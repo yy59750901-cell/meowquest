@@ -1,0 +1,17 @@
+{
+  "name": "喵星成长屋",
+  "short_name": "喵星",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#FDF6E3",
+  "theme_color": "#F0997B",
+  "description": "和小猫一起完成任务、养成好习惯",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 12' shape-rendering='crispEdges'%3E%3Crect x='4' y='0' width='3' height='1' fill='%23D85A30'/%3E%3Crect x='10' y='0' width='3' height='1' fill='%23D85A30'/%3E%3Crect x='3' y='1' width='5' height='2' fill='%23F0997B'/%3E%3Crect x='9' y='1' width='5' height='2' fill='%23F0997B'/%3E%3Crect x='2' y='3' width='13' height='7' fill='%23F0997B'/%3E%3Crect x='5' y='5' width='2' height='2' fill='%231B5E3A'/%3E%3Crect x='9' y='5' width='2' height='2' fill='%231B5E3A'/%3E%3Crect x='6' y='8' width='4' height='2' fill='%23F5E6C8'/%3E%3Crect x='13' y='4' width='3' height='4' fill='%23F0997B'/%3E%3C/svg%3E",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

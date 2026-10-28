@@ -1,0 +1,15 @@
+# 构建产物（二进制 18MB，不入库）
+backend/meowquest
+backend/meowquest.exe
+
+# 前端依赖与缓存
+frontend/node_modules/
+frontend/.vite/
+
+# 本地环境
+.env
+*.log
+.DS_Store
+
+# 数据（如有本地测试数据）
+backend/data/
