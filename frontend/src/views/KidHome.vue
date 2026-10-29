@@ -5,7 +5,7 @@ import CatSprite from '../components/CatSprite.vue'
 import PixelRoom from '../components/PixelRoom.vue'
 import PixelItem from '../components/PixelItem.vue'
 import GardenBackdrop from '../components/GardenBackdrop.vue'
-import { decorArt, getSceneLighting, isWallpaper } from '../scene-art.js'
+import { decorArt, getSceneLighting, isWallpaper, wallStyle } from '../scene-art.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
 
 const API = '/api'
@@ -893,7 +893,50 @@ async function buyItem(it) {
 // 已购未摆放的道具（物品栏）
 const inventory = computed(() =>
   shopItems.value.filter((i) => i.owned && !isWallpaper(i.key) && !sceneItems.value.find((s) => s.item_key === i.key)))
+// 拖动已摆放的道具时，底部浮出明确的收回投放区（替代"拖到边缘"的隐藏手势）
+const dropActive = ref(false)
+const dropEl = ref(null)
 const wallpaperSaving = ref(false)
+// 默认墙不是商品，但要在商店里留一个随时能换回来的入口。
+const DEFAULT_WALL_ITEM = { key: 'wall-default', name: '原装白墙', price: 0, owned: true, builtin: true }
+const shopRows = computed(() => {
+  const rows = [...shopItems.value]
+  const at = rows.findIndex(i => isWallpaper(i.key))
+  if (at >= 0) rows.splice(at, 0, DEFAULT_WALL_ITEM)
+  else if (rows.length) rows.push(DEFAULT_WALL_ITEM)
+  return rows
+})
+// 已摆放的道具在场景里的记录 id（商店/收回按钮要用）
+const placedIdOf = key => sceneItems.value.find(s => s.item_key === key)?.id || 0
+const wallpaperUsing = it => (it.builtin ? activeWallpaper.value === '' : activeWallpaper.value === it.key)
+function shopButtonText(it) {
+  if (it.builtin) return wallpaperUsing(it) ? '使用中' : '使用'
+  if (!it.owned) return '购买'
+  if (isWallpaper(it.key)) return wallpaperUsing(it) ? '使用中' : '使用'
+  return placedIdOf(it.key) ? '收回' : '摆放'
+}
+async function clearWallpaper() {
+  if (wallpaperSaving.value || !activeWallpaper.value) return
+  wallpaperSaving.value = true
+  try {
+    for (const item of sceneItems.value.filter(x => isWallpaper(x.item_key))) {
+      const r = await jpost('/scene/remove', { id: item.id })
+      if (!r.ok) { showToast('恢复白墙没成功，再试一次'); break }
+    }
+    await loadAll()
+    showToast('换回原装白墙啦')
+  } catch {
+    showToast('网络暂时不通，稍后再换')
+  } finally { wallpaperSaving.value = false }
+}
+async function retrieveItem(it) {
+  const id = placedIdOf(it.key)
+  if (!id) return
+  const { ok, data } = await jpost('/scene/remove', { id })
+  if (!ok) return showToast(data.error || '收回失败，再试一次')
+  await loadAll()
+  showToast('收回物品栏了，随时可以再摆')
+}
 async function applyWallpaper(it) {
   if (!it.owned || wallpaperSaving.value || activeWallpaper.value === it.key) return
   wallpaperSaving.value = true
@@ -913,10 +956,12 @@ async function applyWallpaper(it) {
   } finally { wallpaperSaving.value = false }
 }
 function shopAction(it) {
+  if (it.builtin) return clearWallpaper()
   if (!it.owned) return buyItem(it)
   if (isWallpaper(it.key)) return applyWallpaper(it)
+  if (placedIdOf(it.key)) return retrieveItem(it)
   if (isNarrow.value) { sheet.value = ''; toolsOpen.value = true }
-  showToast('从物品栏拖进房间；拖到边缘可以收回')
+  showToast('从物品栏拖进房间；不想要了可以在商店点「收回」')
 }
 
 // 拖拽：物品栏拖入房间（新摆放）；场景内拖动改位置；拖到边缘收回
@@ -938,17 +983,21 @@ function onItemPointerDown(e, it, sceneId) {
     document.removeEventListener('pointerup', up)
     document.removeEventListener('pointercancel', up)
     ghost.remove()
+    dropActive.value = false
     cancelDecorDrag = null
   }
   const move = ev => {
     if (ev.pointerId !== drag.pointerId || Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 8) return
     drag.moved = true
+    if (drag.id) dropActive.value = true
     ghost.style.left = `${ev.clientX - 36}px`
     ghost.style.top = `${ev.clientY - 72}px`
     ghost.style.opacity = 1
   }
   const up = async ev => {
     if (ev.pointerId !== drag.pointerId) return
+    // 先取投放区位置：cleanup 会把 dropActive 清掉
+    const dropRect = dropActive.value ? dropEl.value?.getBoundingClientRect() : null
     cleanup()
     if (ev.type === 'pointercancel') return
     if (!drag.moved) {
@@ -965,7 +1014,11 @@ function onItemPointerDown(e, it, sceneId) {
       : clamp(ev.clientY - worldRect.top, WORLD_H * 0.62, WORLD_H - 20)
     try {
       let result
-      if (vx < 16 || vx > viewport.clientWidth - 16 || vy < 16 || vy > viewport.clientHeight - 16) {
+      const inDropZone = dropRect && ev.clientX >= dropRect.left && ev.clientX <= dropRect.right
+        && ev.clientY >= dropRect.top && ev.clientY <= dropRect.bottom
+      if (inDropZone && drag.id) {
+        result = await jpost('/scene/remove', { id: drag.id })
+      } else if (vx < 16 || vx > viewport.clientWidth - 16 || vy < 16 || vy > viewport.clientHeight - 16) {
         if (!drag.id) return
         result = await jpost('/scene/remove', { id: drag.id })
       } else result = await jpost('/scene/place', { id: drag.id, key: drag.key, x, y })
@@ -1162,6 +1215,7 @@ onBeforeUnmount(() => {
     </div>
     </div><!-- /world -->
     <div v-if="placingFeed" class="place-banner">点一下地面放猫粮，点“陪伴 → 取消喂食”可取消</div>
+    <div v-show="dropActive" ref="dropEl" class="drop-retrieve">松手拖到这里 → 收回物品栏</div>
     </div><!-- /scene-viewport -->
     <div class="room-tools" v-show="!sheet">
       <button class="mobile-companion" :class="{ on: toolsOpen }" :aria-expanded="toolsOpen" @click="toggleCompanion"><svg class="ui-icon"><use href="#room-paw" /></svg>陪伴</button>
@@ -1223,11 +1277,11 @@ onBeforeUnmount(() => {
     <div class="panel shop" id="shopPanel" v-show="!isNarrow || sheet === 'shop'">
       <div class="panel-bar">🛒 像素商店<button class="sheet-close" @click="sheet = ''" aria-label="关闭商店"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
-        <div v-for="it in shopItems" :key="it.key" class="shop-row">
-          <PixelItem v-if="!isWallpaper(it.key)" :item-key="it.key" :size="32" />
-          <i v-else class="wallpaper-swatch" :style="{ backgroundColor: decorArt(it.key).wallColor }" aria-hidden="true"></i>
-          <span>{{ it.name }}</span><em>{{ it.price }}⭐</em>
-          <button :class="{ owned: it.owned }" :disabled="wallpaperSaving" @click="shopAction(it)">{{ !it.owned ? '购买' : isWallpaper(it.key) ? (activeWallpaper === it.key ? '使用中' : '使用') : '摆放' }}</button>
+        <div v-for="it in shopRows" :key="it.key" class="shop-row">
+          <PixelItem v-if="!isWallpaper(it.key) && !it.builtin" :item-key="it.key" :size="32" />
+          <i v-else class="wallpaper-swatch" :style="wallStyle(it.builtin ? '' : it.key, 64)" aria-hidden="true"></i>
+          <span>{{ it.name }}</span><em>{{ it.builtin ? '免费' : it.price + '⭐' }}</em>
+          <button :class="{ owned: it.owned }" :disabled="wallpaperSaving" @click="shopAction(it)">{{ shopButtonText(it) }}</button>
         </div>
       </div>
     </div>
@@ -1476,7 +1530,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .shop-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 8px; }
 .shop-row span { flex: 1; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 .shop-row em { font-style: normal; color: #94692F; font-weight: 700; white-space: nowrap; }
-.shop-row button.owned { background: #EDF3E8; color: #719462; border-color: #D4E0CC; }
+.shop-row button.owned { background: #EDF3E8; color: #4C6B39; border-color: #C3D3B6; }
 
 /* 互动操作、独立相机工具与可横滚物品栏 */
 .pbtn { font-size: 14px; font-weight: 600; cursor: pointer; padding: 10px 14px; color: #70543C; background: #FFF1DB; border: 1.5px solid #D8BFA1; border-radius: 12px; box-shadow: 0 3px 8px rgba(103, 75, 47, .08); }
@@ -1501,7 +1555,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .scene-viewport .inv-bar { bottom: 16px; left: 16px; max-width: min(580px, calc(100% - 32px)); }
 .inv-bar .lbl { flex-shrink: 0; font-size: 11px; color: #88786A; white-space: nowrap; }
 .inv-item { flex: 0 0 44px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; border: 2px dashed #b39b73; border-radius: 4px; cursor: grab; user-select: none; touch-action: none; background: #fff1d8; }
-.wallpaper-swatch { display: block; flex: 0 0 24px; width: 24px; height: 24px; border: 2px solid #b09b78; background: #edccd0 url('/art/plaster.png') center / 128px; background-blend-mode: multiply; image-rendering: pixelated; }
+.wallpaper-swatch { display: block; flex: 0 0 24px; width: 24px; height: 24px; border: 2px solid #b09b78; background-repeat: repeat; background-position: center; image-rendering: pixelated; }
+.drop-retrieve { position: absolute; z-index: 40; bottom: 14px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border: 2px dashed #b4584f; border-radius: 12px; background: rgba(255, 246, 238, .96); color: #8d453c; font-size: 13px; font-weight: 500; white-space: nowrap; pointer-events: none; box-shadow: 0 4px 10px rgba(80, 50, 40, .18); }
 :global(.drag-ghost) { position: fixed; width: 72px; height: 72px; opacity: 0; pointer-events: none; z-index: 999; image-rendering: pixelated; }
 .status-pointer { position: absolute; width: 14px; height: 10px; background: #b09b78; clip-path: polygon(50% 0, 100% 100%, 0 100%); z-index: 33; pointer-events: none; }
 

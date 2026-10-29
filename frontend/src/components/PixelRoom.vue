@@ -1,17 +1,18 @@
 <script setup>
 import { computed } from 'vue'
-import { decorArt } from '../scene-art.js'
+import { wallStyle } from '../scene-art.js'
 
 const props = defineProps({
   wallpaperKey: { type: String, default: '' },
 })
 
-const wallColor = computed(() => decorArt(props.wallpaperKey).wallColor || '#fffaf0')
+// 有壁纸用壁纸图案整层替换；没贴壁纸仍是原来的白墙。
+const wall = computed(() => wallStyle(props.wallpaperKey))
 </script>
 
 <template>
   <div class="pixel-room" aria-hidden="true">
-    <div class="pixel-wall" :style="{ backgroundColor: wallColor }" />
+    <div class="pixel-wall" :style="wall" />
     <div class="pixel-floor" />
     <div class="pixel-skirting" />
     <img
@@ -41,10 +42,7 @@ const wallColor = computed(() => decorArt(props.wallpaperKey).wallColor || '#fff
   left: 0;
   width: 1280px;
   height: 404px;
-  background-image: url('/art/plaster.png');
   background-repeat: repeat;
-  background-size: 512px 512px;
-  background-blend-mode: multiply;
   image-rendering: pixelated;
 }
 
