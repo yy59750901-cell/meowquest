@@ -1,5 +1,17 @@
 <script setup>
 // 家长后台（Vant 移动组件库）：确认队列 / 任务配置 / 愿望审批 / 流水
+function evText(t) {
+  const m = { photo: '📷', audio: '🎙', video: '🎬', timer: '⏱' }
+  return t.split(',').map((x) => m[x] || x).join('')
+}
+function parseEvidence(ev) {
+  if (!ev) return []
+  if (Array.isArray(ev)) return ev // API 已是数组
+  try {
+    const p = JSON.parse(ev)
+    return Array.isArray(p) ? p : []
+  } catch (e) { return [] }
+}
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
@@ -7,15 +19,25 @@ import { showToast, showConfirmDialog } from 'vant'
 const router = useRouter()
 const tab = ref('confirm')
 const confirms = ref([])
+const expanded = ref(0) // 待确认卡片展开的 id（默认全收起）
+function toggleExpand(id) { expanded.value = expanded.value === id ? 0 : id }
 const tasks = ref([])
 const wishes = ref([])
 const wishHealth = ref(0)
 const ledger = ref([])
 const newTask = ref({ name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,3,5', weekly_quota: 3 })
+const evChecks = ref([]) // 成果提交方式复选：photo / audio / video
+const ICONS = ['⭐', '🎹', '📖', '🔤', '🏃', '🧹', '✍️', '🎨', '🧠', '🦷']
+const EV_OPTIONS = [
+  { v: 'photo', label: '📷 拍照', desc: '调起相机拍作业/成果' },
+  { v: 'audio', label: '🎙 录音', desc: '调起录音（朗读/背诵）' },
+  { v: 'video', label: '🎬 录像', desc: '调起录像（练琴过程）' },
+]
 const editingId = ref(0) // >0 = 编辑模式
 
 function editTask(t) {
   editingId.value = t.id
+  evChecks.value = (t.evidence_type || '').split(',').filter((x) => ['photo', 'audio', 'video'].includes(x))
   newTask.value = {
     name: t.name, icon: t.icon || '⭐', category: t.category || 'custom',
     goal_type: t.goal_type || 'duration', goal_value: t.goal_value || 0,
@@ -27,6 +49,7 @@ function editTask(t) {
 }
 function resetTaskForm() {
   editingId.value = 0
+  evChecks.value = []
   newTask.value = { name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,3,5', weekly_quota: 3 }
 }
 
@@ -78,13 +101,14 @@ async function reject(id) {
 
 async function createTask() {
   if (!newTask.value.name) return showToast('任务名必填')
+  const payload = { ...newTask.value, evidence_type: evChecks.value.length ? evChecks.value.join(',') : 'none' }
   if (editingId.value) {
     // 编辑模式：PUT 更新
-    const { ok } = await jput(`/api/admin/task/${editingId.value}`, newTask.value)
+    const { ok } = await jput(`/api/admin/task/${editingId.value}`, payload)
     if (ok) { showToast('已保存'); resetTaskForm(); await load() }
     return
   }
-  const { ok } = await jpost('/api/admin/task', newTask.value)
+  const { ok } = await jpost('/api/admin/task', payload)
   if (ok) { showToast('已创建'); resetTaskForm(); await load() }
 }
 
@@ -112,17 +136,25 @@ onMounted(load)
     <van-tabs v-model:active="tab" sticky>
       <van-tab title="✅ 待确认" name="confirm">
         <div v-if="!confirms.length" class="empty">没有待确认的任务</div>
-        <van-swipe-cell v-for="it in confirms" :key="it.id">
-          <div class="confirm-card">
-            <div class="row1"><b>{{ it.snapshot?.icon }} {{ it.snapshot?.name }}</b>
-              <em>{{ Math.round(it.duration_sec / 60) }} 分钟</em></div>
-            <div class="row2">提交于 {{ new Date(it.submitted_at).toLocaleString('zh-CN') }}</div>
+        <div v-for="it in confirms" :key="it.id" class="confirm-card" @click="toggleExpand(it.id)">
+          <div class="row1">
+            <b>{{ it.snapshot?.icon }} {{ it.snapshot?.name }}</b>
+            <em>{{ Math.round(it.duration_sec / 60) }}分钟 · {{ (parseEvidence(it.evidence) || []).length ? parseEvidence(it.evidence).length + '个材料' : '无材料' }}</em>
+            <span class="arrow">{{ expanded === it.id ? '▾' : '▸' }}</span>
+          </div>
+          <div class="row2">提交于 {{ new Date(it.submitted_at).toLocaleString('zh-CN') }}</div>
+          <div v-if="expanded === it.id" class="detail">
+            <div v-for="(ev, i) in parseEvidence(it.evidence)" :key="i" class="evidence">
+              <img v-if="ev.type === 'photo' || ev.type === 'video'" :src="ev.path" @click.stop />
+              <audio v-else-if="ev.type === 'audio'" :src="ev.path" controls @click.stop />
+            </div>
+            <div v-if="!(parseEvidence(it.evidence) || []).length" class="no-ev">（无照片/录音材料，只有计时数据）</div>
             <div class="btns">
-              <button class="ok" @click="approve(it.id)">✓ 通过</button>
-              <button class="no" @click="reject(it.id)">驳回</button>
+              <button class="ok" @click.stop="approve(it.id)">✓ 通过并结算</button>
+              <button class="no" @click.stop="reject(it.id)">驳回重做</button>
             </div>
           </div>
-        </van-swipe-cell>
+        </div>
       </van-tab>
 
       <van-tab title="📋 任务配置" name="tasks">
@@ -139,11 +171,30 @@ onMounted(load)
             <input v-else v-model.number="newTask.weekly_quota" type="number" placeholder="每周次数" />
           </div>
           <div class="grid">
-            <input v-model.number="newTask.goal_value" type="number" placeholder="时长(分钟)" />
+            <select v-model="newTask.goal_type">
+              <option value="duration">⏱ 时长任务</option>
+              <option value="free">自由完成</option>
+            </select>
+            <input v-if="newTask.goal_type === 'duration'" v-model.number="newTask.goal_value" type="number" placeholder="时长(分钟)" />
+          </div>
+          <div class="grid">
+            <input v-model.number="newTask.base_score" type="number" placeholder="完成奖励(星星数)" />
             <select v-model="newTask.confirm_mode">
               <option value="a">自动确认</option>
               <option value="c">需家长确认</option>
             </select>
+          </div>
+          <div class="icon-row">
+            <small>图标</small>
+            <button v-for="ic in ICONS" :key="ic" type="button" class="ic-btn" :class="{ on: newTask.icon === ic }" @click="newTask.icon = ic">{{ ic }}</button>
+          </div>
+          <div class="ev-block">
+            <b>成果提交方式</b>
+            <small>时长任务自动用全屏计时页；勾选后孩子完成时需上传对应材料，家长确认时可见</small>
+            <label v-for="o in EV_OPTIONS" :key="o.v" class="ev-opt">
+              <input type="checkbox" :value="o.v" v-model="evChecks" />
+              <span>{{ o.label }}</span><em>{{ o.desc }}</em>
+            </label>
           </div>
           <button class="primary" @click="createTask">{{ editingId ? '保存修改' : '创建' }}</button>
         </div>
@@ -152,6 +203,7 @@ onMounted(load)
           <em v-if="t.schedule?.date_mode === 'weekly_quota'">每周{{ t.schedule.weekly_quota }}次</em>
           <em v-else>周{{ t.schedule?.weekdays }}</em>
           · {{ t.base_score }}⭐
+          <em v-if="t.evidence_type && t.evidence_type !== 'none'" class="ev-tag">{{ evText(t.evidence_type) }}</em>
           <a class="edit" @click="editTask(t)">✏️ 编辑</a>
         </div>
       </van-tab>
@@ -209,6 +261,18 @@ button:active { transform: translate(2px, 2px); box-shadow: none; }
 .no { background: #FCEBEB; color: #A32D2D; }
 .primary { margin-top: 10px; width: 100%; background: #534AB7; color: #fff; }
 .task-line { background: #fff; margin: 6px 10px; border-radius: 8px; padding: 10px 14px; font-size: 13px; border: 1px solid #E5E2D9; }
+.icon-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.icon-row small { color: #888780; }
+.ic-btn { width: 36px; height: 36px; font-size: 18px; padding: 0; background: #fff; border: 1.5px solid #D3D1C7; border-radius: 8px; cursor: pointer; }
+.ic-btn.on { border-color: #534AB7; background: #EEEDFE; }
+.ev-block { margin-top: 10px; padding: 10px; background: #FAF8F3; border-radius: 8px; }
+.ev-block b { font-size: 13px; }
+.ev-block small { display: block; color: #888780; font-size: 11px; margin: 4px 0 8px; }
+.ev-opt { display: flex; align-items: center; gap: 6px; padding: 6px 0; font-size: 13px; cursor: pointer; }
+.ev-opt input { width: 16px; height: 16px; }
+.ev-opt em { font-style: normal; color: #888780; font-size: 11px; margin-left: auto; }
+.ev-tag { font-style: normal; margin-left: 4px; }
+
 .task-line .edit { float: right; color: #534AB7; font-weight: 700; cursor: pointer; font-size: 12px; }
 .cancel-edit { float: right; color: #A32D2D; font-size: 12px; font-weight: 700; cursor: pointer; }
 .pm-mask { position: fixed; inset: 0; z-index: 99; background: rgba(0,0,0,.35); display: flex; align-items: center; justify-content: center; }
@@ -220,4 +284,6 @@ button:active { transform: translate(2px, 2px); box-shadow: none; }
 .pm-btns button { flex: 1; }
 .task-line em { font-style: normal; color: #534AB7; }
 .confirm-card { background: #fff; margin: 10px; border-radius: 10px; padding: 14px; border: 1px solid #E5E2D9; }
+.evidence img { max-width: 100%; border-radius: 8px; margin-top: 8px; display: block; }
+.evidence audio { width: 100%; margin-top: 8px; display: block; }
 </style>

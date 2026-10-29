@@ -13,3 +13,8 @@ frontend/.vite/
 
 # 数据（如有本地测试数据）
 backend/data/
+
+# 用户上传的证据（照片/录音，隐私数据不入库）
+backend/uploads/
+# 前端构建产物（backend/internal/web/dist 已入库供 embed，此目录纯本地）
+frontend/dist/

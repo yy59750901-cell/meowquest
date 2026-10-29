@@ -41,6 +41,7 @@ func (s *Server) Router() *gin.Engine {
 		// 商店与场景
 		api.GET("/shop", s.kid, s.shopList)
 		api.POST("/shop/buy", s.kid, s.buyItem)
+		api.POST("/upload", s.kid, s.uploadEvidence) // 任务证据上传
 		api.GET("/scene", s.kid, s.sceneLayout)
 		api.POST("/scene/place", s.kid, s.placeItem)
 		api.POST("/scene/remove", s.kid, s.removeItem)
@@ -61,6 +62,9 @@ func (s *Server) Router() *gin.Engine {
 		admin.GET("/wish/list", s.admin, s.adminWishList)    // 愿望审批列表
 		admin.POST("/wish/:id", s.admin, s.adminWishAction)  // 定价/驳回/兑现
 	}
+	// 上传的证据文件（本地磁盘）
+	r.Static("/uploads", uploadDir())
+
 	// 前端产物（embed 单二进制）
 	if h, err := web.Handler(); err == nil {
 		r.NoRoute(gin.WrapH(h))

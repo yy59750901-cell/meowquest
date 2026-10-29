@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { showDialog, showToast, showConfirmDialog } from 'vant'
 import CatSprite from '../components/CatSprite.vue'
+import TimerOverlay from '../components/TimerOverlay.vue'
 
 const API = '/api'
 
@@ -206,6 +207,13 @@ function playYarn(it, round) {
 const roomEl = ref(null)
 const catEl = ref(null)
 
+// 窄屏（手机竖屏）：面板收进底部抽屉，点导航切换
+const isNarrow = ref(false)
+const sheet = ref('') // '' / 'task' / 'wish' / 'shop'
+function openSheet(name) { sheet.value = sheet.value === name ? '' : name }
+function checkNarrow() { isNarrow.value = (roomEl.value ? roomEl.value.clientWidth : 1024) < 900 }
+window.addEventListener('resize', checkNarrow)
+
 // 触摸交互：点地面 → 猫快速跑过去；点物品 → 跑过去互动
 function onRoomTap(e) {
   if (!adopted.value) return
@@ -279,23 +287,79 @@ const bowlPos = reactive({ x: 0, y: 0 })
 
 // ===== 任务 =====
 const submitting = ref(0)
-async function submitTask(t) {
+async function submitTask(t, body = {}) {
   if (submitting.value) return
   submitting.value = t.id
   const snap = t.snapshot
-  const body = { duration_sec: (snap.goal_type === 'duration' ? snap.goal_value : 0) * 60, evidence: [] }
-  const { ok, data } = await jpost(`/tasks/${t.id}/submit`, body)
+  const payload = {
+    duration_sec: body.duration_sec ?? (snap.goal_type === 'duration' ? snap.goal_value : 0) * 60,
+    extra_sec: body.duration_sec || 0,
+    evidence: body.evidence || [],
+  }
+  const { ok, data } = await jpost(`/tasks/${t.id}/submit`, payload)
   submitting.value = 0
   if (data.settled) {
-    showToast({ message: `任务完成 +${'?'}`, duration: 800 })
+    showToast('任务完成！')
+    hearts(6)
     say('主人真棒！')
     await loadAll()
   } else if (data.waiting) {
     showToast('提交成功，等妈妈确认哦～')
+    say('等妈妈看看～')
     await loadAll()
   } else {
     showToast(data.error || '提交失败')
   }
+}
+
+// ===== 任务入口分流：计时 / 拍照 / 录音 / 直接打卡 =====
+const timerTask = ref(null) // 打开全屏计时页的任务
+function startTask(t) {
+  const snap = t.snapshot
+  if (snap.goal_type === 'duration' && snap.goal_value > 0) {
+    timerTask.value = t
+    return
+  }
+  const ev = snap.evidence_type || ''
+  if (ev.includes('photo') || ev.includes('audio') || ev.includes('video')) {
+    evidenceTask = t
+    evidenceInput.value && evidenceInput.value.click()
+    return
+  }
+  submitTask(t)
+}
+async function onTimerDone(sec) {
+  const t = timerTask.value
+  timerTask.value = null
+  if (t) await submitTask(t, { duration_sec: sec })
+}
+function onTimerGiveup() { timerTask.value = null }
+
+// 拍照/录音（file input：HTTP 局域网下摄像头 API 不可用，iPad 会调起相机/录音）
+const evidenceInput = ref(null)
+let evidenceTask = null
+async function onEvidenceFile(e) {
+  const file = e.target.files && e.target.files[0]
+  e.target.value = ''
+  if (!file || !evidenceTask) return
+  const fd = new FormData()
+  fd.append('file', file)
+  showToast('上传中…')
+  const r = await fetch('/api/upload', { method: 'POST', body: fd })
+  const d = await r.json()
+  if (!d.path) { showToast('上传失败，再试一次？'); return }
+  const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
+  const t = evidenceTask
+  evidenceTask = null
+  await submitTask(t, { evidence: [{ type, path: d.path }] })
+}
+function taskBtnLabel(snap) {
+  if (snap.goal_type === 'duration' && snap.goal_value > 0) return '计时开始'
+  const ev = snap.evidence_type || ''
+  if (ev.includes('photo')) return '拍照提交'
+  if (ev.includes('audio')) return '录音提交'
+  if (ev.includes('video')) return '录像提交'
+  return '打卡'
 }
 
 // ===== 愿望 =====
@@ -418,6 +482,7 @@ function initCat() {
 onMounted(async () => {
   await loadAll()
   if (adopted.value) initCat()
+  checkNarrow()
 })
 // 领养完成 → 初始化猫位置（修复：猫从左上角 0,0 起步的问题）
 watch(adopted, (v) => { if (v) setTimeout(initCat, 100) })
@@ -446,7 +511,7 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
   </div>
 
   <!-- 房间 -->
-  <div v-else class="room" ref="roomEl" :class="wpClass" @pointerdown="onRoomTap">
+  <div v-else class="room" ref="roomEl" :class="[wpClass, { 'drawer-open': isNarrow && !!sheet }]" @pointerdown="onRoomTap">
     <div class="wall-deco">
       <div class="window"><i class="cloud" /><i class="cloud c2" /></div>
       <div class="baseboard"></div>
@@ -494,8 +559,9 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
     <!-- 提示气泡（触屏长按后松手/移开消失） -->
     <div v-if="tipShow" class="tip-bubble" @pointerdown="hideTip">{{ tipText }}</div>
 
-    <!-- 今日任务 -->
-    <div class="panel" id="taskPanel">
+    <!-- 侧栏容器：桌面=右侧自适应列；窄屏=底部抽屉 -->
+    <div class="sidebar" :class="{ open: !!sheet, narrow: isNarrow }">
+    <div class="panel" id="taskPanel" v-show="!isNarrow || sheet === 'task'">
       <div class="panel-bar">📋 今日任务（{{ today.tasks.filter(t => t.status === 'approved').length }}/{{ today.tasks.length }}）</div>
       <div class="panel-body">
         <div v-for="t in today.tasks" :key="t.id" class="task" :class="t.status === 'approved' ? 'done' : t.status === 'submitted' ? 'wait' : ''">
@@ -507,14 +573,13 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
           <span v-if="t.status === 'approved'" class="st ok">✓</span>
           <span v-else-if="t.status === 'submitted'" class="st wait-t">等妈妈…</span>
           <span v-else-if="t.status === 'skipped'" class="st skip">请假</span>
-          <button v-else @click="submitTask(t)">{{ t.snapshot?.goal_type === 'duration' ? '完成' : '打卡' }}</button>
+          <button v-else @click="startTask(t)">{{ taskBtnLabel(t.snapshot) }}</button>
         </div>
         <div v-if="!today.tasks.length" class="empty">今天没有任务，和猫玩吧～</div>
       </div>
     </div>
 
-    <!-- 愿望 -->
-    <div class="panel wish" id="wishPanel">
+    <div class="panel wish" id="wishPanel" v-show="!isNarrow || sheet === 'wish'">
       <div class="panel-bar">🌠 我的愿望 <a @click="newWish">+ 许愿</a></div>
       <div class="panel-body">
         <div v-for="w in wishes.filter(x => x.status !== 'rejected')" :key="w.id" class="wish-row">
@@ -528,8 +593,7 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
       </div>
     </div>
 
-    <!-- 商店 -->
-    <div class="panel shop" id="shopPanel">
+    <div class="panel shop" id="shopPanel" v-show="!isNarrow || sheet === 'shop'">
       <div class="panel-bar">🛒 像素商店</div>
       <div class="panel-body">
         <div v-for="it in shopItems" :key="it.key" class="shop-row">
@@ -537,6 +601,15 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
           <button :class="{ owned: it.owned }" @click="buyItem(it)">{{ it.owned ? '已购' : '购买' }}</button>
         </div>
       </div>
+    </div>
+
+    </div><!-- /sidebar -->
+
+    <!-- 窄屏底部导航 -->
+    <div v-if="isNarrow" class="sheet-nav">
+      <button :class="{ on: sheet === 'task' }" @click="openSheet('task')">📋 任务</button>
+      <button :class="{ on: sheet === 'wish' }" @click="openSheet('wish')">🌠 愿望</button>
+      <button :class="{ on: sheet === 'shop' }" @click="openSheet('shop')">🛒 商店</button>
     </div>
 
     <!-- 物品栏：已购未摆放的道具，拖入房间 -->
@@ -550,6 +623,14 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
       <button class="pbtn feed" @click="feed">🍖 喂猫粮<small>10⭐{{ placingFeed ? ' · 放置中' : '' }}</small></button>
       <button class="pbtn hint" @click="petCat">👆 摸摸头</button>
     </div>
+
+    <!-- 全屏计时页 -->
+    <TimerOverlay v-if="timerTask" :minutes="timerTask.snapshot.goal_value"
+      :task-name="timerTask.snapshot.name" :icon="timerTask.snapshot.icon" :species="species"
+      @done="onTimerDone" @giveup="onTimerGiveup" />
+
+    <!-- 拍照/录音（调起相机或语音备忘录） -->
+    <input ref="evidenceInput" type="file" accept="image/*,audio/*,video/*" capture="environment" style="display:none" @change="onEvidenceFile" />
 
     <!-- 许愿输入框 -->
     <div v-if="wishModal" class="modal-mask" @click.self="wishModal = false">
@@ -604,15 +685,25 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
 .chip.mini .bar i { display: block; height: 100%; background: linear-gradient(90deg, #F0997B, #D85A30); transition: width .5s; }
 .chip.mini .bar i.mood { background: linear-gradient(90deg, #97C459, #3B6D11); }
 
-.panel { position: absolute; background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; box-shadow: 4px 4px 0 rgba(44, 44, 42, .85); z-index: 10; width: 248px; }
+.panel { background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; box-shadow: 4px 4px 0 rgba(44, 44, 42, .85); z-index: 10; width: 248px; }
 .panel-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 2px solid #2C2C2A; font-size: 13px; font-weight: 600; background: #E1F5EE; }
 .panel.wish .panel-bar { background: #EEEDFE; }
 .panel.shop .panel-bar { background: #FAEEDA; }
 .panel-bar a { margin-left: auto; color: #534AB7; font-size: 12px; cursor: pointer; }
-.panel-body { max-height: 340px; overflow-y: auto; padding: 10px; }
-#taskPanel { top: 12px; right: 12px; }
-#wishPanel { top: 190px; right: 12px; }
-#shopPanel { top: 340px; right: 12px; }
+.panel-body { padding: 10px; }
+/* 侧栏：桌面=右侧自适应列（永不互相遮挡）；窄屏=底部抽屉 */
+.sidebar { position: absolute; top: 12px; right: 12px; bottom: 84px; width: 248px; display: flex; flex-direction: column; gap: 12px; z-index: 10; }
+.sidebar .panel { position: static; flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.sidebar .panel .panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; max-height: none; }
+#taskPanel { flex-grow: 2; }
+#wishPanel, #shopPanel { flex-grow: 1; }
+/* 窄屏：底部抽屉（隐藏在屏幕外，open 弹出） */
+.sidebar.narrow { top: auto; left: 0; right: 0; bottom: 112px; width: auto; max-height: 56vh; transform: translateY(calc(100% + 130px)); transition: transform .28s ease; gap: 0; }
+.sidebar.narrow.open { transform: none; }
+.sidebar.narrow .panel { width: 100%; max-height: 56vh; }
+.sheet-nav { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 30; display: flex; gap: 8px; }
+.sheet-nav button { flex: 1; font-size: 13px; font-weight: 700; cursor: pointer; padding: 10px 0; background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; box-shadow: 3px 3px 0 rgba(44,44,42,.85); }
+.sheet-nav button.on { background: #534AB7; color: #fff; }
 .task { display: flex; align-items: center; gap: 8px; border: 2px solid #2C2C2A; border-radius: 8px; padding: 7px 8px; background: #fff; margin-bottom: 8px; }
 .task.done { background: #E1F5EE; }
 .task.wait { background: #EEEDFE; }
@@ -673,9 +764,12 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
 .scene-item.shake { animation: shake .5s ease-in-out 3; }
 @keyframes shake { 0%, 100% { transform: translate(-50%, -100%) rotate(0); } 30% { transform: translate(-50%, -100%) rotate(-8deg); } 60% { transform: translate(-50%, -100%) rotate(6deg); } }
 
-@media (max-width: 760px) {
-  .panel { width: 206px; }
+@media (max-width: 900px) {
+  .inv-bar { bottom: 112px; }
+  .actions { bottom: 112px; }
   .task .sub { display: none; }
-  #wishPanel { top: 160px; } #shopPanel { top: 290px; }
 }
+/* 抽屉打开时隐藏底部操作区（喂猫/摸头/物品栏让位给任务卡） */
+.room.drawer-open .actions, .room.drawer-open .inv-bar { display: none; }
+@media (min-width: 901px) and (max-width: 760px) { }
 </style>
