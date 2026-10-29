@@ -2,6 +2,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { showDialog, showToast, showConfirmDialog } from 'vant'
 import CatSprite from '../components/CatSprite.vue'
+import PixelRoom from '../components/PixelRoom.vue'
+import PixelItem from '../components/PixelItem.vue'
+import GardenBackdrop from '../components/GardenBackdrop.vue'
+import { decorArt, getSceneLighting, isWallpaper } from '../scene-art.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
 
 const API = '/api'
@@ -108,6 +112,70 @@ async function jpost(url, body) {
 
 const hadDuration = ref({}) // {taskID:bool} 计时任务曾达标（AI 退回后免重新计时）
 
+// ===== 世界视口：固定逻辑世界 + 相机（窄屏看局部可拖，跟猫为默认焦点） =====
+const WORLD_W = 1280, WORLD_H = 720
+const cam = ref({ x: 0, y: 0 })
+const camMode = ref('follow') // follow(跟猫) | free(自由拖动)
+const camAnim = ref('') // 相机移动的 CSS transition（跟猫同步时设置）
+const sceneLighting = ref(getSceneLighting())
+let lightingTimer = null
+function syncSceneLighting() { sceneLighting.value = getSceneLighting() }
+function onDocumentVisibility() {
+  if (!document.hidden) syncSceneLighting()
+}
+const activeWallpaper = computed(() => sceneItems.value.filter(it => isWallpaper(it.item_key)).at(-1)?.item_key || '')
+const placedDecor = computed(() => sceneItems.value.filter(it => !isWallpaper(it.item_key)))
+// 图层按地面锚点排序：未来新增装饰沿用同一坐标与注册表。
+const decorDepth = it => decorArt(it.item_key).surface === 'wall' ? 2 : 10 + Math.floor(it.y)
+const catDepth = computed(() => 10 + Math.floor(catPos.y))
+const rootEl = ref(null)
+const statusToggleEl = ref(null)
+const statusPanelEl = ref(null)
+const statusPosition = ref({})
+function alignStatusPanel() {
+  const button = statusToggleEl.value, root = rootEl.value
+  if (!button || !root) return
+  const anchor = button.getBoundingClientRect(), bounds = root.getBoundingClientRect()
+  statusPosition.value = { top: `${anchor.bottom - bounds.top + 12}px`,
+    right: `${bounds.right - anchor.right}px`, width: `${Math.min(340, bounds.width - 32)}px` }
+}
+async function toggleStatus() {
+  hudOpen.value = !hudOpen.value
+  tipShow.value = false
+  toolsOpen.value = false
+  if (hudOpen.value) { await nextTick(); alignStatusPanel() }
+}
+function dismissStatusOutside(e) {
+  if (!statusPanelEl.value?.contains(e.target) && !statusToggleEl.value?.contains(e.target)) {
+    hudOpen.value = false
+    tipShow.value = false
+  }
+}
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
+// 房间世界坐标以猫脚底为锚点；视口边框不计入可见区域。
+function cameraBounds() {
+  const el = roomEl.value
+  if (!el) return null
+  const width = el.clientWidth, height = el.clientHeight
+  const centerX = Math.max(0, (width - WORLD_W) / 2)
+  // 手机允许少量底部留白，让猫身体中心避开导航，而非硬贴世界下沿。
+  const minY = isNarrow.value ? Math.min(0, height - WORLD_H, -220) : Math.min(0, height - WORLD_H)
+  return { width, height, minX: width >= WORLD_W ? centerX : width - WORLD_W,
+    maxX: centerX, minY, maxY: Math.max(0, (height - WORLD_H) / 2) }
+}
+function setCamera(x, y) {
+  const b = cameraBounds()
+  if (b) cam.value = { x: clamp(x, b.minX, b.maxX), y: clamp(y, b.minY, b.maxY) }
+}
+function centerOn(x, y, durSec) {
+  const b = cameraBounds()
+  if (!b) return
+  const focusY = b.height / 2 // 视口已避开标题与导航，无需再扣一次安全区
+  camAnim.value = durSec != null ? `transform ${durSec}s linear` : 'transform .45s ease'
+  setCamera(b.width / 2 - x, focusY - y)
+}
+function resetCam() { camMode.value = 'follow'; centerOn(catPos.x, catPos.y - 48) }
+
 async function loadAll() {
   const [sp, p, t, w, s, sc] = await Promise.all([
     jget('/species'), jget('/pet'), jget('/tasks/today'), jget('/wish/list'), jget('/shop'), jget('/scene'),
@@ -115,7 +183,7 @@ async function loadAll() {
   if (sp) speciesList.value = sp.species || []
   if (p && p.pet) { adopted.value = true; pet.value = p.pet; species.value = p.pet.species }
   if (t) today.value = t
-  hadDuration.value = t.had_duration || {}
+  hadDuration.value = t?.had_duration || {}
   if (t && t.tasks) today.value.tasks = t.tasks.map(x => ({ ...x, snapshot: typeof x.snapshot === 'string' ? JSON.parse(x.snapshot) : x.snapshot }))
   if (w) wishes.value = w.wishes || []
   if (s) shopItems.value = s.items || []
@@ -148,16 +216,16 @@ async function doAdopt() {
 
 // ===== 猫行为状态机（房间内走动/躺/睡） =====
 function randTarget() {
-  const W = roomEl.value?.clientWidth || 800, H = roomEl.value?.clientHeight || 600
-  return { x: 80 + Math.random() * (W - 200), y: (0.62 + Math.random() * 0.32) * H }
+  return { x: 80 + Math.random() * (WORLD_W - 200), y: (0.62 + Math.random() * 0.32) * WORLD_H }
 }
 // 校准：catPos ← 猫的实际渲染位置（DOM 和数据有偏差时原地归位，杜绝瞬移）
 function syncCatPos() {
   if (!catEl.value || !roomEl.value) return
   const cr = catEl.value.getBoundingClientRect()
   const rr = roomEl.value.getBoundingClientRect()
-  catPos.x = cr.left - rr.left + 55
-  catPos.y = cr.top - rr.top + 100
+  const worldRect = worldEl.value.getBoundingClientRect()
+  catPos.x = cr.left - worldRect.left + 55
+  catPos.y = cr.top - worldRect.top + 100
 }
 // 打断猫当前行为（喂食/触摸可抢占自主走动）
 function interrupt() {
@@ -180,6 +248,8 @@ async function walkTo(target, done, opts = {}) {
   const speed = opts.speed || (pet.value && pet.value.hunger < 30 ? 55 : 100)
   const dur = Math.max(200, (dist / speed) * 1000)
   el.style.transition = `left ${dur / 1000}s linear, top ${dur / 1000}s linear`
+  // 相机跟猫同步走（follow 模式）
+  if (camMode.value === 'follow') centerOn(target.x, target.y - 48, dur / 1000)
   requestAnimationFrame(() => { catPos.x = target.x; catPos.y = target.y })
   clearTimeout(stateTimer)
   stateTimer = setTimeout(() => { catAnim.value = 'sit'; walking = false; done && done() }, dur + 60)
@@ -247,7 +317,7 @@ function interactWith(it) {
 // 追毛线球：球滚开（本地位置动画）→ 猫追上 → 最多 3 轮 → 保存新位置
 function playYarn(it, round) {
   say('推球球！咕噜咕噜～')
-  const W = roomEl.value.clientWidth
+  const W = WORLD_W
   const dir = Math.random() < 0.5 ? -1 : 1
   const nx = Math.max(60, Math.min(W - 60, it.x + dir * (80 + Math.random() * 60)))
   // 球滚走（CSS transition 平滑）
@@ -270,15 +340,36 @@ function playYarn(it, round) {
   })
 }
 
-const roomEl = ref(null)
+const roomEl = ref(null) // 可拖动的场景视口，不包含导航与侧栏
+const worldEl = ref(null)
 const catEl = ref(null)
 
-// 窄屏（手机竖屏）：面板收进底部抽屉，点导航切换
-const isNarrow = ref(false)
+// CSS 和 JS 使用同一断点，首帧同步判断；不能用场景宽度判断设备宽度。
+const narrowMedia = window.matchMedia('(max-width: 900px)')
+const isNarrow = ref(narrowMedia.matches)
+const hudOpen = ref(false)
+const toolsOpen = ref(false)
 const sheet = ref('') // '' / 'task' / 'wish' / 'shop'
-function openSheet(name) { sheet.value = sheet.value === name ? '' : name }
-function checkNarrow() { isNarrow.value = (roomEl.value ? roomEl.value.clientWidth : 1024) < 900 }
-window.addEventListener('resize', checkNarrow)
+function openSheet(name) {
+  sheet.value = sheet.value === name ? '' : name
+  hudOpen.value = false
+  toolsOpen.value = false
+}
+function toggleCompanion() {
+  toolsOpen.value = !toolsOpen.value
+  sheet.value = ''
+  hudOpen.value = false
+}
+function checkNarrow() { isNarrow.value = narrowMedia.matches }
+function onViewportResize() {
+  checkNarrow()
+  nextTick(() => {
+    if (hudOpen.value) alignStatusPanel()
+    if (camMode.value === 'follow' && adopted.value) centerOn(catPos.x, catPos.y - 48, 0)
+    else setCamera(cam.value.x, cam.value.y)
+  })
+}
+let viewportObserver = null
 
 // ===== 语音输入：按住录音 → 转码 16k WAV → /api/asr → 文字填框 =====
 const recState = ref('idle') // idle | recording | uploading
@@ -372,6 +463,9 @@ const chatStreaming = ref(false)
 const chatLeft = ref(30)
 
 async function openChat() {
+  toolsOpen.value = false
+  hudOpen.value = false
+  sheet.value = ''
   chatOpen.value = true
   if (chatMessages.value.length === 0) {
     const d = await jget('/chat/history')
@@ -436,15 +530,43 @@ async function sendChat() {
 }
 
 // 触摸交互：点地面 → 猫快速跑过去；点物品 → 跑过去互动
+let dragCam = null // 视角拖动状态
 function onRoomTap(e) {
-  if (!adopted.value) return
-  if (e.target.closest('.panel, .chip, .cat-wrap, .pbtn, .inv-bar, .tip-bubble, .adopt-box')) return
+  if (!adopted.value || e.button !== 0) return
+  if (e.target.closest('button, input, .cat-wrap, .inv-bar')) return
+  hudOpen.value = false
+  toolsOpen.value = false
   const r = roomEl.value.getBoundingClientRect()
-  const x = Math.max(70, Math.min(r.width - 90, e.clientX - r.left))
-  const y = Math.max(r.height * 0.58, Math.min(r.height - 20, e.clientY - r.top))
-  if (placingFeed.value) { placeBowlAndGo(x, y); return } // 放置猫粮
-  say(['来啦来啦！', '等等我～', '马上去！'][Math.floor(Math.random() * 3)])
-  walkTo({ x, y }, () => behaviorNext(1500), { speed: 220 }) // 快速跑
+  // 视角拖动：按下后移动超阈值 → 拖动视角（不点地）
+  dragCam = { sx: e.clientX, sy: e.clientY, camx: cam.value.x, camy: cam.value.y, moved: false }
+  const move = (ev) => {
+    if (!dragCam) return
+    const dx = ev.clientX - dragCam.sx, dy = ev.clientY - dragCam.sy
+    if (!dragCam.moved && Math.hypot(dx, dy) < 12) return
+    dragCam.moved = true
+    camMode.value = 'free'
+    camAnim.value = 'none'
+    setCamera(dragCam.camx + dx, dragCam.camy + dy)
+  }
+  const up = (ev) => {
+    document.removeEventListener('pointermove', move)
+    document.removeEventListener('pointerup', up)
+    document.removeEventListener('pointercancel', up)
+    const wasDrag = dragCam && dragCam.moved
+    dragCam = null
+    if (wasDrag) return // 拖了视角就不点地
+    // 点地（世界坐标 = 屏幕 - 视口原点 - 相机平移）
+    if (ev.type === 'pointercancel') return
+    const worldRect = worldEl.value.getBoundingClientRect()
+    const x = clamp(ev.clientX - worldRect.left, 70, WORLD_W - 90)
+    const y = clamp(ev.clientY - worldRect.top, WORLD_H * 0.62, WORLD_H - 20)
+    if (placingFeed.value) { placeBowlAndGo(x, y); return } // 放置猫粮
+    say(['来啦来啦！', '等等我～', '马上去！'][Math.floor(Math.random() * 3)])
+    walkTo({ x, y }, () => behaviorNext(1500), { speed: 220 }) // 快速跑
+  }
+  document.addEventListener('pointermove', move)
+  document.addEventListener('pointerup', up)
+  document.addEventListener('pointercancel', up)
 }
 
 const TALK = ['喵～陪我玩！', '今天任务做完了吗？', '我在守护这个房间！', '你是最棒的主人！']
@@ -472,6 +594,7 @@ function feed() {
   if (!adopted.value || eating) return
   if (placingFeed.value) { placingFeed.value = false; say('不喂了吗？'); return } // 再点一次=取消
   placingFeed.value = true
+  toolsOpen.value = false
   say('猫粮放哪儿？点一下地面～')
 }
 function placeBowlAndGo(x, y) {
@@ -769,53 +892,91 @@ async function buyItem(it) {
 
 // 已购未摆放的道具（物品栏）
 const inventory = computed(() =>
-  shopItems.value.filter((i) => i.owned && !sceneItems.value.find((s) => s.item_key === i.key)))
-
-const ITEM_ICON = { nest: '🛏️', yarn: '🧶', plant: '🪴', fish: '🐟' }
-
-// 拖拽：物品栏拖入房间（新摆放）；场景内拖动改位置；拖到边缘收回
-let dragItem = null // {id?, key, el}
-function onItemPointerDown(e, it, sceneId) {
-  e.preventDefault()
-  e.stopPropagation()
-  dragItem = { id: sceneId || 0, key: it.key || it.item_key, moved: false }
-  const ghost = document.createElement('div')
-  ghost.className = 'drag-ghost'
-  ghost.textContent = ITEM_ICON[dragItem.key] || '🎁'
-  document.body.appendChild(ghost)
-  const move = (ev) => {
-    dragItem.moved = true
-    ghost.style.left = ev.clientX - 20 + 'px'
-    ghost.style.top = ev.clientY - 20 + 'px'
-    ghost.style.opacity = 1
-  }
-  const up = async (ev) => {
-    document.removeEventListener('pointermove', move)
-    document.removeEventListener('pointerup', up)
-    ghost.remove()
-    if (!dragItem.moved) {
-      // 点击（非拖拽）→ 猫跑过去和物品互动
-      if (adopted.value) {
-        say('我去玩那个！')
-        interactWith({ ...it, x: it.x, y: it.y })
-      }
-      return
-    }
-    const r = roomEl.value.getBoundingClientRect()
-    const x = ev.clientX - r.left, y = ev.clientY - r.top
-    // 拖到边缘（上/左/右）→ 收回物品栏
-    if (x < 40 || x > r.width - 40 || y < 40) {
-      if (dragItem.id) {
-        await jpost('/scene/remove', { id: dragItem.id })
-        say('收起来啦')
-      }
-    } else {
-      await jpost('/scene/place', { id: dragItem.id || 0, key: dragItem.key, x, y })
+  shopItems.value.filter((i) => i.owned && !isWallpaper(i.key) && !sceneItems.value.find((s) => s.item_key === i.key)))
+const wallpaperSaving = ref(false)
+async function applyWallpaper(it) {
+  if (!it.owned || wallpaperSaving.value || activeWallpaper.value === it.key) return
+  wallpaperSaving.value = true
+  try {
+    // 沿用场景持久化接口，壁纸是主题层，不伪装成可拖动家具。
+    const { ok, data } = await jpost('/scene/place', { key: it.key, x: 1, y: 1 })
+    if (!ok) return showToast(data.error || '更换壁纸失败')
+    const previous = sceneItems.value.filter(item => isWallpaper(item.item_key))
+    for (const item of previous) {
+      const removed = await jpost('/scene/remove', { id: item.id })
+      if (!removed.ok) { showToast('壁纸已换好，旧记录清理未完成'); break }
     }
     await loadAll()
+    showToast('新壁纸换好啦')
+  } catch {
+    showToast('网络暂时不通，稍后再换壁纸')
+  } finally { wallpaperSaving.value = false }
+}
+function shopAction(it) {
+  if (!it.owned) return buyItem(it)
+  if (isWallpaper(it.key)) return applyWallpaper(it)
+  if (isNarrow.value) { sheet.value = ''; toolsOpen.value = true }
+  showToast('从物品栏拖进房间；拖到边缘可以收回')
+}
+
+// 拖拽：物品栏拖入房间（新摆放）；场景内拖动改位置；拖到边缘收回
+let cancelDecorDrag = null
+function onItemPointerDown(e, it, sceneId) {
+  if (e.button !== 0) return
+  e.preventDefault()
+  e.stopPropagation()
+  cancelDecorDrag?.()
+  const drag = { id: sceneId || 0, key: it.key || it.item_key, moved: false, pointerId: e.pointerId }
+  const art = decorArt(drag.key)
+  const ghost = document.createElement('div')
+  ghost.className = 'drag-ghost'
+  const sprite = e.currentTarget.querySelector('svg')?.cloneNode(true)
+  if (sprite) { sprite.style.width = '72px'; sprite.style.height = '72px'; ghost.appendChild(sprite) }
+  document.body.appendChild(ghost)
+  const cleanup = () => {
+    document.removeEventListener('pointermove', move)
+    document.removeEventListener('pointerup', up)
+    document.removeEventListener('pointercancel', up)
+    ghost.remove()
+    cancelDecorDrag = null
   }
+  const move = ev => {
+    if (ev.pointerId !== drag.pointerId || Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 8) return
+    drag.moved = true
+    ghost.style.left = `${ev.clientX - 36}px`
+    ghost.style.top = `${ev.clientY - 72}px`
+    ghost.style.opacity = 1
+  }
+  const up = async ev => {
+    if (ev.pointerId !== drag.pointerId) return
+    cleanup()
+    if (ev.type === 'pointercancel') return
+    if (!drag.moved) {
+      if (drag.id && ['plant', 'nest', 'yarn'].includes(drag.key)) interactWith(it)
+      else showToast('按住拖动来摆放，拖到房间边缘可以收回')
+      return
+    }
+    const viewport = roomEl.value, r = viewport.getBoundingClientRect()
+    const vx = ev.clientX - r.left - viewport.clientLeft, vy = ev.clientY - r.top - viewport.clientTop
+    const worldRect = worldEl.value.getBoundingClientRect()
+    const x = clamp(ev.clientX - worldRect.left, art.size / 2, WORLD_W - art.size / 2)
+    const y = art.surface === 'wall'
+      ? clamp(ev.clientY - worldRect.top, art.size + 20, 380)
+      : clamp(ev.clientY - worldRect.top, WORLD_H * 0.62, WORLD_H - 20)
+    try {
+      let result
+      if (vx < 16 || vx > viewport.clientWidth - 16 || vy < 16 || vy > viewport.clientHeight - 16) {
+        if (!drag.id) return
+        result = await jpost('/scene/remove', { id: drag.id })
+      } else result = await jpost('/scene/place', { id: drag.id, key: drag.key, x, y })
+      if (!result.ok) return showToast(result.data.error || '摆放没有保存，请再试一次')
+      await loadAll()
+    } catch { showToast('网络暂时不通，原来的装饰没有丢失') }
+  }
+  cancelDecorDrag = cleanup
   document.addEventListener('pointermove', move)
   document.addEventListener('pointerup', up)
+  document.addEventListener('pointercancel', up)
 }
 
 const moodColor = computed(() => (!pet.value ? '' : pet.value.hunger < 30 || pet.value.mood < 30 ? 'sad' : ''))
@@ -848,12 +1009,24 @@ function tipUp() { clearTimeout(tipTimer) }
 
 function initCat() {
   if (!roomEl.value) return
-  catPos.x = roomEl.value.clientWidth * 0.55
-  catPos.y = roomEl.value.clientHeight * 0.8
+  catPos.x = WORLD_W * 0.55
+  catPos.y = WORLD_H * 0.82
+  camMode.value = 'follow'
+  centerOn(catPos.x, catPos.y - 48, 0)
+  viewportObserver?.disconnect()
+  viewportObserver = new ResizeObserver(onViewportResize)
+  viewportObserver.observe(roomEl.value)
+  clearTimeout(stateTimer)
   stateTimer = setTimeout(behaviorTick, 1200)
 }
 onMounted(async () => {
+  window.addEventListener('resize', onViewportResize)
+  document.addEventListener('pointerdown', dismissStatusOutside)
+  document.addEventListener('visibilitychange', onDocumentVisibility)
+  syncSceneLighting()
+  lightingTimer = setInterval(syncSceneLighting, 60000)
   await loadAll()
+  await nextTick()
   if (adopted.value) {
     initCat()
   } else {
@@ -868,7 +1041,15 @@ onMounted(async () => {
 })
 // 领养完成 → 初始化猫位置（修复：猫从左上角 0,0 起步的问题）
 watch(adopted, (v) => { if (v) setTimeout(initCat, 100) })
-onBeforeUnmount(() => clearTimeout(stateTimer))
+onBeforeUnmount(() => {
+  clearTimeout(stateTimer)
+  viewportObserver?.disconnect()
+  window.removeEventListener('resize', onViewportResize)
+  document.removeEventListener('pointerdown', dismissStatusOutside)
+  document.removeEventListener('visibilitychange', onDocumentVisibility)
+  clearInterval(lightingTimer)
+  cancelDecorDrag?.()
+})
 </script>
 
 <template>
@@ -919,43 +1100,78 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
   </div>
 
   <!-- 房间 -->
-  <div v-else class="room" ref="roomEl" :class="[wpClass, { 'drawer-open': isNarrow && !!sheet }]" @pointerdown="onRoomTap">
-    <div class="wall-deco">
-      <div class="window"><i class="cloud" /><i class="cloud c2" /></div>
-      <div class="baseboard"></div>
-      <div class="floorline"></div>
-    </div>
+  <div v-else class="room" ref="rootEl" :class="{ 'drawer-open': isNarrow && !!sheet }" :data-time-phase="sceneLighting.label">
+    <svg class="ui-icons" aria-hidden="true" width="0" height="0">
+      <defs>
+        <symbol id="room-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9Z" /></symbol>
+        <symbol id="room-flame" viewBox="0 0 24 24"><path d="M12 3c1 5-4 6-4 9 0 1 1 2 2 2 0-2 2-3 3-5 3 3 5 5 5 8a6 6 0 0 1-12 0C3 10 8 6 12 3Z" /></symbol>
+        <symbol id="room-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7" /><circle cx="12" cy="12" r="2" /><path d="M12 2v3m0 14v3M2 12h3m14 0h3" /></symbol>
+        <symbol id="room-paw" viewBox="0 0 24 24"><ellipse cx="5.5" cy="8" rx="2" ry="2.5" /><ellipse cx="10" cy="5" rx="2" ry="2.5" /><ellipse cx="15" cy="5" rx="2" ry="2.5" /><ellipse cx="19" cy="8" rx="2" ry="2.5" /><path d="M7 15c1-5 9-5 10 0l2 3c1 4-5 2-7 2s-8 2-7-2Z" /></symbol>
+        <symbol id="room-task" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="17" rx="3" /><path d="M9 3h6v4H9zm0 9h6m-6 4h4" /></symbol>
+        <symbol id="room-heart" viewBox="0 0 24 24"><path d="M20 5c-3-3-6-1-8 1-2-2-5-4-8-1s-1 6 2 9l6 6 6-6c3-3 5-6 2-9Z" /></symbol>
+        <symbol id="room-shop" viewBox="0 0 24 24"><path d="M4 8h16l-1 13H5Zm4 0V6a4 4 0 0 1 8 0v2" /></symbol>
+        <symbol id="room-chat" viewBox="0 0 24 24"><path d="M4 4h16v13H9l-5 4Z" /><path d="M8 8h8m-8 4h5" /></symbol>
+        <symbol id="room-food" viewBox="0 0 24 24"><path d="M3 12h18l-3 8H6ZM6 8c-2-2 2-3 0-5m6 5c-2-2 2-3 0-5m6 5c-2-2 2-3 0-5" /></symbol>
+        <symbol id="room-chevron" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5" /></symbol>
+        <symbol id="room-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6" /></symbol>
+      </defs>
+    </svg>
+    <GardenBackdrop :lighting="sceneLighting" />
+    <header class="room-header">
+      <div class="room-identity">
+        <CatSprite :species="species" anim="sit" :size="40" />
+        <div class="room-name"><h1>{{ pet?.name }}的小屋</h1><small>喵星成长屋 · {{ sceneLighting.label }} {{ sceneLighting.time }}</small></div>
+      </div>
+      <div class="header-stats">
+        <button class="star-stat" @click="showTip('stars')" aria-label="查看星星说明"><svg class="ui-icon"><use href="#room-star" /></svg>{{ pet?.balance }}</button>
+        <button class="streak-stat" @click="showTip('streak')" aria-label="查看连击说明"><svg class="ui-icon"><use href="#room-flame" /></svg>{{ pet?.streak }} 天</button>
+        <button class="status-toggle" ref="statusToggleEl" :class="{ open: hudOpen }" :aria-expanded="hudOpen" aria-controls="cat-status" aria-label="查看小猫状态" @click="toggleStatus"><svg class="ui-icon"><use href="#room-chevron" /></svg></button>
+      </div>
+    </header>
+    <!-- 房间独立取景框：世界坐标固定，控件不跟着镜头移动。 -->
+    <div class="scene-viewport" ref="roomEl" @pointerdown="onRoomTap">
+    <div class="world" ref="worldEl" :style="{ transform: 'translate(' + cam.x + 'px,' + cam.y + 'px)', transition: camAnim }">
+    <PixelRoom :wallpaper-key="activeWallpaper" />
 
     <!-- 场景道具（可拖动改位置，拖到边缘收回；被猫咬会晃） -->
-    <div v-for="it in sceneItems" :key="it.id" class="scene-item"
+    <div v-for="it in placedDecor" :key="it.id" class="scene-item"
       :class="{ shake: shakeId === it.id }"
-      :style="{ left: it.x + 'px', top: it.y + 'px', transition: it.item_key === 'yarn' ? 'left .8s ease' : '' }"
+      :style="{ left: it.x + 'px', top: it.y + 'px', zIndex: decorDepth(it), transition: it.item_key === 'yarn' ? 'left .8s ease' : '' }"
+      :title="decorArt(it.item_key).name"
       @pointerdown="(e) => onItemPointerDown(e, it, it.id)">
-      {{ ITEM_ICON[it.item_key] || '🎁' }}
+      <PixelItem :item-key="it.item_key" :size="decorArt(it.item_key).size" />
     </div>
 
-    <!-- 放置猫粮提示 -->
-    <div v-if="placingFeed" class="place-banner">🥣 点一下地面，把猫粮碗放那儿（再点"喂猫粮"可取消）</div>
-
     <!-- 食物碗（放大，猫低头吃时可见） -->
-    <svg v-if="showBowl" class="bowl" :style="{ left: bowlPos.x + 'px', top: bowlPos.y + 'px' }" width="72" height="42" viewBox="0 0 44 26">
-      <ellipse cx="22" cy="9" rx="17" ry="6" fill="#C76A84" stroke="#2C2C2A" stroke-width="2" />
-      <ellipse cx="22" cy="8" rx="12" ry="4" fill="#A24E72" />
-      <path d="M5 9 L9 22 L35 22 L39 9" fill="#E89AB4" stroke="#2C2C2A" stroke-width="2" stroke-linejoin="round" />
+    <svg v-if="showBowl" class="bowl" :style="{ left: bowlPos.x + 'px', top: bowlPos.y + 'px', zIndex: 10 + Math.floor(bowlPos.y) }" width="72" height="42" viewBox="0 0 48 28" shape-rendering="crispEdges">
+      <path d="M8 4H40V6H44V10H42V14H40V20H36V24H12V20H8V14H6V10H4V6H8Z" fill="#765449" />
+      <path d="M8 6H40V8H42V12H40V16H37V21H11V16H8V12H6V8H8Z" fill="#C78776" />
+      <path d="M12 7H36V9H40V12H36V14H12V12H8V9H12Z" fill="#744C3E" />
+      <path d="M14 9H18V11H14ZM22 8H27V11H22ZM30 10H34V12H30Z" fill="#D9A571" />
+      <path d="M11 16H37V19H34V21H14V19H11Z" fill="#E7B296" />
     </svg>
 
     <!-- 猫 -->
     <div class="cat-wrap" ref="catEl" :class="{ sad: moodColor === 'sad' }"
-      :style="{ left: catPos.x + 'px', top: catPos.y + 'px' }" @click="petCat">
+      :style="{ left: catPos.x + 'px', top: catPos.y + 'px', zIndex: catDepth }" @click="petCat">
       <div class="bubble" v-if="showBubble">{{ bubble }}</div>
       <span class="zzz" v-if="catAnim === 'sleep' && zzz">💤</span>
       <div class="cat-inner" :class="{ flip: flipped }">
         <CatSprite :species="species" :anim="catAnim" :size="110" />
       </div>
     </div>
+    </div><!-- /world -->
+    <div v-if="placingFeed" class="place-banner">点一下地面放猫粮，点“陪伴 → 取消喂食”可取消</div>
+    </div><!-- /scene-viewport -->
+    <div class="room-tools" v-show="!sheet">
+      <button class="mobile-companion" :class="{ on: toolsOpen }" :aria-expanded="toolsOpen" @click="toggleCompanion"><svg class="ui-icon"><use href="#room-paw" /></svg>陪伴</button>
+      <span class="camera-hint">{{ camMode === 'free' ? '自由视角' : '拖动画面，逛逛小屋' }}</span>
+      <button class="camera-reset" :class="{ free: camMode === 'free' }" @click="resetCam" aria-label="视角回到小猫"><svg class="ui-icon"><use href="#room-target" /></svg>回猫</button>
+    </div>
 
-    <!-- HUD（带文字说明 + 悬停/长按提示） -->
-    <div class="hud-top">
+    <!-- 完整状态锚定开关下方，独立于游戏相机。 -->
+    <span v-show="hudOpen" class="status-pointer" :style="{ top: (parseFloat(statusPosition.top || 0) - 8) + 'px', right: (parseFloat(statusPosition.right || 0) + 10) + 'px' }"></span>
+    <div class="hud-top" id="cat-status" ref="statusPanelEl" :style="statusPosition" v-show="hudOpen">
       <div class="chip">🐱 {{ pet?.name }} <small>{{ today.date }} {{ today.date_multiplier > 1 ? '· 奖励日×' + today.date_multiplier : '' }}</small></div>
       <div class="chip tippable" @mouseenter="showTip('stars')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('stars', e)" @pointerup="tipUp" @pointerleave="tipUp">星星 ⭐{{ pet?.balance }}</div>
       <div class="chip tippable" @mouseenter="showTip('level')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('level', e)" @pointerup="tipUp" @pointerleave="tipUp">等级 Lv{{ pet?.level }}</div>
@@ -963,15 +1179,17 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
       <div class="chip mini tippable" @mouseenter="showTip('hunger')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('hunger', e)" @pointerup="tipUp" @pointerleave="tipUp">饱腹<div class="bar"><i :style="{ width: (pet?.hunger || 0) + '%' }" /></div><small>{{ Math.round(pet?.hunger || 0) }}</small></div>
       <div class="chip mini tippable" @mouseenter="showTip('mood')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('mood', e)" @pointerup="tipUp" @pointerleave="tipUp">心情<div class="bar"><i class="mood" :style="{ width: (pet?.mood || 0) + '%' }" /></div><small>{{ Math.round(pet?.mood || 0) }}</small></div>
       <div class="chip switch" @click="switchKid" title="换一个小朋友登录">👤 换人</div>
+      <button class="hud-fold" @click="hudOpen = false">收起状态</button>
     </div>
 
     <!-- 提示气泡（触屏长按后松手/移开消失） -->
     <div v-if="tipShow" class="tip-bubble" @pointerdown="hideTip">{{ tipText }}</div>
 
+    <div v-if="isNarrow && sheet" class="sheet-scrim" @click="sheet = ''"></div>
     <!-- 侧栏容器：桌面=右侧自适应列；窄屏=底部抽屉 -->
     <div class="sidebar" :class="{ open: !!sheet, narrow: isNarrow }">
     <div class="panel" id="taskPanel" v-show="!isNarrow || sheet === 'task'">
-      <div class="panel-bar">📋 今日任务（{{ today.tasks.filter(t => t.status === 'approved').length }}/{{ today.tasks.length }}）</div>
+      <div class="panel-bar">📋 今日任务（{{ today.tasks.filter(t => t.status === 'approved').length }}/{{ today.tasks.length }}）<button class="sheet-close" @click="sheet = ''" aria-label="关闭任务"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
         <div v-for="t in today.tasks" :key="t.id" class="task" :class="t.status === 'approved' ? 'done' : t.status === 'submitted' ? 'wait' : ''">
           <div class="ic">{{ t.snapshot?.icon }}</div>
@@ -989,7 +1207,7 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
     </div>
 
     <div class="panel wish" id="wishPanel" v-show="!isNarrow || sheet === 'wish'">
-      <div class="panel-bar">🌠 我的愿望 <a @click="newWish">+ 许愿</a></div>
+      <div class="panel-bar">🌠 我的愿望 <a @click="newWish">+ 许愿</a><button class="sheet-close" @click="sheet = ''" aria-label="关闭愿望"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
         <div v-for="w in wishes.filter(x => x.status !== 'rejected')" :key="w.id" class="wish-row">
           <div class="wt">✨ {{ w.title }} <a v-if="['pending', 'saving'].includes(w.status)" class="cancel" @click="cancelWish(w)">✕</a></div>
@@ -1003,11 +1221,13 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
     </div>
 
     <div class="panel shop" id="shopPanel" v-show="!isNarrow || sheet === 'shop'">
-      <div class="panel-bar">🛒 像素商店</div>
+      <div class="panel-bar">🛒 像素商店<button class="sheet-close" @click="sheet = ''" aria-label="关闭商店"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
         <div v-for="it in shopItems" :key="it.key" class="shop-row">
+          <PixelItem v-if="!isWallpaper(it.key)" :item-key="it.key" :size="32" />
+          <i v-else class="wallpaper-swatch" :style="{ backgroundColor: decorArt(it.key).wallColor }" aria-hidden="true"></i>
           <span>{{ it.name }}</span><em>{{ it.price }}⭐</em>
-          <button :class="{ owned: it.owned }" @click="buyItem(it)">{{ it.owned ? '已购' : '购买' }}</button>
+          <button :class="{ owned: it.owned }" :disabled="wallpaperSaving" @click="shopAction(it)">{{ !it.owned ? '购买' : isWallpaper(it.key) ? (activeWallpaper === it.key ? '使用中' : '使用') : '摆放' }}</button>
         </div>
       </div>
     </div>
@@ -1015,23 +1235,24 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
     </div><!-- /sidebar -->
 
     <!-- 窄屏底部导航 -->
-    <div v-if="isNarrow" class="sheet-nav">
-      <button :class="{ on: sheet === 'task' }" @click="openSheet('task')">📋 任务</button>
-      <button :class="{ on: sheet === 'wish' }" @click="openSheet('wish')">🌠 愿望</button>
-      <button :class="{ on: sheet === 'shop' }" @click="openSheet('shop')">🛒 商店</button>
-    </div>
+    <nav v-if="isNarrow" class="sheet-nav" aria-label="小屋导航">
+      <button :class="{ on: sheet === 'task' }" @click="openSheet('task')"><span class="nav-icon"><svg class="ui-icon"><use href="#room-task" /></svg></span><span>任务</span></button>
+      <button :class="{ on: sheet === 'wish' }" @click="openSheet('wish')"><span class="nav-icon"><svg class="ui-icon"><use href="#room-heart" /></svg></span><span>愿望</span></button>
+      <button :class="{ on: sheet === 'shop' }" @click="openSheet('shop')"><span class="nav-icon"><svg class="ui-icon"><use href="#room-shop" /></svg></span><span>商店</span></button>
+      <button :class="{ on: chatOpen }" @click="openChat"><span class="nav-icon"><svg class="ui-icon"><use href="#room-chat" /></svg></span><span>聊天</span></button>
+    </nav>
 
     <!-- 物品栏：已购未摆放的道具，拖入房间 -->
-    <div v-if="inventory.length" class="inv-bar">
+    <div v-if="inventory.length && (!isNarrow || toolsOpen)" class="inv-bar">
       <span class="lbl">拖我进房间→</span>
-      <div v-for="it in inventory" :key="it.key" class="inv-item"
-        @pointerdown="(e) => onItemPointerDown(e, it, 0)">{{ ITEM_ICON[it.key] || '🎁' }}</div>
+      <div v-for="it in inventory" :key="it.key" class="inv-item" :title="it.name"
+        @pointerdown="(e) => onItemPointerDown(e, it, 0)"><PixelItem :item-key="it.key" :size="40" /></div>
     </div>
 
-    <div class="actions">
-      <button class="pbtn feed" @click="feed">🍖 喂猫粮<small>10⭐{{ placingFeed ? ' · 放置中' : '' }}</small></button>
-      <button class="pbtn hint" @click="petCat">👆 摸摸头</button>
-      <button class="pbtn chatbtn" @click="openChat">💬 聊天<small>剩{{ chatLeft }}条</small></button>
+    <div class="actions" v-show="!isNarrow || toolsOpen">
+      <button class="pbtn feed" @click="feed"><span class="action-icon"><svg class="ui-icon"><use href="#room-food" /></svg></span><span class="action-copy"><b>{{ placingFeed ? '取消喂食' : '喂猫粮' }}</b><small>10 星星 / 次</small></span></button>
+      <button class="pbtn hint" @click="petCat"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>摸摸头</b><small>陪它开心一下</small></span></button>
+      <button class="pbtn chatbtn" @click="openChat"><span class="action-icon"><svg class="ui-icon"><use href="#room-chat" /></svg></span><span class="action-copy"><b>聊聊天</b><small>今日还可聊 {{ chatLeft }} 句</small></span></button>
     </div>
 
     <!-- AI 分析状态层（b 模式提交后 ~20 秒） -->
@@ -1137,201 +1358,271 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
 
 <style scoped>
 * { box-sizing: border-box; font-family: 'PingFang SC', 'Hiragino Sans GB', system-ui, sans-serif; }
-.adopt-mask { position: fixed; inset: 0; z-index: 100; background: rgba(250, 243, 227, .97); display: flex; align-items: center; justify-content: center; overflow-y: auto; }
-.adopt-box { max-width: 620px; width: 92vw; background: #fff; border: 2px solid #2C2C2A; border-radius: 14px; box-shadow: 6px 6px 0 rgba(44, 44, 42, .85); padding: 24px; margin: 20px; }
+button { font: inherit; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid #9C8BC5; outline-offset: 3px; }
+
+/* 领养与登录 */
+.adopt-mask { position: fixed; inset: 0; z-index: 100; background: rgba(250, 243, 227, .97); display: flex; align-items: center; justify-content: center; padding: 20px 0; overflow-y: auto; touch-action: pan-y; }
+.adopt-box { max-width: 620px; width: 92vw; background: #FFFCF6; color: #5D493B; border: 2px solid #CBB49A; border-radius: 18px; box-shadow: 0 12px 36px rgba(100, 73, 47, .14); padding: 24px; margin: auto; }
 .adopt-box h2 { font-size: 22px; text-align: center; margin-bottom: 4px; }
-.adopt-box .sub { text-align: center; font-size: 13px; color: #888780; margin-bottom: 18px; }
+.adopt-box .sub { text-align: center; font-size: 13px; color: #88786A; margin-bottom: 18px; }
 .cats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 18px; }
-.cat-card { border: 2px solid #2C2C2A; border-radius: 10px; padding: 12px 8px; text-align: center; cursor: pointer; box-shadow: 3px 3px 0 rgba(44, 44, 42, .6); background: #FAF3E3; }
-.cat-card:hover { transform: translateY(-4px); }
-.cat-card.sel { background: #EEEDFE; border-color: #534AB7; border-width: 3px; }
+.cat-card { border: 2px solid #D9C6AD; border-radius: 12px; padding: 12px 8px; text-align: center; cursor: pointer; box-shadow: 0 3px 0 #E8DCCB; background: #FAF3E3; transition: transform .18s ease; }
+.cat-card:hover { transform: translateY(-3px); }
+.cat-card.sel { background: #EEEBFA; border-color: #9C8BC5; }
 .cat-card .nm { font-size: 14px; font-weight: 700; margin-top: 6px; }
-.cat-card .ds { font-size: 11px; color: #888780; margin-top: 2px; }
-.code-input { width: 100%; font-size: 22px; text-align: center; letter-spacing: 8px; border: 2px solid #2C2C2A; border-radius: 10px; padding: 12px; outline: none; margin-bottom: 12px; }
-.enter-btn { width: 100%; font-size: 16px; font-weight: 700; color: #fff; background: #534AB7; border: 2px solid #2C2C2A; border-radius: 10px; padding: 12px; cursor: pointer; box-shadow: 3px 3px 0 rgba(44,44,42,.7); }
-.tiny { font-size: 11px; color: #888780; margin-top: 12px; text-align: center; }
+.cat-card .ds { font-size: 11px; color: #88786A; margin-top: 2px; }
+.code-input { width: 100%; font-size: 22px; text-align: center; letter-spacing: 8px; border: 1.5px solid #CBB49A; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+.enter-btn { width: 100%; font-size: 16px; font-weight: 700; color: #fff; background: #8370AF; border: 1.5px solid #706098; border-radius: 10px; padding: 12px; cursor: pointer; box-shadow: 0 3px 0 #D8CFE8; }
+.tiny { font-size: 11px; color: #88786A; margin-top: 12px; text-align: center; }
 .pick-list { display: flex; flex-direction: column; gap: 10px; margin: 16px 0; }
-.pick-btn small { font-size: 12px; color: #888780; font-weight: 400; margin-left: 8px; }
-.pick-btn { font-size: 17px; font-weight: 700; background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; padding: 14px; cursor: pointer; box-shadow: 3px 3px 0 rgba(44,44,42,.6); }
-.pick-btn:active { transform: translate(2px, 2px); box-shadow: none; }
-.new-kid { display: block; text-align: center; color: #534AB7; font-size: 13px; font-weight: 600; cursor: pointer; padding: 8px; }
-.adopt-row { display: flex; gap: 10px; }
-.adopt-row input { flex: 1; font-size: 14px; border: 2px solid #2C2C2A; border-radius: 8px; padding: 9px 12px; outline: none; }
-.adopt-row button { font-size: 15px; font-weight: 700; cursor: pointer; color: #fff; background: #534AB7; border: 2px solid #2C2C2A; border-radius: 8px; padding: 9px 22px; box-shadow: 3px 3px 0 rgba(44, 44, 42, .85); }
+.pick-btn { font-size: 17px; font-weight: 700; color: #5D493B; background: #fff; border: 1.5px solid #D9C6AD; border-radius: 12px; padding: 14px; cursor: pointer; box-shadow: 0 3px 0 #E8DCCB; }
+.pick-btn small { font-size: 12px; color: #88786A; font-weight: 400; margin-left: 8px; }
+.pick-btn:active { transform: translateY(1px); box-shadow: none; }
+.new-kid { display: block; text-align: center; color: #75609D; font-size: 13px; font-weight: 600; cursor: pointer; padding: 8px; }
+.adopt-row { display: flex; gap: 10px; margin-bottom: 12px; }
+.adopt-row input { flex: 1; min-width: 0; font-size: 14px; border: 1.5px solid #CBB49A; border-radius: 8px; padding: 9px 12px; }
+.adopt-row button { font-size: 15px; font-weight: 700; cursor: pointer; color: #fff; background: #8370AF; border: 1.5px solid #706098; border-radius: 8px; padding: 9px 22px; }
 
-.room { position: fixed; inset: 0; overflow: hidden; background: linear-gradient(#FDF6E3 0%, #FBEFD1 55%, #EFE3BC 56%, #E9C58F 57%, #E3BB78 100%); }
-.wall-deco, .window { position: absolute; inset: 0; pointer-events: none; }
-.window { left: 10%; top: 7%; width: 150px; height: 110px; border: 6px solid #B48A5A; border-radius: 10px; background: linear-gradient(#AED9F2 60%, #C9E8F7); }
-.cloud { position: absolute; width: 34px; height: 12px; background: #fff; border-radius: 8px; top: 18px; animation: drift 14s linear infinite; }
-.cloud.c2 { top: 40px; animation-delay: 6s; width: 24px; }
-@keyframes drift { 0% { left: -40px; } 100% { left: 130px; } }
-.baseboard { position: absolute; left: 0; right: 0; top: calc(56% + 1px); height: 10px; background: #D8B183; border-bottom: 3px solid #C4A06C; }
-.floorline { position: absolute; left: 0; right: 0; top: 57%; bottom: 0; background: repeating-linear-gradient(0deg, transparent 0 46px, rgba(44, 44, 42, .07) 46px 49px); }
-
+.ui-icons { position: absolute; pointer-events: none; }
+.ui-icon { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.camera-hint { font-size: 11px; color: #88786A; white-space: nowrap; }
+/* 美术分层：庭院在视口外；固定世界内仅基础墙地纹理，装饰独立持久化。 */
+.room { position: fixed; inset: 0; overflow: hidden; color: #5D493B; background: #617a4f; cursor: default; }
+.scene-viewport { position: absolute; top: clamp(112px, 14vh, 152px); bottom: 132px; left: clamp(68px, 7vw, 132px); right: clamp(344px, 25vw, 420px); max-width: 1280px; max-height: 720px; overflow: hidden; z-index: 1; border: 8px solid #8b6547; border-top-color: #c8a778; border-left-color: #b18b61; border-radius: 6px; background: #dbb27b url('/art/wood-floor.png') center bottom / 1280px 320px repeat; image-rendering: pixelated; box-shadow: 0 0 0 4px #e0d1b4, 0 8px 0 4px #74644d, 0 14px 0 4px rgb(48 58 34 / 35%); touch-action: none; }
+.world { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; background: #e9c891; will-change: transform; }
 .cat-wrap { position: absolute; width: 110px; margin-left: -55px; margin-top: -100px; cursor: pointer; z-index: 5; }
 .cat-inner { transition: transform .3s; transform-origin: 50% 90%; }
 .cat-inner.flip { transform: scaleX(-1); }
 .cat-wrap.sad { filter: grayscale(.75); }
-.bubble { position: absolute; left: 50%; top: -46px; transform: translateX(-50%); background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; padding: 6px 12px; font-size: 12px; font-weight: 600; white-space: nowrap; box-shadow: 2px 2px 0 rgba(44, 44, 42, .7); }
+.bubble { position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); width: max-content; max-width: 300px; background: #FFFCF6; border: 1.5px solid #CBB49A; border-radius: 12px; padding: 8px 12px; font-size: 12px; line-height: 1.5; font-weight: 600; white-space: normal; overflow-wrap: anywhere; box-shadow: 0 4px 12px rgba(103, 75, 47, .12); pointer-events: none; }
+.zzz { position: absolute; top: -20px; right: 0; }
+.scene-item { position: absolute; transform: translate(-50%, -100%); line-height: 0; cursor: grab; user-select: none; touch-action: none; }
+.scene-item.shake { animation: shake .5s ease-in-out 3; }
+@keyframes shake { 0%, 100% { transform: translate(-50%, -100%) rotate(0); } 30% { transform: translate(-50%, -100%) rotate(-8deg); } 60% { transform: translate(-50%, -100%) rotate(6deg); } }
+.bowl { position: absolute; transform: translate(-50%, -100%); z-index: 6; }
+.place-banner { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); z-index: 8; width: max-content; max-width: calc(100% - 32px); background: #FFF1D6; color: #805A32; border: 1.5px solid #D6B58A; border-radius: 12px; padding: 8px 14px; font-size: 12px; line-height: 1.5; font-weight: 700; box-shadow: 0 4px 12px rgba(103, 75, 47, .12); pointer-events: none; }
+.room:has(.place-banner) .scene-viewport { cursor: crosshair; }
 
-.hud-top { position: absolute; top: 12px; left: 12px; display: flex; gap: 8px; flex-wrap: wrap; z-index: 10; max-width: 62%; }
-.chip { display: flex; align-items: center; gap: 6px; background: #fff; border: 2px solid #2C2C2A; border-radius: 8px; box-shadow: 3px 3px 0 rgba(44, 44, 42, .85); padding: 5px 10px; font-weight: 600; font-size: 13px; }
-.chip small { font-size: 10px; font-weight: 400; color: #888780; }
-.chip.mini .bar { width: 60px; height: 10px; background: #F1EFE8; border: 2px solid #2C2C2A; border-radius: 5px; overflow: hidden; }
-.chip.mini .bar i { display: block; height: 100%; background: linear-gradient(90deg, #F0997B, #D85A30); transition: width .5s; }
-.chip.mini .bar i.mood { background: linear-gradient(90deg, #97C459, #3B6D11); }
+/* 标题与默认收起的状态浮层，开关交给 v-show */
+.room-header { position: absolute; top: 20px; left: clamp(68px, 7vw, 132px); right: clamp(344px, 25vw, 420px); min-height: 64px; z-index: 16; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; background: #fff8e8; border: 2px solid #b29870; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; }
+.room-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.room-identity > :first-child { flex-shrink: 0; }
+.room-name { min-width: 0; }
+.room-name h1 { margin: 0; font-size: 22px; line-height: 1.3; letter-spacing: .5px; font-weight: 800; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-name small { display: block; margin-top: 4px; font-size: 11px; line-height: 1.4; color: #88786A; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.header-stats { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.header-stats button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 36px; padding: 7px 11px; border: 1px solid #DCCCB6; border-radius: 12px; background: rgba(255, 252, 246, .92); color: #70543C; font-size: 12px; font-weight: 700; white-space: nowrap; cursor: pointer; box-shadow: 0 2px 6px rgba(103, 75, 47, .05); }
+.header-stats svg { width: 18px; height: 18px; flex-shrink: 0; }
+.header-stats .star-stat { background: #FFF1D5; color: #94692F; }
+.header-stats .streak-stat { background: #F8E9DF; color: #9A6450; }
+.header-stats .status-toggle { color: #75609D; background: #F0ECF8; border-color: #D9CFE9; }
+.status-toggle svg { transition: transform .18s; }
+.status-toggle.open svg { transform: rotate(180deg); }
+.hud-top { position: absolute; left: auto; max-height: calc(100dvh - 190px); display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 14px; z-index: 32; background: #fff9ed; border: 2px solid #b09b78; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; overflow-y: auto; touch-action: pan-y; }
+.hud-top::before { content: ''; position: absolute; top: 0; right: 8px; width: 12px; height: 4px; background: #8370af; }
+.hud-top .chip:first-child { grid-column: 1 / -1; }
+.hud-top .chip.mini { flex-direction: column; align-items: start; gap: 6px; }
+.hud-top .chip.mini .bar { width: 100%; }
+.hud-top .chip.mini small { align-self: flex-end; }
+.chip { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; background: #F7F0E5; border: 1px solid #E6D8C5; border-radius: 10px; padding: 8px 10px; font-weight: 600; font-size: 12px; flex-wrap: wrap; }
+.chip small { font-size: 10px; font-weight: 400; color: #88786A; }
+.chip.mini .bar { width: 60px; height: 8px; background: #EAE1D4; border-radius: 5px; overflow: hidden; }
+.chip.mini .bar i { display: block; height: 100%; background: #D99B7D; transition: width .5s; }
+.chip.mini .bar i.mood { background: #99AE89; }
+.chip.mini small { font-size: 10px; color: #705F50; font-weight: 700; }
+.chip.switch { cursor: pointer; background: #EEEBF7; color: #75609D; border-color: #DCD2EB; }
+.chip.tippable { cursor: help; -webkit-touch-callout: none; user-select: none; }
+.hud-fold { margin-left: auto; border: 0; background: transparent; font-size: 12px; color: #75609D; font-weight: 700; cursor: pointer; padding: 8px; }
+.tip-bubble { position: absolute; left: 24px; top: 82px; z-index: 90; max-width: min(320px, calc(100% - 48px)); background: #6C5849; color: #FFF9EE; border: 1px solid #A28D78; border-radius: 12px; padding: 10px 14px; font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; box-shadow: 0 6px 18px rgba(103, 75, 47, .16); animation: tipin .18s ease; }
+@keyframes tipin { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 
-.panel { background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; box-shadow: 4px 4px 0 rgba(44, 44, 42, .85); z-index: 10; width: 248px; }
-.panel-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 2px solid #2C2C2A; font-size: 13px; font-weight: 600; background: #E1F5EE; }
-.panel.wish .panel-bar { background: #EEEDFE; }
-.panel.shop .panel-bar { background: #FAEEDA; }
-.panel-bar a { margin-left: auto; color: #534AB7; font-size: 12px; cursor: pointer; }
-.panel-body { padding: 10px; }
-/* 侧栏：桌面=右侧自适应列（永不互相遮挡）；窄屏=底部抽屉 */
-.sidebar { position: absolute; top: 12px; right: 12px; bottom: 84px; width: 248px; display: flex; flex-direction: column; gap: 12px; z-index: 10; }
-.sidebar .panel { position: static; flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; }
-.sidebar .panel .panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; max-height: none; }
+/* 侧栏与任务、愿望、商店 */
+.sidebar { position: absolute; top: 106px; right: 24px; bottom: 100px; width: 272px; display: flex; flex-direction: column; gap: 12px; z-index: 25; min-height: 0; }
+.panel { width: 100%; min-width: 0; background: #fff9eb; border: 2px solid #b59d76; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; overflow: hidden; }
+.sidebar .panel { position: static; flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
 #taskPanel { flex-grow: 2; }
-#wishPanel, #shopPanel { flex-grow: 1; }
-/* 窄屏：底部抽屉（隐藏在屏幕外，open 弹出） */
-.sidebar.narrow { top: auto; left: 0; right: 0; bottom: 112px; width: auto; max-height: 56vh; transform: translateY(calc(100% + 130px)); transition: transform .28s ease; gap: 0; }
-.sidebar.narrow.open { transform: none; }
-.sidebar.narrow .panel { width: 100%; max-height: 56vh; }
-.sheet-nav { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 30; display: flex; gap: 8px; }
-.sheet-nav button { flex: 1; font-size: 13px; font-weight: 700; cursor: pointer; padding: 10px 0; background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; box-shadow: 3px 3px 0 rgba(44,44,42,.85); }
-.sheet-nav button.on { background: #534AB7; color: #fff; }
-.task { display: flex; align-items: center; gap: 8px; border: 2px solid #2C2C2A; border-radius: 8px; padding: 7px 8px; background: #fff; margin-bottom: 8px; }
-.task.done { background: #E1F5EE; }
-.task.wait { background: #EEEDFE; }
-.task .ic { width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; font-size: 17px; border: 2px solid #2C2C2A; border-radius: 6px; background: #FAEEDA; }
+.panel-bar { display: flex; align-items: center; flex-shrink: 0; gap: 8px; min-height: 44px; padding: 10px 12px; border-bottom: 1px solid #E6D8C5; font-size: 13px; font-weight: 700; background: #EAF0E3; }
+.panel.wish .panel-bar { background: #EFEBF7; }
+.panel.shop .panel-bar { background: #FAEEDB; }
+.panel-bar a { margin-left: auto; color: #75609D; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.sheet-close { display: none; margin-left: auto; flex: 0 0 28px; width: 28px; height: 28px; padding: 4px; align-items: center; justify-content: center; background: rgba(255, 255, 255, .7); color: #796653; border: 1px solid #D9C7B1; border-radius: 8px; cursor: pointer; }
+.sheet-close svg { width: 16px; height: 16px; }
+.panel-body { padding: 10px; }
+.sidebar .panel .panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; }
+.sheet-scrim { position: fixed; inset: 0; z-index: 19; background: rgba(88, 69, 51, .2); }
+.sheet-nav { display: none; }
+.task { display: flex; align-items: center; gap: 7px; border: 1px solid #E4D6C4; border-radius: 10px; padding: 8px; background: #fff; margin-bottom: 8px; }
+.task.done { background: #EDF3E8; border-color: #D4E0CC; }
+.task.wait { background: #F1EDF9; border-color: #DED6ED; }
+.task .ic { flex: 0 0 30px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; font-size: 17px; border: 1px solid #E3CFB1; border-radius: 8px; background: #FAEEDA; }
 .task .info { flex: 1; min-width: 0; }
-.task .nm { font-size: 12.5px; font-weight: 600; }
-.task .sub { font-size: 10.5px; color: #888780; }
-.task button, .shop-row button { font-size: 11px; font-weight: 600; cursor: pointer; border: 2px solid #2C2C2A; border-radius: 6px; padding: 4px 10px; background: #EEEDFE; box-shadow: 2px 2px 0 rgba(44, 44, 42, .85); }
-.task button:active { transform: translate(2px, 2px); box-shadow: none; }
-.st.ok { color: #1D9E75; font-weight: 700; }
-.st.wait-t { color: #534AB7; font-weight: 700; font-size: 12px; }
-.st.skip { color: #888780; }
-.empty { font-size: 12px; color: #888780; text-align: center; padding: 8px; }
+.task .nm { font-size: 12.5px; line-height: 1.45; font-weight: 600; overflow-wrap: anywhere; }
+.task .sub { font-size: 10.5px; line-height: 1.5; color: #88786A; }
+.task button, .shop-row button { flex-shrink: 0; font-size: 11px; font-weight: 600; cursor: pointer; color: #75609D; border: 1px solid #D5C8E7; border-radius: 8px; padding: 6px 8px; background: #EEEBF7; white-space: nowrap; box-shadow: 0 2px 0 #E5DDEE; }
+.task button:active, .shop-row button:active { transform: translateY(1px); box-shadow: none; }
+.st.ok { color: #719462; font-weight: 700; }
+.st.wait-t { color: #75609D; font-weight: 700; font-size: 11px; white-space: nowrap; }
+.st.skip { color: #88786A; font-size: 11px; white-space: nowrap; }
+.empty { font-size: 12px; color: #88786A; text-align: center; padding: 12px 8px; }
 .wish-row { margin-bottom: 10px; }
-.wish-row .wt { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
-.wish-row .track { height: 16px; background: #F1EFE8; border: 2px solid #2C2C2A; border-radius: 8px; overflow: hidden; position: relative; }
-.wish-row .track i { display: block; height: 100%; background: linear-gradient(90deg, #FAC775, #EF9F27); transition: width .6s; }
+.wish-row .wt { font-size: 13px; font-weight: 700; margin-bottom: 4px; overflow-wrap: anywhere; }
+.wish-row .track { height: 16px; background: #EFE6D7; border: 1px solid #D7C3A9; border-radius: 8px; overflow: hidden; position: relative; }
+.wish-row .track i { display: block; height: 100%; background: linear-gradient(90deg, #EBC995, #DDA761); transition: width .6s; }
 .wish-row .track span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 10.5px; font-weight: 700; }
-.wsub { font-size: 11px; color: #888780; }
-.wsub.done { color: #EF9F27; font-weight: 700; }
-.shop-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 6px; }
-.shop-row span { flex: 1; font-weight: 600; }
-.shop-row em { font-style: normal; color: #854F0B; font-weight: 700; }
-.shop-row button.owned { background: #E1F5EE; color: #1D9E75; }
+.wsub { font-size: 11px; color: #88786A; }
+.wsub.done { color: #A67B3F; font-weight: 700; }
+.wish-row .cancel { float: right; color: #A56860; font-weight: 700; cursor: pointer; margin-left: 8px; font-size: 12px; padding: 2px 6px; }
+.shop-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 8px; }
+.shop-row span { flex: 1; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.shop-row em { font-style: normal; color: #94692F; font-weight: 700; white-space: nowrap; }
+.shop-row button.owned { background: #EDF3E8; color: #719462; border-color: #D4E0CC; }
 
-.modal-mask { position: absolute; inset: 0; z-index: 95; background: rgba(44,44,42,.35); display: flex; align-items: center; justify-content: center; }
-.modal-box { width: min(360px, 88vw); background: #fff; border: 2px solid #2C2C2A; border-radius: 14px; box-shadow: 6px 6px 0 rgba(44,44,42,.6); padding: 20px; animation: tipin .2s ease; }
+/* 互动操作、独立相机工具与可横滚物品栏 */
+.pbtn { font-size: 14px; font-weight: 600; cursor: pointer; padding: 10px 14px; color: #70543C; background: #FFF1DB; border: 1.5px solid #D8BFA1; border-radius: 12px; box-shadow: 0 3px 8px rgba(103, 75, 47, .08); }
+.pbtn:active { transform: translateY(1px); box-shadow: none; }
+.pbtn small { display: block; font-size: 10px; line-height: 1.4; font-weight: 400; color: #88786A; }
+.actions { position: absolute; bottom: 30px; left: 24px; max-width: calc(100% - 470px); display: flex; gap: 10px; z-index: 17; }
+.actions .pbtn { display: flex; align-items: center; gap: 10px; min-width: 0; height: 52px; padding: 8px 14px; }
+.actions .feed { background: #FFF0D9; border-color: #DABF9B; }
+.actions .hint { background: #EEE9F8; color: #75609D; border-color: #CFC2E3; }
+.actions .chatbtn { background: #F9EAE3; border-color: #DFC1B4; }
+.action-icon { display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.action-icon svg { width: 24px; height: 24px; }
+.action-copy { min-width: 0; text-align: left; }
+.action-copy b { display: block; font-size: 13px; line-height: 1.4; white-space: nowrap; }
+.action-copy small { margin-top: 2px; white-space: nowrap; }
+.room-tools { position: absolute; right: 320px; bottom: 38px; z-index: 18; display: flex; align-items: center; gap: 10px; }
+.mobile-companion { display: none; }
+.camera-reset { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.camera-reset svg, .mobile-companion svg { flex-shrink: 0; width: 18px; height: 18px; }
+.camera-reset.free, .camera-reset.on { background: #EEEBF7; color: #75609D; border-color: #CFC2E3; }
+.inv-bar { position: absolute; bottom: 126px; left: 40px; max-width: min(580px, calc(100% - 376px)); z-index: 17; background: rgba(255, 252, 246, .94); border: 1px solid #D5C1A8; border-radius: 14px; box-shadow: 0 4px 12px rgba(103, 75, 47, .1); padding: 6px 10px; display: flex; gap: 8px; align-items: center; overflow-x: auto; overscroll-behavior-x: contain; touch-action: pan-x; scrollbar-width: thin; }
+.scene-viewport .inv-bar { bottom: 16px; left: 16px; max-width: min(580px, calc(100% - 32px)); }
+.inv-bar .lbl { flex-shrink: 0; font-size: 11px; color: #88786A; white-space: nowrap; }
+.inv-item { flex: 0 0 44px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; border: 2px dashed #b39b73; border-radius: 4px; cursor: grab; user-select: none; touch-action: none; background: #fff1d8; }
+.wallpaper-swatch { display: block; flex: 0 0 24px; width: 24px; height: 24px; border: 2px solid #b09b78; background: #edccd0 url('/art/plaster.png') center / 128px; background-blend-mode: multiply; image-rendering: pixelated; }
+:global(.drag-ghost) { position: fixed; width: 72px; height: 72px; opacity: 0; pointer-events: none; z-index: 999; image-rendering: pixelated; }
+.status-pointer { position: absolute; width: 14px; height: 10px; background: #b09b78; clip-path: polygon(50% 0, 100% 100%, 0 100%); z-index: 33; pointer-events: none; }
+
+/* 功能遮罩都在导航之上，滚动区域不接管场景拖动 */
+.modal-mask, .chat-mask, .think-mask, .pprev-mask { position: fixed; inset: 0; display: flex; justify-content: center; background: rgba(77, 60, 45, .32); }
+.modal-mask { z-index: 96; align-items: center; padding: 16px; overflow-y: auto; touch-action: pan-y; }
+.modal-box { width: min(360px, 100%); max-height: calc(100dvh - 32px); overflow-y: auto; background: #FFFCF6; border: 1.5px solid #CBB49A; border-radius: 18px; box-shadow: 0 16px 48px rgba(77, 60, 45, .2); padding: 20px; animation: tipin .2s ease; touch-action: pan-y; }
 .modal-box h3 { font-size: 17px; margin-bottom: 12px; }
-.modal-box input { width: 100%; font-size: 14px; border: 2px solid #2C2C2A; border-radius: 8px; padding: 10px 12px; outline: none; margin-bottom: 10px; }
+.modal-box input { width: 100%; font-size: 16px; border: 1.5px solid #D5C1A8; border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; }
 .modal-btns { display: flex; gap: 10px; margin-top: 6px; }
-.modal-btns button { flex: 1; font-size: 14px; font-weight: 700; cursor: pointer; border: 2px solid #2C2C2A; border-radius: 8px; padding: 10px; box-shadow: 3px 3px 0 rgba(44,44,42,.6); }
-.modal-btns .primary { background: #534AB7; color: #fff; }
-.modal-btns .ghost { background: #F1EFE8; }
-.wish-row .cancel { float: right; color: #A32D2D; font-weight: 700; cursor: pointer; margin-left: 8px; font-size: 12px; padding: 2px 6px; }
-
-.place-banner { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); z-index: 90; background: #EF9F27; color: #fff; border: 2px solid #2C2C2A; border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 700; box-shadow: 3px 3px 0 rgba(44,44,42,.5); animation: tipin .2s ease; }
-.room { cursor: default; }
-.room:has(.place-banner) { cursor: crosshair; }
-.bowl { position: absolute; transform: translate(-50%, -100%); z-index: 6; } /* z 高于道具低于猫：低头吃时可见 */
-
-/* 猫聊天 */
-.pbtn.chatbtn { background: #EF9F27; font-size: 13px; }
-/* AI 分析状态层 */
-.think-mask { position: absolute; inset: 0; z-index: 98; background: rgba(44,44,42,.55); display: flex; align-items: center; justify-content: center; }
-.think-box { background: #FFF9EE; border: 2px solid #2C2C2A; border-radius: 18px; padding: 28px 32px; text-align: center; box-shadow: 4px 4px 0 rgba(44,44,42,.6); }
+.modal-btns button { flex: 1; font-size: 14px; font-weight: 700; cursor: pointer; border: 1.5px solid #D5C1A8; border-radius: 10px; padding: 10px; }
+.modal-btns .primary { background: #8370AF; border-color: #706098; color: #fff; }
+.modal-btns .ghost { background: #F3EDE3; color: #796653; }
+.think-mask { z-index: 98; align-items: center; background: rgba(77, 60, 45, .48); padding: 16px; }
+.think-box { max-width: 100%; background: #FFF9EE; border: 1.5px solid #CBB49A; border-radius: 20px; padding: 28px 24px; text-align: center; box-shadow: 0 16px 48px rgba(77, 60, 45, .2); }
 .think-cat { font-size: 44px; animation: bouncecat 1.2s infinite; }
 @keyframes bouncecat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
 .think-box b { display: block; margin: 10px 0 8px; font-size: 16px; }
 .think-dots { display: flex; gap: 5px; justify-content: center; margin-bottom: 8px; }
-.think-dots i { width: 7px; height: 7px; background: #EF9F27; border-radius: 50%; animation: dotp 1s infinite; }
+.think-dots i { width: 7px; height: 7px; background: #DDA761; border-radius: 50%; animation: dotp 1s infinite; }
 .think-dots i:nth-child(2) { animation-delay: .2s; }
 .think-dots i:nth-child(3) { animation-delay: .4s; }
 @keyframes dotp { 40% { opacity: .25; transform: scale(.8); } }
-.think-box small { color: #888780; font-size: 12px; }
+.think-box small { color: #88786A; font-size: 12px; }
+.pprev-mask { z-index: 99; align-items: center; background: rgba(38, 31, 26, .88); }
+.pprev-mask img { max-width: 94%; max-height: 94dvh; object-fit: contain; border-radius: 10px; }
 
-/* 向导内证据预览 */
-.wprev { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-.wprev-item { position: relative; }
-.wprev-item img { width: 74px; height: 74px; object-fit: cover; border: 2px solid #2C2C2A; border-radius: 8px; cursor: zoom-in; }
-.wprev-item audio { height: 36px; max-width: 200px; }
-.wprev-del { position: absolute; top: -8px; right: -8px; width: 20px; height: 20px; background: #A32D2D; color: #fff; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; cursor: pointer; border: 1.5px solid #fff; }
-
-/* 照片大图 */
-.pprev-mask { position: absolute; inset: 0; z-index: 99; background: rgba(0,0,0,.85); display: flex; align-items: center; justify-content: center; }
-.pprev-mask img { max-width: 94%; max-height: 94%; border-radius: 10px; }
-
-/* 提交向导 */
-.wizard-box { width: min(460px, 94vw); max-height: 70vh; background: #FFF9EE; border: 2px solid #2C2C2A; border-radius: 18px; box-shadow: 0 -4px 0 rgba(44,44,42,.5); display: flex; flex-direction: column; animation: chatin .22s ease; }
-.wizard-body { flex: 1; overflow-y: auto; padding: 14px; }
-.wstep { background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; padding: 12px; margin-bottom: 10px; }
-.wstep.done { background: #E8F5E9; border-color: #A5D6A7; }
-.wstep-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.wstep-head b { font-size: 14px; }
-.wstep-head small { font-size: 11px; color: #888780; }
-.wstep-head em { font-style: normal; margin-left: auto; color: #2E7D32; font-weight: 700; font-size: 13px; }
-.wstep .pbtn { width: 100%; background: #EF9F27; color: #fff; border: 2px solid #2C2C2A; border-radius: 10px; padding: 10px; font-weight: 700; cursor: pointer; box-shadow: 2px 2px 0 rgba(44,44,42,.6); }
-.wizard-foot { padding: 10px 14px; border-top: 2px solid #2C2C2A; }
-.ok-btn { width: 100%; font-size: 16px; font-weight: 800; color: #fff; background: #534AB7; border: 2px solid #2C2C2A; border-radius: 12px; padding: 12px; cursor: pointer; box-shadow: 3px 3px 0 rgba(44,44,42,.7); }
-.ok-btn:disabled { opacity: .4; }
-.chat-mask { position: absolute; inset: 0; z-index: 96; background: rgba(44,44,42,.3); display: flex; align-items: flex-end; justify-content: center; }
-.chat-box { width: min(460px, 94vw); height: 62vh; background: #FFF9EE; border: 2px solid #2C2C2A; border-radius: 18px 18px 0 0; box-shadow: 0 -4px 0 rgba(44,44,42,.5); display: flex; flex-direction: column; animation: chatin .22s ease; }
-@keyframes chatin { from { transform: translateY(40px); opacity: 0; } }
-.chat-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 2px solid #2C2C2A; background: #FAEEDA; border-radius: 18px 18px 0 0; }
-.chat-head b { font-size: 15px; }
-.chat-left { font-size: 11px; color: #888780; margin-left: auto; }
-.chat-head a { cursor: pointer; font-size: 15px; padding: 2px 8px; }
-.chat-body { flex: 1; overflow-y: auto; padding: 14px; }
+/* 聊天与提交向导 */
+.chat-mask { z-index: 97; align-items: flex-end; }
+.chat-box, .wizard-box { width: min(460px, 94vw); min-height: 0; background: #FFF9EE; border: 1.5px solid #CBB49A; border-radius: 18px 18px 0 0; box-shadow: 0 -8px 32px rgba(77, 60, 45, .16); display: flex; flex-direction: column; overflow: hidden; animation: chatin .22s ease; }
+.chat-box { height: min(70dvh, 600px); }
+.wizard-box { max-height: min(80dvh, 700px); }
+@keyframes chatin { from { transform: translateY(32px); opacity: 0; } }
+.chat-head { display: flex; align-items: center; flex-shrink: 0; gap: 8px; padding: 12px 14px; border-bottom: 1px solid #E6D8C5; background: #FAEEDA; }
+.chat-head b { min-width: 0; font-size: 15px; overflow-wrap: anywhere; }
+.chat-left { flex-shrink: 0; font-size: 11px; color: #88786A; margin-left: auto; }
+.chat-head a { flex-shrink: 0; cursor: pointer; font-size: 15px; padding: 4px 8px; }
+.chat-body, .wizard-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 14px; overscroll-behavior: contain; touch-action: pan-y; }
 .msg { display: flex; gap: 8px; margin-bottom: 12px; }
 .msg.user { flex-direction: row-reverse; }
-.msg .avatar { width: 34px; height: 34px; flex: 0 0 34px; display: flex; align-items: center; justify-content: center; background: #fff; border: 2px solid #2C2C2A; border-radius: 50%; font-size: 17px; }
-.msg .bubble-txt { max-width: 74%; background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; padding: 8px 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-.msg.user .bubble-txt { background: #EEEDFE; }
+.msg .avatar { width: 34px; height: 34px; flex: 0 0 34px; display: flex; align-items: center; justify-content: center; background: #fff; border: 1px solid #D9C7B1; border-radius: 10px; font-size: 17px; }
+.msg .bubble-txt { min-width: 0; max-width: calc(100% - 42px); background: #fff; border: 1px solid #E4D6C4; border-radius: 12px; padding: 8px 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.user .bubble-txt { background: #EEEBF7; border-color: #DCD2EB; }
 .cursor { animation: blink .8s infinite; font-style: normal; }
 @keyframes blink { 50% { opacity: 0; } }
-.chat-input { display: flex; gap: 8px; padding: 10px 12px; border-top: 2px solid #2C2C2A; background: #fff; }
-.chat-input input { flex: 1; border: 2px solid #2C2C2A; border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none; }
-.rec-btn { flex: 0 0 46px; height: 44px; font-size: 20px; background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; cursor: pointer; position: relative; box-shadow: 2px 2px 0 rgba(44,44,42,.6); }
-.rec-btn.recording { background: #A32D2D; color: #fff; border-color: #6B1F1F; }
-.rec-btn.recording i { display: inline-block; width: 6px; height: 6px; background: #fff; border-radius: 50%; margin-left: 4px; animation: pulse 0.8s infinite; }
-.rec-btn.uploading { background: #FAEEDA; }
+.chat-input { display: flex; align-items: center; flex-shrink: 0; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid #E6D8C5; background: #FFFCF6; }
+.chat-input input { flex: 1 1 0; min-width: 0; width: 0; height: 44px; border: 1.5px solid #D5C1A8; border-radius: 10px; padding: 10px; font-size: 16px; background: #fff; }
+.chat-input button { flex-shrink: 0; height: 44px; font-size: 14px; font-weight: 700; color: #805A32; background: #FFF0D5; border: 1.5px solid #D8BFA1; border-radius: 10px; padding: 8px 12px; cursor: pointer; }
+.chat-input .rec-btn { position: static; flex: 0 0 44px; width: 44px; height: 44px; padding: 0; font-size: 20px; color: #75609D; background: #EEEBF7; border-color: #CFC2E3; box-shadow: 0 2px 6px rgba(103, 75, 47, .06); opacity: 1; touch-action: manipulation; user-select: none; }
+.chat-input .rec-btn.recording { background: #AF6D66; color: #fff; border-color: #975B55; }
+.chat-input .rec-btn.recording i { display: inline-block; width: 6px; height: 6px; background: #fff; border-radius: 50%; margin-left: 2px; animation: pulse .8s infinite; }
+.chat-input .rec-btn.uploading { background: #FAEEDA; }
 @keyframes pulse { 50% { opacity: .2; } }
-.chat-input button { font-size: 14px; font-weight: 700; color: #fff; background: #EF9F27; border: 2px solid #2C2C2A; border-radius: 10px; padding: 8px 16px; cursor: pointer; box-shadow: 2px 2px 0 rgba(44,44,42,.7); }
-.chat-input button:disabled { opacity: .5; }
+.chat-input button:disabled { opacity: .55; cursor: default; }
+.wstep { background: #fff; border: 1px solid #E4D6C4; border-radius: 12px; padding: 12px; margin-bottom: 10px; }
+.wstep.done { background: #EDF3E8; border-color: #D4E0CC; }
+.wstep-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.wstep-head b { font-size: 14px; overflow-wrap: anywhere; }
+.wstep-head small { font-size: 11px; color: #88786A; }
+.wstep-head em { font-style: normal; margin-left: auto; color: #719462; font-weight: 700; font-size: 13px; }
+.wstep .pbtn { width: 100%; background: #FFF0D5; color: #805A32; }
+.wizard-foot { flex-shrink: 0; padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid #E6D8C5; }
+.ok-btn { width: 100%; font-size: 16px; font-weight: 800; color: #fff; background: #8370AF; border: 1.5px solid #706098; border-radius: 12px; padding: 12px; cursor: pointer; }
+.ok-btn:disabled { opacity: .4; cursor: default; }
+.wprev { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.wprev-item { position: relative; min-width: 0; max-width: 100%; }
+.wprev-item img { width: 74px; height: 74px; object-fit: cover; border: 1.5px solid #D5C1A8; border-radius: 8px; cursor: zoom-in; }
+.wprev-item audio { height: 36px; width: 200px; max-width: 100%; }
+.wprev-del { position: absolute; top: -8px; right: -8px; width: 20px; height: 20px; background: #AF6D66; color: #fff; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; cursor: pointer; border: 1.5px solid #fff; }
 
-.inv-bar { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); z-index: 11; background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; box-shadow: 4px 4px 0 rgba(44,44,42,.85); padding: 6px 10px; display: flex; gap: 8px; align-items: center; }
-.inv-bar .lbl { font-size: 11px; color: #888780; }
-.inv-item { width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; border: 2px dashed #2C2C2A; border-radius: 8px; cursor: grab; user-select: none; background: #FAF3E3; font-size: 22px; touch-action: none; }
-.scene-item { position: absolute; transform: translate(-50%, -100%); font-size: 40px; z-index: 4; cursor: grab; touch-action: none; }
-.drag-ghost { position: fixed; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; font-size: 22px; opacity: 0; pointer-events: none; z-index: 999; transition: opacity .15s; }
-
-.actions { position: absolute; bottom: 12px; left: 12px; display: flex; gap: 10px; z-index: 10; }
-.pbtn { font-size: 15px; font-weight: 600; cursor: pointer; padding: 10px 18px; color: #fff; border: 2px solid #2C2C2A; border-radius: 10px; box-shadow: 3px 3px 0 rgba(44, 44, 42, .85); }
-.pbtn:active { transform: translate(3px, 3px); box-shadow: none; }
-.pbtn.feed { background: #F0997B; }
-.pbtn.hint { background: #534AB7; font-size: 13px; }
-.pbtn small { display: block; font-size: 10px; font-weight: 400; opacity: .9; }
-.chip.switch { cursor: pointer; background: #EEEDFE; color: #534AB7; }
-.chip.switch:active { transform: translate(1px, 1px); }
-.chip.tippable { cursor: help; -webkit-touch-callout: none; user-select: none; }
-.chip.mini small { font-size: 10px; color: #5F5E5A; font-weight: 700; }
-.tip-bubble { position: absolute; left: 12px; top: 54px; z-index: 90; max-width: 300px; background: #2C2C2A; color: #FDF6E3; border: 2px solid #FDF6E3; border-radius: 10px; padding: 10px 14px; font-size: 12px; line-height: 1.65; box-shadow: 3px 3px 0 rgba(44,44,42,.4); animation: tipin .18s ease; }
-@keyframes tipin { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
-
-.scene-item.shake { animation: shake .5s ease-in-out 3; }
-@keyframes shake { 0%, 100% { transform: translate(-50%, -100%) rotate(0); } 30% { transform: translate(-50%, -100%) rotate(-8deg); } 60% { transform: translate(-50%, -100%) rotate(6deg); } }
-
+/* 与 JS matchMedia 的 900px 断点一致 */
 @media (max-width: 900px) {
-  .inv-bar { bottom: 112px; }
-  .actions { bottom: 112px; }
-  .task .sub { display: none; }
+  .scene-viewport { inset: max(82px, calc(env(safe-area-inset-top, 0px) + 70px)) 10px calc(142px + env(safe-area-inset-bottom, 0px)); max-width: none; max-height: none; border-width: 4px; border-radius: 4px; box-shadow: 0 0 0 2px #e0d1b4, 0 6px 0 2px #74644d; }
+  .camera-hint { font-size: 10px; padding: 4px 8px; background: #fff8e8; border-radius: 4px; }
+  .room-tools { gap: 6px; }
+  .room-header { top: max(env(safe-area-inset-top, 0px), 14px); left: 16px; right: 16px; min-height: 44px; gap: 8px; padding: 6px 8px; border: 1px solid rgba(217, 199, 177, .65); border-radius: 16px; background: rgba(255, 252, 246, .92); box-shadow: 0 4px 14px rgba(103, 75, 47, .08); }
+  .room-identity { gap: 6px; flex: 1; }
+  .room-name h1 { font-size: 16px; letter-spacing: 0; }
+  .room-name small { font-size: 10px; margin-top: 2px; }
+  .header-stats { gap: 4px; }
+  .header-stats button { min-height: 32px; padding: 5px 7px; gap: 4px; border-radius: 10px; font-size: 11px; box-shadow: none; }
+  .header-stats svg { width: 16px; height: 16px; }
+  .header-stats .streak-stat { display: none; }
+  .hud-top { left: auto; max-height: calc(100dvh - 190px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); padding: 10px; gap: 6px; }
+  .chip { padding: 7px 8px; font-size: 11px; gap: 5px; }
+  .chip.mini .bar { width: 48px; }
+  .tip-bubble { top: max(86px, calc(env(safe-area-inset-top, 0px) + 70px)); left: 16px; max-width: calc(100% - 32px); }
+  .place-banner { top: max(86px, calc(env(safe-area-inset-top, 0px) + 70px)); }
+  .sheet-nav { position: absolute; left: 12px; right: 12px; bottom: max(12px, calc(env(safe-area-inset-bottom, 0px) + 8px)); height: 66px; z-index: 40; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; padding: 5px; border: 1px solid #DCCCB6; border-radius: 20px; background: rgba(255, 252, 246, .98); box-shadow: 0 6px 22px rgba(103, 75, 47, .13); }
+  .sheet-nav button { min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 4px; border: 0; border-radius: 14px; background: transparent; color: #88786A; font-size: 11px; line-height: 1.3; font-weight: 600; cursor: pointer; }
+  .sheet-nav button.on, .sheet-nav button.active { background: #EEEBF7; color: #75609D; }
+  .nav-icon { display: flex; align-items: center; justify-content: center; }
+  .nav-icon svg { width: 24px; height: 24px; }
+  .room-tools { left: 16px; right: 16px; bottom: calc(92px + env(safe-area-inset-bottom, 0px)); justify-content: space-between; }
+  .mobile-companion { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; background: rgba(255, 252, 246, .94); color: #796653; border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+  .mobile-companion.on, .mobile-companion.active { background: #EEEBF7; color: #75609D; border-color: #CFC2E3; }
+  .actions { bottom: calc(142px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; max-width: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 4px; background: rgba(255, 252, 246, .9); border: 1px solid #E4D6C4; border-radius: 18px; box-shadow: 0 5px 16px rgba(103, 75, 47, .09); }
+  .actions .pbtn { width: 100%; height: 58px; justify-content: center; gap: 8px; padding: 8px; }
+  .action-icon svg { width: 22px; height: 22px; }
+  .action-copy b { font-size: 13px; }
+  .action-copy small { font-size: 10px; }
+  .actions .chatbtn { display: none; }
+  .inv-bar, .scene-viewport .inv-bar { bottom: calc(214px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; width: max-content; max-width: calc(100% - 32px); }
+  .sidebar.narrow { top: auto; bottom: calc(90px + env(safe-area-inset-bottom, 0px)); left: 12px; right: 12px; width: auto; max-height: 60dvh; display: none; gap: 0; }
+  .sidebar.narrow.open { display: flex; }
+  .sidebar.narrow .panel { flex: 0 1 auto; max-height: 60dvh; }
+  .sidebar.narrow .sheet-close { display: inline-flex; }
+  .chat-box, .wizard-box { width: 100%; border-bottom: 0; }
+  .chat-head { padding: 12px; }
+  .chat-head b { font-size: 14px; }
+  .chat-left { font-size: 10px; }
+  .chat-input { gap: 6px; padding-left: 10px; padding-right: 10px; }
+  .bubble { max-width: min(260px, calc(100vw - 32px)); font-size: 12px; white-space: normal; }
+  .scene-item { font-size: 34px; }
 }
-/* 抽屉打开时隐藏底部操作区（喂猫/摸头/物品栏让位给任务卡） */
+
+/* 抽屉打开时让操作区与物品栏退场 */
 .room.drawer-open .actions, .room.drawer-open .inv-bar { display: none; }
-@media (min-width: 901px) and (max-width: 760px) { }
+@media (prefers-reduced-motion: reduce) {
+  .scene-item.shake, .think-cat, .think-dots i, .cursor, .chat-input .rec-btn.recording i { animation: none; }
+  .cat-card, .cat-inner, .chip.mini .bar i, .wish-row .track i, :global(.drag-ghost) { transition: none; }
+  .modal-box, .chat-box, .wizard-box, .tip-bubble { animation: none; }
+}
 </style>
