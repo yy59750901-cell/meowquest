@@ -106,6 +106,8 @@ async function jpost(url, body) {
   return { ok: r.ok, data: await r.json().catch(() => ({})) }
 }
 
+const hadDuration = ref({}) // {taskID:bool} 计时任务曾达标（AI 退回后免重新计时）
+
 async function loadAll() {
   const [sp, p, t, w, s, sc] = await Promise.all([
     jget('/species'), jget('/pet'), jget('/tasks/today'), jget('/wish/list'), jget('/shop'), jget('/scene'),
@@ -113,6 +115,7 @@ async function loadAll() {
   if (sp) speciesList.value = sp.species || []
   if (p && p.pet) { adopted.value = true; pet.value = p.pet; species.value = p.pet.species }
   if (t) today.value = t
+  hadDuration.value = t.had_duration || {}
   if (t && t.tasks) today.value.tasks = t.tasks.map(x => ({ ...x, snapshot: typeof x.snapshot === 'string' ? JSON.parse(x.snapshot) : x.snapshot }))
   if (w) wishes.value = w.wishes || []
   if (s) shopItems.value = s.items || []
@@ -277,6 +280,161 @@ function openSheet(name) { sheet.value = sheet.value === name ? '' : name }
 function checkNarrow() { isNarrow.value = (roomEl.value ? roomEl.value.clientWidth : 1024) < 900 }
 window.addEventListener('resize', checkNarrow)
 
+// ===== 语音输入：按住录音 → 转码 16k WAV → /api/asr → 文字填框 =====
+const recState = ref('idle') // idle | recording | uploading
+let mediaRec = null, recChunks = [], recStream = null
+
+async function recStart() {
+  if (recState.value !== 'idle' || chatStreaming.value) return
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+  } catch (e) { return showToast('麦克风没开权限哦，去设置里打开～') }
+  recChunks = []
+  mediaRec = new MediaRecorder(recStream)
+  mediaRec.ondataavailable = (e) => recChunks.push(e.data)
+  mediaRec.onstop = onRecStop
+  mediaRec.start()
+  recState.value = 'recording'
+}
+function recStop() {
+  if (recState.value !== 'recording') return
+  recState.value = 'uploading'
+  try { mediaRec.stop() } catch (e) { recState.value = 'idle' }
+}
+
+// 录音 Blob → 16kHz 单声道 WAV（全浏览器格式归一：Safari mp4 / Chrome webm / Firefox ogg 都解进来重编）
+async function blobToWav16k(blob) {
+  const arr = await blob.arrayBuffer()
+  const ctx = new AudioContext({ sampleRate: 16000 })
+  const audio = await ctx.decodeAudioData(arr) // 浏览器解码自己录的格式
+  // 混单声道
+  let ch = audio.getChannelData(0)
+  if (audio.numberOfChannels > 1) {
+    const ch2 = audio.getChannelData(1)
+    for (let i = 0; i < ch.length; i++) ch[i] = (ch[i] + ch2[i]) / 2
+  }
+  const buf = ctx.createBuffer(1, ch.length, 16000)
+  buf.copyToChannel ? buf.copyToChannel(ch, 0) : buf.getChannelData(0).set(ch)
+  // 上采样重采样：用 OfflineAudioContext 保证 16k
+  const off = new OfflineAudioContext(1, Math.ceil(audio.duration * 16000), 16000)
+  const src = off.createBufferSource()
+  src.buffer = audio
+  src.connect(off.destination)
+  src.start()
+  const rendered = await off.startRendering()
+  const data = rendered.getChannelData(0)
+  // WAV 编码（44 字节头 + PCM16）
+  const len = data.length
+  const wav = new ArrayBuffer(44 + len * 2)
+  const view = new DataView(wav)
+  const ws = (o, str) => { for (let i = 0; i < str.length; i++) view.setUint8(o + i, str.charCodeAt(i)) }
+  ws(0, 'RIFF'); view.setUint32(4, 36 + len * 2, true); ws(8, 'WAVE')
+  ws(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true)
+  view.setUint32(24, 16000, true); view.setUint32(28, 32000, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true)
+  ws(36, 'data'); view.setUint32(40, len * 2, true)
+  let o = 44
+  for (let i = 0; i < len; i++, o += 2) {
+    const v = Math.max(-1, Math.min(1, data[i]))
+    view.setInt16(o, v < 0 ? v * 0x8000 : v * 0x7FFF, true)
+  }
+  ctx.close()
+  return new Blob([wav], { type: 'audio/wav' })
+}
+
+async function onRecStop() {
+  recStream.getTracks().forEach((t) => t.stop())
+  const blob = new Blob(recChunks, { type: recChunks[0]?.type || 'audio/webm' })
+  if (blob.size < 2000) { // 太短（<~0.1s）忽略
+    recState.value = 'idle'
+    return
+  }
+  try {
+    const wav = await blobToWav16k(blob)
+    const fd = new FormData()
+    fd.append('file', wav, 'rec.wav')
+    const r = await fetch('/api/asr', { method: 'POST', body: fd })
+    const d = await r.json()
+    if (d.text) {
+      chatInput.value = (chatInput.value ? chatInput.value + ' ' : '') + d.text
+      if (navigator.vibrate) navigator.vibrate(60) // 转写完成轻震
+    } else showToast(d.error || '猫没听清，再说一次？')
+  } catch (e) {
+    showToast('网络卡了喵…')
+  }
+  recState.value = 'idle'
+}
+
+// ===== 猫聊天（SSE 流式打字机） =====
+const chatOpen = ref(false)
+const chatMessages = ref([]) // {role, content}
+const chatInput = ref('')
+const chatStreaming = ref(false)
+const chatLeft = ref(30)
+
+async function openChat() {
+  chatOpen.value = true
+  if (chatMessages.value.length === 0) {
+    const d = await jget('/chat/history')
+    chatMessages.value = d.messages || []
+    chatLeft.value = d.left_today ?? 30
+    if (!chatMessages.value.length) {
+      chatMessages.value = [{ role: 'assistant', content: '喵～想和我聊什么呀？' }]
+    }
+  }
+  if (adopted.value) say('聊点什么呀～')
+}
+
+async function sendChat() {
+  const text = chatInput.value.trim()
+  if (!text || chatStreaming.value) return
+  if (chatLeft.value <= 0) return showToast('今天聊得够多啦，猫要睡觉了喵～明天再来')
+  chatInput.value = ''
+  chatMessages.value.push({ role: 'user', content: text })
+  chatLeft.value--
+  chatStreaming.value = true
+  const reply = { role: 'assistant', content: '' }
+  chatMessages.value.push(reply)
+
+  // fetch + ReadableStream 解析 SSE（EventSource 不支持 POST）
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text }),
+    })
+    if (r.status === 429) {
+      const e = await r.json()
+      reply.content = e.error || '今天聊够啦～'
+      chatStreaming.value = false
+      return
+    }
+    const reader = r.body.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    catAnim.value = 'eat' // 说话时张嘴动画
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop()
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue
+        try {
+          const d = JSON.parse(line.slice(5).trim())
+          if (d.d) { reply.content += d.d; chatMessages.value = [...chatMessages.value] }
+          if (d.error) { reply.content = d.error }
+        } catch (e) { /* 半行 */ }
+      }
+    }
+    catAnim.value = 'sit'
+  } catch (e) {
+    reply.content = reply.content || '喵呜…卡住了，再试一次？'
+    catAnim.value = 'sit'
+  }
+  chatStreaming.value = false
+}
+
 // 触摸交互：点地面 → 猫快速跑过去；点物品 → 跑过去互动
 function onRoomTap(e) {
   if (!adopted.value) return
@@ -359,16 +517,46 @@ async function submitTask(t, body = {}) {
     extra_sec: body.duration_sec || 0,
     evidence: body.evidence || [],
   }
+  // b 模式：显示"猫在看作业"状态层（后端判定 ~20 秒，期间锁操作）
+  const isB = (t.snapshot && t.snapshot.confirm_mode || '').includes('b')
+  if (isB) aiThinking.value = true
+
   const { ok, data } = await jpost(`/tasks/${t.id}/submit`, payload)
   submitting.value = 0
+  aiThinking.value = false
+
+  // AI 反馈写入猫聊天面板（可回看，不再一闪而过）
+  const aiFeedback = data && (data.kid_feedback || data.ai_reason)
+  if (isB && aiFeedback) {
+    const stars = data.ai_score ? '⭐'.repeat(Math.max(1, Math.min(5, data.ai_score))) + ' ' : ''
+    const content = stars + aiFeedback
+    chatMessages.value.push({ role: 'assistant', content })
+    chatOpen.value = true // 自动打开对话框看反馈
+    setTimeout(() => {
+      const el = document.getElementById('chatBody')
+      if (el) el.scrollTop = el.scrollHeight
+    }, 100)
+  }
   if (data.settled) {
     showToast('任务完成！')
     hearts(6)
     say('主人真棒！')
     await loadAll()
+  } else if (data.waiting && data.ai_pass) {
+    // b 模式：AI 初审通过 → 等家长终审（score 模式带星级与猫反馈）
+    const stars = data.ai_score ? '⭐'.repeat(Math.max(1, Math.min(5, data.ai_score))) + ' ' : ''
+    showToast(stars + '猫觉得你做得很好！等妈妈最后确认～')
+    hearts(4)
+    say(data.kid_feedback || `猫看了你的作业：${data.ai_reason || '做得不错'}！等妈妈最后看一眼～`)
+    await loadAll()
   } else if (data.waiting) {
     showToast('提交成功，等妈妈确认哦～')
     say('等妈妈看看～')
+    await loadAll()
+  } else if (data.redo) {
+    // b 模式：AI 觉得不够 → 温柔退回（无限重试）
+    showToast('猫觉得还可以再试一次喵～')
+    say(data.kid_feedback || `咦…${data.ai_reason || '再认真一点'}。再试一次，我在这里等你喵！`)
     await loadAll()
   } else {
     showToast(data.error || '提交失败')
@@ -380,7 +568,16 @@ const timerTask = ref(null) // 打开全屏计时页的任务
 function startTask(t) {
   const snap = t.snapshot
   if (snap.goal_type === 'duration' && snap.goal_value > 0) {
-    timerTask.value = t
+    // 计时曾达标（材料被 AI 退回重做）→ 免重新计时，直接补材料
+    if (!hadDuration.value[t.id]) {
+      timerTask.value = t
+      return
+    }
+  }
+  // 新流程：配置了提交步骤 → 向导（逐步引导拍照/录音）
+  const steps = parseSteps(snap)
+  if (steps.length > 0) {
+    openWizard(t, steps)
     return
   }
   const ev = snap.evidence_type || ''
@@ -391,20 +588,131 @@ function startTask(t) {
   }
   submitTask(t)
 }
+
+// ===== 提交向导（多步骤证据） =====
+const wizard = ref(null) // { task, steps, done: {} }
+function parseSteps(snap) {
+  try {
+    const arr = typeof snap.evidence_steps === 'string' ? JSON.parse(snap.evidence_steps) : (snap.evidence_steps || [])
+    return Array.isArray(arr) && arr.length ? arr : []
+  } catch (e) { return [] }
+}
+function openWizard(t, steps, durationSec) {
+  wizard.value = { task: t, steps, done: {}, duration: durationSec || 0 } // done[i] = [{type,path},...]（每步可多文件）
+  say('跟着提示一步步来哦～')
+}
+function wizardDoneCount(w) {
+  return w.steps.filter((st) => w.done[st.kind + '_' + w.steps.indexOf(st)]).length
+}
+const wizardInput = ref(null)
+let wizardStepIdx = -1
+function wizardPick(st, idx) {
+  wizardStepIdx = idx
+  if (wizardInput.value) {
+    wizardInput.value.accept = st.kind === 'photo' ? 'image/*' : 'audio/*'
+    wizardInput.value.multiple = true // 支持多张（如多页口算）
+    wizardInput.value.click()
+  }
+}
+// 任何格式图片 → 压缩 JPEG（HEIC 归一 + 长边 2048 + 质量 0.85，AI vision 只认 jpg/png/webp）
+async function normalizeImage(file) {
+  if (!file.type.startsWith('image')) return file
+  try {
+    const bitmap = await createImageBitmap(file)
+    const MAX = 2048
+    const scale = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height))
+    const w = Math.round(bitmap.width * scale), h = Math.round(bitmap.height * scale)
+    const cv = document.createElement('canvas')
+    cv.width = w; cv.height = h
+    cv.getContext('2d').drawImage(bitmap, 0, 0, w, h)
+    bitmap.close()
+    const blob = await new Promise((res) => cv.toBlob(res, 'image/jpeg', 0.85))
+    if (blob && blob.size > 0 && blob.size < file.size) {
+      return new File([blob], (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' })
+    }
+  } catch (e) { /* 解码失败（如 SVG 动图）→ 原样返回 */ }
+  return file
+}
+
+async function onWizardFile(e) {
+  const files = Array.from(e.target.files || [])
+  e.target.value = ''
+  if (!files.length || !wizard.value) return
+  const w = wizard.value
+  const idx = wizardStepIdx
+  if (!w.steps[idx]) return
+  showToast(files.length > 1 ? `上传 ${files.length} 个文件中…` : '上传中…')
+  for (const f0 of files) {
+    const file = await normalizeImage(f0)
+    const fd = new FormData()
+    fd.append('file', file)
+    try {
+      const r = await fetch('/api/upload', { method: 'POST', body: fd })
+      const d = await r.json()
+      if (!d.path) continue
+      const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
+      if (!w.done[idx]) w.done[idx] = []
+      w.done[idx].push({ type, path: d.path })
+    } catch (err) { /* 单个失败不阻塞 */ }
+  }
+  if (!w.done[idx] || !w.done[idx].length) { showToast('上传失败，再试一次？'); return }
+  wizard.value = { ...w, done: { ...w.done } }
+}
+function wizardRemoveFile(idx, fi) {
+  const w = wizard.value
+  if (!w) return
+  w.done[idx].splice(fi, 1)
+  if (!w.done[idx].length) delete w.done[idx]
+  wizard.value = { ...w, done: { ...w.done } }
+}
+function wizardReady(w) {
+  return !w.steps.some((st, i) => st.required && !(w.done[i] && w.done[i].length))
+}
+const aiThinking = ref(false) // b 模式：AI 分析中（全屏状态层 + 锁操作）
+let aiThinkTimer = null
+function previewPhoto(url) {
+  photoPreview.value = url
+}
+const photoPreview = ref(null)
+
+async function wizardSubmit() {
+  const w = wizard.value
+  const evs = w.steps.map((st, i) => w.done[i] || []).flat()
+  const t = w.task
+  const dur = w.duration || (t.snapshot.goal_type === 'duration' && t.snapshot.goal_value > 0 ? t.snapshot.goal_value * 60 : 0)
+  wizard.value = null
+  await submitTask(t, { evidence: evs, duration_sec: dur })
+}
 async function onTimerDone(sec) {
   const t = timerTask.value
   timerTask.value = null
-  if (t) await submitTask(t, { duration_sec: sec })
+  if (!t) return
+  // 计时达标 + 配置了证据步骤 → 转向导补材料（duration 暂存随提交带上）
+  const steps = parseSteps(t.snapshot)
+  if (steps.length > 0) {
+    openWizard(t, steps, sec)
+    return
+  }
+  const ev = t.snapshot.evidence_type || ''
+  if (ev.includes('photo') || ev.includes('audio') || ev.includes('video')) {
+    evidenceTask = t
+    timerSec = sec
+    evidenceInput.value && evidenceInput.value.click()
+    return
+  }
+  await submitTask(t, { duration_sec: sec })
 }
+let timerSec = 0
 function onTimerGiveup() { timerTask.value = null }
 
 // 拍照/录音（file input：HTTP 局域网下摄像头 API 不可用，iPad 会调起相机/录音）
 const evidenceInput = ref(null)
 let evidenceTask = null
 async function onEvidenceFile(e) {
-  const file = e.target.files && e.target.files[0]
+  const f0 = e.target.files && e.target.files[0]
   e.target.value = ''
-  if (!file || !evidenceTask) return
+  if (!f0 || !evidenceTask) return
+  const file = await normalizeImage(f0)
   const fd = new FormData()
   fd.append('file', file)
   showToast('上传中…')
@@ -414,7 +722,9 @@ async function onEvidenceFile(e) {
   const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
   const t = evidenceTask
   evidenceTask = null
-  await submitTask(t, { evidence: [{ type, path: d.path }] })
+  const dur = timerSec || (t.snapshot.goal_type === 'duration' ? t.snapshot.goal_value * 60 : 0)
+  timerSec = 0
+  await submitTask(t, { evidence: [{ type, path: d.path }], duration_sec: dur })
 }
 function taskBtnLabel(snap) {
   if (snap.goal_type === 'duration' && snap.goal_value > 0) return '计时开始'
@@ -721,6 +1031,85 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
     <div class="actions">
       <button class="pbtn feed" @click="feed">🍖 喂猫粮<small>10⭐{{ placingFeed ? ' · 放置中' : '' }}</small></button>
       <button class="pbtn hint" @click="petCat">👆 摸摸头</button>
+      <button class="pbtn chatbtn" @click="openChat">💬 聊天<small>剩{{ chatLeft }}条</small></button>
+    </div>
+
+    <!-- AI 分析状态层（b 模式提交后 ~20 秒） -->
+    <div v-if="aiThinking" class="think-mask">
+      <div class="think-box">
+        <div class="think-cat">🐱</div>
+        <b>猫正在认真看你的作业…</b>
+        <div class="think-dots"><i></i><i></i><i></i></div>
+        <small>别走开，马上就好喵～</small>
+      </div>
+    </div>
+
+    <!-- 照片大图预览 -->
+    <div v-if="photoPreview" class="pprev-mask" @click.self="photoPreview = null">
+      <img :src="photoPreview" @click="photoPreview = null" />
+    </div>
+
+    <!-- 提交向导（多步骤证据） -->
+    <div v-if="wizard" class="chat-mask">
+      <div class="wizard-box">
+        <div class="chat-head">
+          <b>{{ wizard.task.snapshot.icon }} {{ wizard.task.snapshot.name }}</b>
+          <span class="chat-left">{{ wizard.steps.length }} 步</span>
+          <a @click="wizard = null">✕</a>
+        </div>
+        <div class="wizard-body">
+          <div v-for="(st, i) in wizard.steps" :key="i" class="wstep" :class="{ done: wizardReady(wizard) && wizard.done[i] }">
+            <div class="wstep-head">
+              <b>{{ st.kind === 'photo' ? '📷' : '🎙' }} {{ st.label }}</b>
+              <small v-if="!st.required">可选</small>
+              <em v-if="wizard.done[i] && wizard.done[i].length">✓ {{ wizard.done[i].length }} 个</em>
+            </div>
+            <button class="pbtn" @click="wizardPick(st, i)">
+              {{ wizard.done[i] && wizard.done[i].length ? '再传一张 / 重新选' : st.kind === 'photo' ? '拍照 / 相册（可多张）' : '录音 / 音频文件' }}
+            </button>
+            <div v-if="wizard.done[i] && wizard.done[i].length" class="wprev">
+              <div v-for="(f, fi) in wizard.done[i]" :key="fi" class="wprev-item">
+                <img v-if="f.type === 'photo'" :src="f.path" @click="previewPhoto(f.path)" />
+                <audio v-else-if="f.type === 'audio'" :src="f.path" controls preload="none" />
+                <a class="wprev-del" @click="wizardRemoveFile(i, fi)">✕</a>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="wizard-foot">
+          <button class="ok-btn" :disabled="!wizardReady(wizard)" @click="wizardSubmit">
+            交给猫看 🐱
+          </button>
+        </div>
+      </div>
+    </div>
+    <input ref="wizardInput" type="file" style="display: none" @change="onWizardFile" />
+
+    <!-- 猫聊天面板（SSE 打字机） -->
+    <div v-if="chatOpen" class="chat-mask">
+      <div class="chat-box">
+        <div class="chat-head">
+          <b>🐱 {{ pet?.name }}</b>
+          <span class="chat-left">今日还能聊 {{ chatLeft }} 句</span>
+          <a @click="chatOpen = false">✕</a>
+        </div>
+        <div class="chat-body" id="chatBody">
+          <div v-for="(m, i) in chatMessages" :key="i" class="msg" :class="m.role">
+            <div class="avatar">{{ m.role === 'user' ? '🧒' : '🐱' }}</div>
+            <div class="bubble-txt">{{ m.content }}<i v-if="chatStreaming && i === chatMessages.length - 1 && m.role === 'assistant'" class="cursor">▌</i></div>
+          </div>
+        </div>
+        <div class="chat-input">
+          <button class="rec-btn" :class="recState" @pointerdown.prevent="recStart" @pointerup.prevent="recStop" @pointerleave="recStop" :disabled="recState === 'uploading'">
+            <template v-if="recState === 'recording'">🎙<i></i></template>
+            <template v-else-if="recState === 'uploading'">⏳</template>
+            <template v-else>🎤</template>
+          </button>
+          <input v-model="chatInput" maxlength="200" :placeholder="recState === 'recording' ? '松开结束，在听呢…' : recState === 'uploading' ? '猫在听写…' : '跟它说点什么（按🎤说话）'"
+            @keyup.enter="sendChat" :disabled="chatStreaming" />
+          <button @click="sendChat" :disabled="chatStreaming || !chatInput.trim()">喵！</button>
+        </div>
+      </div>
     </div>
 
     <!-- 全屏计时页 -->
@@ -850,6 +1239,70 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
 .room { cursor: default; }
 .room:has(.place-banner) { cursor: crosshair; }
 .bowl { position: absolute; transform: translate(-50%, -100%); z-index: 6; } /* z 高于道具低于猫：低头吃时可见 */
+
+/* 猫聊天 */
+.pbtn.chatbtn { background: #EF9F27; font-size: 13px; }
+/* AI 分析状态层 */
+.think-mask { position: absolute; inset: 0; z-index: 98; background: rgba(44,44,42,.55); display: flex; align-items: center; justify-content: center; }
+.think-box { background: #FFF9EE; border: 2px solid #2C2C2A; border-radius: 18px; padding: 28px 32px; text-align: center; box-shadow: 4px 4px 0 rgba(44,44,42,.6); }
+.think-cat { font-size: 44px; animation: bouncecat 1.2s infinite; }
+@keyframes bouncecat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+.think-box b { display: block; margin: 10px 0 8px; font-size: 16px; }
+.think-dots { display: flex; gap: 5px; justify-content: center; margin-bottom: 8px; }
+.think-dots i { width: 7px; height: 7px; background: #EF9F27; border-radius: 50%; animation: dotp 1s infinite; }
+.think-dots i:nth-child(2) { animation-delay: .2s; }
+.think-dots i:nth-child(3) { animation-delay: .4s; }
+@keyframes dotp { 40% { opacity: .25; transform: scale(.8); } }
+.think-box small { color: #888780; font-size: 12px; }
+
+/* 向导内证据预览 */
+.wprev { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.wprev-item { position: relative; }
+.wprev-item img { width: 74px; height: 74px; object-fit: cover; border: 2px solid #2C2C2A; border-radius: 8px; cursor: zoom-in; }
+.wprev-item audio { height: 36px; max-width: 200px; }
+.wprev-del { position: absolute; top: -8px; right: -8px; width: 20px; height: 20px; background: #A32D2D; color: #fff; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; cursor: pointer; border: 1.5px solid #fff; }
+
+/* 照片大图 */
+.pprev-mask { position: absolute; inset: 0; z-index: 99; background: rgba(0,0,0,.85); display: flex; align-items: center; justify-content: center; }
+.pprev-mask img { max-width: 94%; max-height: 94%; border-radius: 10px; }
+
+/* 提交向导 */
+.wizard-box { width: min(460px, 94vw); max-height: 70vh; background: #FFF9EE; border: 2px solid #2C2C2A; border-radius: 18px; box-shadow: 0 -4px 0 rgba(44,44,42,.5); display: flex; flex-direction: column; animation: chatin .22s ease; }
+.wizard-body { flex: 1; overflow-y: auto; padding: 14px; }
+.wstep { background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; padding: 12px; margin-bottom: 10px; }
+.wstep.done { background: #E8F5E9; border-color: #A5D6A7; }
+.wstep-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.wstep-head b { font-size: 14px; }
+.wstep-head small { font-size: 11px; color: #888780; }
+.wstep-head em { font-style: normal; margin-left: auto; color: #2E7D32; font-weight: 700; font-size: 13px; }
+.wstep .pbtn { width: 100%; background: #EF9F27; color: #fff; border: 2px solid #2C2C2A; border-radius: 10px; padding: 10px; font-weight: 700; cursor: pointer; box-shadow: 2px 2px 0 rgba(44,44,42,.6); }
+.wizard-foot { padding: 10px 14px; border-top: 2px solid #2C2C2A; }
+.ok-btn { width: 100%; font-size: 16px; font-weight: 800; color: #fff; background: #534AB7; border: 2px solid #2C2C2A; border-radius: 12px; padding: 12px; cursor: pointer; box-shadow: 3px 3px 0 rgba(44,44,42,.7); }
+.ok-btn:disabled { opacity: .4; }
+.chat-mask { position: absolute; inset: 0; z-index: 96; background: rgba(44,44,42,.3); display: flex; align-items: flex-end; justify-content: center; }
+.chat-box { width: min(460px, 94vw); height: 62vh; background: #FFF9EE; border: 2px solid #2C2C2A; border-radius: 18px 18px 0 0; box-shadow: 0 -4px 0 rgba(44,44,42,.5); display: flex; flex-direction: column; animation: chatin .22s ease; }
+@keyframes chatin { from { transform: translateY(40px); opacity: 0; } }
+.chat-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 2px solid #2C2C2A; background: #FAEEDA; border-radius: 18px 18px 0 0; }
+.chat-head b { font-size: 15px; }
+.chat-left { font-size: 11px; color: #888780; margin-left: auto; }
+.chat-head a { cursor: pointer; font-size: 15px; padding: 2px 8px; }
+.chat-body { flex: 1; overflow-y: auto; padding: 14px; }
+.msg { display: flex; gap: 8px; margin-bottom: 12px; }
+.msg.user { flex-direction: row-reverse; }
+.msg .avatar { width: 34px; height: 34px; flex: 0 0 34px; display: flex; align-items: center; justify-content: center; background: #fff; border: 2px solid #2C2C2A; border-radius: 50%; font-size: 17px; }
+.msg .bubble-txt { max-width: 74%; background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; padding: 8px 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.msg.user .bubble-txt { background: #EEEDFE; }
+.cursor { animation: blink .8s infinite; font-style: normal; }
+@keyframes blink { 50% { opacity: 0; } }
+.chat-input { display: flex; gap: 8px; padding: 10px 12px; border-top: 2px solid #2C2C2A; background: #fff; }
+.chat-input input { flex: 1; border: 2px solid #2C2C2A; border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none; }
+.rec-btn { flex: 0 0 46px; height: 44px; font-size: 20px; background: #fff; border: 2px solid #2C2C2A; border-radius: 10px; cursor: pointer; position: relative; box-shadow: 2px 2px 0 rgba(44,44,42,.6); }
+.rec-btn.recording { background: #A32D2D; color: #fff; border-color: #6B1F1F; }
+.rec-btn.recording i { display: inline-block; width: 6px; height: 6px; background: #fff; border-radius: 50%; margin-left: 4px; animation: pulse 0.8s infinite; }
+.rec-btn.uploading { background: #FAEEDA; }
+@keyframes pulse { 50% { opacity: .2; } }
+.chat-input button { font-size: 14px; font-weight: 700; color: #fff; background: #EF9F27; border: 2px solid #2C2C2A; border-radius: 10px; padding: 8px 16px; cursor: pointer; box-shadow: 2px 2px 0 rgba(44,44,42,.7); }
+.chat-input button:disabled { opacity: .5; }
 
 .inv-bar { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); z-index: 11; background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; box-shadow: 4px 4px 0 rgba(44,44,42,.85); padding: 6px 10px; display: flex; gap: 8px; align-items: center; }
 .inv-bar .lbl { font-size: 11px; color: #888780; }

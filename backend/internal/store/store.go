@@ -80,7 +80,7 @@ func autoMigrateAll(gdb *gorm.DB) error {
 		&Family{}, &Kid{}, &TaskAssign{}, &DeviceToken{},
 		&Pet{}, &SpeciesConfig{}, &TaskTemplate{}, &TaskSchedule{}, &RewardPolicy{},
 		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &TaskCompletion{},
-		&SettlementLedger{}, &Wish{}, &SceneItem{}, &OwnedItem{}, &PetEvent{},
+		&SettlementLedger{}, &Wish{}, &SceneItem{}, &OwnedItem{}, &PetEvent{}, &ChatMessage{},
 	)
 }
 
@@ -443,6 +443,31 @@ func FamilyOfAdminToken(token string) int64 {
 		return 0
 	}
 	return fid
+}
+
+// ===== 猫聊天 =====
+
+// ChatHistory 最近 limit 条对话（按时间正序）
+func (d *DB) ChatHistory(kidID int64, limit int) ([]ChatMessage, error) {
+	var list []ChatMessage
+	if err := d.Where("kid_id=?", kidID).Order("id DESC").Limit(limit).Find(&list).Error; err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+		list[i], list[j] = list[j], list[i]
+	}
+	return list, nil
+}
+
+func (d *DB) SaveChat(kidID int64, role, content string) {
+	d.Create(&ChatMessage{KidID: kidID, Role: role, Content: content})
+}
+
+// ChatCountToday 今日聊天条数（限额用）
+func (d *DB) ChatCountToday(kidID int64) int64 {
+	var n int64
+	d.Model(&ChatMessage{}).Where("kid_id=? AND date(created_at)=CURRENT_DATE", kidID).Count(&n)
+	return n
 }
 
 func today() string { return time.Now().Format("2006-01-02") }

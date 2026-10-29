@@ -21,14 +21,25 @@ const tab = ref('confirm')
 // 切 tab 即拉最新数据（tabs 不销毁组件，onMounted 只跑一次会留旧数据）
 watch(tab, () => load())
 const confirms = ref([])
+const rejectedItems = ref([]) // AI 初审退回历史（孩子可覆盖重做）
 const expanded = ref(0) // 待确认卡片展开的 id（默认全收起）
 function toggleExpand(id) { expanded.value = expanded.value === id ? 0 : id }
+function snapOf(it) {
+  try { return typeof it.snapshot === 'string' ? JSON.parse(it.snapshot) : (it.snapshot || {}) } catch (e) { return {} }
+}
+function safeReview(raw) {
+  try {
+    const v = typeof raw === 'string' ? JSON.parse(raw) : raw
+    return { pass: !!v.pass, score: v.score || 0, reason: v.reason || 'AI 已检查', kid_feedback: v.kid_feedback || '' }
+  } catch (e) { return { pass: false, score: 0, reason: String(raw).slice(0, 50), kid_feedback: '' } }
+}
 const tasks = ref([])
 const wishes = ref([])
 const wishHealth = ref(0)
 const ledger = ref([])
-const newTask = ref({ name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3 })
-const evChecks = ref([]) // 成果提交方式复选：photo / audio / video
+const newTask = ref({ name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3, review_prompt: '' })
+const evChecks = ref([]) // 旧单证据复选（无步骤时）
+const evSteps = ref([]) // 提交步骤：[{kind,label,required}]
 const ICONS = ['⭐', '🎹', '📖', '🔤', '🏃', '🧹', '✍️', '🎨', '🧠', '🦷']
 const EV_OPTIONS = [
   { v: 'photo', label: '📷 拍照', desc: '调起相机拍作业/成果' },
@@ -40,9 +51,10 @@ const editingId = ref(0) // >0 = 编辑模式
 function editTask(t) {
   editingId.value = t.id
   evChecks.value = (t.evidence_type || '').split(',').filter((x) => ['photo', 'audio', 'video'].includes(x))
+  try { evSteps.value = JSON.parse(t.evidence_steps || '[]') } catch (e) { evSteps.value = [] }
   newTask.value = {
     name: t.name, icon: t.icon || '⭐', category: t.category || 'custom',
-    goal_type: t.goal_type || 'duration', goal_value: t.goal_value || 0,
+    goal_type: t.goal_type || 'duration', goal_value: t.goal_value || 0, review_prompt: t.review_prompt || '', analysis_mode: t.analysis_mode || 'judge',
     confirm_mode: t.confirm_mode || 'c', base_score: t.base_score || 20,
     date_mode: t.schedule?.date_mode || 'weekday_fixed',
     weekdays: t.schedule?.weekdays || '1,2,3,4,5',
@@ -52,7 +64,8 @@ function editTask(t) {
 function resetTaskForm() {
   editingId.value = 0
   evChecks.value = []
-  newTask.value = { name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3 }
+  evSteps.value = []
+  newTask.value = { name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3, review_prompt: '' }
 }
 
 const admHeaders = () => ({ 'Content-Type': 'application/json', 'X-Admin-Token': localStorage.getItem('admin_token') || '' })
@@ -84,6 +97,7 @@ async function load() {
     jget('/api/admin/confirm/list'), jget('/api/admin/task'), jget('/api/admin/wish/list'), jget('/api/admin/ledger'),
   ])
   confirms.value = (c.items || []).map(x => ({ ...x, snapshot: typeof x.snapshot === 'string' ? JSON.parse(x.snapshot) : x.snapshot }))
+  rejectedItems.value = c.rejected || []
   tasks.value = t.tasks || []
   wishes.value = w.wishes || []
   wishHealth.value = w.daily_stars_avg || 0
@@ -106,6 +120,8 @@ async function reject(id) {
 async function createTask() {
   if (!newTask.value.name) return showToast('任务名必填')
   const payload = { ...newTask.value, evidence_type: evChecks.value.length ? evChecks.value.join(',') : 'none' }
+  // 有步骤 → 优先走步骤（evidence_type 仍存着兼容）
+  if (evSteps.value.length) payload.evidence_steps = JSON.stringify(evSteps.value.filter((st) => (st.label || '').trim()))
   if (editingId.value) {
     // 编辑模式：PUT 更新
     const { ok, data } = await jput(`/api/admin/task/${editingId.value}`, payload)
@@ -166,7 +182,7 @@ onMounted(() => {
         <div v-if="!confirms.length" class="empty">没有待确认的任务</div>
         <div v-for="it in confirms" :key="it.id" class="confirm-card" @click="toggleExpand(it.id)">
           <div class="row1">
-            <b>{{ it.kid_name ? it.kid_name + ' · ' : '' }}{{ it.snapshot?.icon }} {{ it.snapshot?.name }}</b>
+            <b>{{ it.kid_name ? it.kid_name + ' · ' : '' }}{{ snapOf(it).icon }} {{ snapOf(it).name }}</b>
             <em>{{ Math.round(it.duration_sec / 60) }}分钟 · {{ (parseEvidence(it.evidence) || []).length ? parseEvidence(it.evidence).length + '个材料' : '无材料' }}</em>
             <span class="arrow">{{ expanded === it.id ? '▾' : '▸' }}</span>
           </div>
@@ -176,6 +192,14 @@ onMounted(() => {
               <img v-if="ev.type === 'photo' || ev.type === 'video'" :src="ev.path" @click.stop />
               <audio v-else-if="ev.type === 'audio'" :src="ev.path" controls @click.stop />
             </div>
+            <div v-if="it.review_result" class="ai-report" :class="safeReview(it.review_result).pass ? 'ok' : 'warn'">
+              <div class="ai-head">
+                🤖 AI {{ safeReview(it.review_result).pass ? '初审通过' : '有疑问' }}
+                <span v-if="safeReview(it.review_result).score" class="ai-stars">{{ '⭐'.repeat(safeReview(it.review_result).score) }}</span>
+              </div>
+              <div class="ai-reason">{{ safeReview(it.review_result).reason }}</div>
+              <div v-if="safeReview(it.review_result).kid_feedback" class="ai-kid">🐱 对孩子说：{{ safeReview(it.review_result).kid_feedback }}</div>
+            </div>
             <div v-if="!(parseEvidence(it.evidence) || []).length" class="no-ev">（无照片/录音材料，只有计时数据）</div>
             <div class="btns">
               <button class="ok" @click.stop="approve(it.id)">✓ 通过并结算</button>
@@ -183,12 +207,26 @@ onMounted(() => {
             </div>
           </div>
         </div>
+        <!-- AI 初审退回（孩子可重做覆盖提交） -->
+        <div v-if="rejectedItems.length" class="reject-block">
+          <b>❌ AI 初审未通过（{{ rejectedItems.length }}）</b>
+          <small>孩子收到猫的反馈后可重新提交覆盖</small>
+          <div v-for="it in rejectedItems" :key="'r' + it.id" class="task-line reject-line">
+            <div class="row1">
+              <b>{{ snapOf(it).icon }} {{ it.kid_name }} · {{ snapOf(it).name }}</b>
+              <em class="reject-tag">{{ safeReview(it.review_result).pass ? "曾通过" : "未通过" }}</em>
+            </div>
+            <div class="row2">{{ safeReview(it.review_result).reason }} · {{ Math.round((it.duration_sec || 0) / 60) }}分钟</div>
+          </div>
+        </div>
       </van-tab>
 
       <van-tab title="📋 任务配置" name="tasks">
         <div class="card">
-          <b>{{ editingId ? '✏️ 修改任务 #' + editingId : '➕ 新建任务' }}</b>
-          <a v-if="editingId" class="cancel-edit" @click="resetTaskForm">取消编辑</a>
+          <div class="card-title">
+            <b>{{ editingId ? '✏️ 修改任务 #' + editingId : '➕ 新建任务' }}</b>
+            <a v-if="editingId" class="cancel-edit" @click="resetTaskForm">取消编辑</a>
+          </div>
           <div class="f-row">
             <label>任务名</label>
             <input v-model="newTask.name" placeholder="如：琴键小挑战" />
@@ -233,20 +271,49 @@ onMounted(() => {
               <select v-model="newTask.confirm_mode">
                 <option value="a">自动确认</option>
                 <option value="c">需家长确认</option>
+                <option value="b">AI 初审 + 家长终审</option>
               </select>
             </div>
+          </div>
+          <div v-if="newTask.confirm_mode === 'b'" class="f-row">
+            <label>AI 分析方式</label>
+            <select v-model="newTask.analysis_mode">
+              <option value="judge">普通判定（做没做、对不对）</option>
+              <option value="score">理解度分析（1-5 星 + 给孩子反馈）</option>
+            </select>
+          </div>
+          <div v-if="newTask.confirm_mode === 'b'" class="f-row">
+            <label>AI 验收要求</label>
+            <textarea v-model="newTask.review_prompt" rows="3" maxlength="200"
+              placeholder="AI 怎么验收这个任务？如：让孩子复述故事，检查是否讲出主要人物和两件以上情节，讲得通顺就算通过"></textarea>
           </div>
           <div class="icon-row">
             <small>任务图标</small>
             <button v-for="ic in ICONS" :key="ic" type="button" class="ic-btn" :class="{ on: newTask.icon === ic }" @click="newTask.icon = ic">{{ ic }}</button>
           </div>
           <div class="ev-block">
-            <b>成果提交方式</b>
-            <small>时长任务自动用全屏计时页；勾选后孩子完成时需上传对应材料，家长确认时可见</small>
-            <label v-for="o in EV_OPTIONS" :key="o.v" class="ev-opt">
-              <input type="checkbox" :value="o.v" v-model="evChecks" />
-              <span>{{ o.label }}</span><em>{{ o.desc }}</em>
-            </label>
+            <b>提交步骤（孩子按引导逐项上传）</b>
+            <small>每步会显示给孩子的提示语；勾"必须"的缺了不能提交</small>
+            <div v-for="(st, i) in evSteps" :key="i" class="step-card">
+              <div class="step-top">
+                <span class="step-no">{{ i + 1 }}</span>
+                <select v-model="st.kind" class="ctl">
+                  <option value="photo">📷 拍照</option>
+                  <option value="audio">🎙 录音</option>
+                </select>
+                <label class="step-req"><input type="checkbox" v-model="st.required" />必须</label>
+                <a class="step-del" @click="evSteps.splice(i, 1)">删除</a>
+              </div>
+              <input v-model="st.label" class="ctl step-label" maxlength="20" placeholder="给孩子的提示语，如：拍下你今天读的内容" />
+            </div>
+            <button type="button" class="step-add" @click="evSteps.push({ kind: 'photo', label: '', required: true })">＋ 添加一步</button>
+            <small class="hint-txt">不配步骤 = 沿用旧的单一提交方式（拍照/录音/录像复选）</small>
+            <div v-if="!evSteps.length" class="legacy-ev">
+              <label v-for="o in EV_OPTIONS" :key="o.v" class="ev-opt">
+                <input type="checkbox" :value="o.v" v-model="evChecks" />
+                <span>{{ o.label }}</span><em>{{ o.desc }}</em>
+              </label>
+            </div>
           </div>
           <button class="primary" @click="createTask">{{ editingId ? '保存修改' : '创建' }}</button>
         </div>
@@ -299,10 +366,87 @@ onMounted(() => {
 
 <style scoped>
 .admin { max-width: 560px; margin: 0 auto; min-height: 100vh; background: #F7F5F0; }
+
+/* ===== 统一控件 token（修复对齐：所有输入/下拉同高同边框） ===== */
+.ctl {
+  width: 100%;
+  height: 42px;
+  font-size: 14px;
+  border: 1.5px solid #D3D1C7;
+  border-radius: 10px;
+  padding: 0 12px;
+  outline: none;
+  background: #fff;
+  box-sizing: border-box;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.ctl:focus { border-color: #534AB7; box-shadow: 0 0 0 3px rgba(83, 74, 183, 0.12); }
+select.ctl { background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888780' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 12px center; padding-right: 32px; }
+textarea.ctl { height: auto; padding: 10px 12px; line-height: 1.5; resize: vertical; }
+/* 数字输入去掉原生 spinner（截图里贴边的小控件） */
+input.ctl[type=number]::-webkit-inner-spin-button, input.ctl[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input.ctl[type=number] { -moz-appearance: textfield; }
+
+/* 标签统一：上 12 下 6 */
+.f-row label, .f-cell label, .lbl {
+  display: block;
+  font-size: 13px;
+  font-weight: 700;
+  color: #5F5E5A;
+  margin: 12px 0 6px;
+}
+.f-row label:first-child, .f-cell label:first-child { margin-top: 4px; }
+
+/* 两列 grid：start 对齐（标签+控件同高，修复基线错位） */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+.f-row, .f-cell { display: flex; flex-direction: column; }
+
+/* 说明文字统一（加深对比度） */
+.hint-txt { display: block; font-size: 12px; color: #6F6E68; margin-top: 8px; line-height: 1.5; }
 .empty { text-align: center; color: #888780; padding: 40px 0; font-size: 13px; }
+.van-tabs :deep(.van-tab) { flex: 1; }
+.ev-block { background: #F7F5F0; border: 1.5px solid #E5E2D9; border-radius: 12px; padding: 12px; margin-top: 12px; }
+.ev-block b { display: block; font-size: 14px; margin-bottom: 2px; }
+.card-title { display: flex; align-items: center; justify-content: space-between; padding-bottom: 10px; margin-bottom: 4px; border-bottom: 1.5px solid #EDEAE0; }
+.card-title b { font-size: 15px; }
+.reject-block { margin: 14px 10px; padding: 12px; background: #FFF8F5; border: 1.5px solid #E8C4B8; border-radius: 12px; }
+.reject-block b { font-size: 14px; }
+.reject-block small { display: block; color: #6F6E68; font-size: 12px; margin: 2px 0 8px; }
+.reject-line { margin: 6px 0; border-color: #E8C4B8; background: #fff; }
+.reject-tag { color: #A32D2D; font-weight: 700; font-size: 12px; }
+.confirm-card { cursor: pointer; }
+.row1 .arrow { margin-left: auto; color: #888780; font-size: 12px; }
+.detail { animation: expand .18s ease; }
+@keyframes expand { from { opacity: 0; transform: translateY(-4px); } }
+.ai-report { margin: 8px 0; padding: 10px 12px; border-radius: 10px; }
+.ai-report.ok { background: #E8F5E9; border: 1.5px solid #A5D6A7; }
+.ai-report.warn { background: #FFF3E0; border: 1.5px solid #FFCC80; }
+.ai-head { font-size: 14px; font-weight: 800; color: #2E7D32; display: flex; align-items: center; gap: 6px; }
+.ai-report.warn .ai-head { color: #EF6C00; }
+.ai-stars { font-size: 12px; letter-spacing: 2px; }
+.ai-reason { font-size: 13px; color: #444; margin-top: 4px; }
+.ai-kid { font-size: 12px; color: #534AB7; margin-top: 4px; font-style: italic; }
+.step-card { background: #F7F5F0; border: 1.5px solid #E5E2D9; border-radius: 12px; padding: 10px 12px; margin: 8px 0; display: flex; flex-direction: column; gap: 8px; }
+.step-top { display: flex; gap: 10px; align-items: center; }
+.step-top .ctl { width: 130px; flex: 0 0 130px; height: 36px; }
+.step-no { flex: 0 0 22px; height: 22px; display: flex; align-items: center; justify-content: center; background: #534AB7; color: #fff; border-radius: 50%; font-size: 12px; font-weight: 800; }
+.step-req { font-size: 12.5px; color: #5F5E5A; font-weight: 600; white-space: nowrap; display: flex; align-items: center; gap: 5px; margin-left: auto; }
+.step-req input { width: 16px; height: 16px; accent-color: #534AB7; }
+.step-del { color: #A32D2D; cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 6px 8px; border-radius: 6px; }
+.step-del:active { background: #FCEBEB; }
+.step-add { font-size: 13px; font-weight: 700; margin-top: 6px; background: #fff; border: 1.5px dashed #B7B4A8; border-radius: 10px; padding: 10px; width: 100%; color: #534AB7; cursor: pointer; box-shadow: none; }
+.ai-badge.ok { background: #E8F5E9; color: #2E7D32; border: 1.5px solid #A5D6A7; }
+.ai-badge.warn { background: #FFF3E0; color: #EF6C00; border: 1.5px solid #FFCC80; }
+.no-ev { font-size: 12px; color: #888780; padding: 8px 0; }
 .card { background: #fff; margin: 10px; border-radius: 10px; padding: 14px; border: 1px solid #E5E2D9; }
 .card b { font-size: 15px; }
-.card input, .card select { width: 100%; margin-top: 8px; font-size: 14px; border: 1.5px solid #D3D1C7; border-radius: 6px; padding: 8px 10px; outline: none; }
+.card input, .card select, .card textarea { width: 100%; height: 42px; font-size: 14px; border: 1.5px solid #D3D1C7; border-radius: 10px; padding: 0 12px; outline: none; background: #fff; box-sizing: border-box; appearance: none; -webkit-appearance: none; }
+.card input:focus, .card select:focus, .card textarea:focus { border-color: #534AB7; box-shadow: 0 0 0 3px rgba(83, 74, 183, 0.12); }
+.card input[type=number]::-webkit-inner-spin-button, .card input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; }
+/* 复选框豁免：恢复原生样式（统一控件 appearance:none 误伤 checkbox） */
+.card input[type=checkbox], .ev-block input[type=checkbox] { appearance: auto; -webkit-appearance: checkbox; width: 16px; height: 16px; margin: 0; accent-color: #534AB7; }
+.card textarea { height: auto; padding: 10px 12px; resize: vertical; }
 .row1 { display: flex; justify-content: space-between; align-items: center; }
 .row1 em { font-style: normal; font-size: 12px; color: #534AB7; font-weight: 700; }
 .row2 { font-size: 12px; color: #888780; margin-top: 6px; }
@@ -311,15 +455,13 @@ button { font-size: 13px; font-weight: 600; cursor: pointer; border: 2px solid #
 button:active { transform: translate(2px, 2px); box-shadow: none; }
 .ok { background: #E1F5EE; color: #0F6E56; }
 .no { background: #FCEBEB; color: #A32D2D; }
-.primary { margin-top: 10px; width: 100%; background: #534AB7; color: #fff; }
+.primary { margin-top: 16px; width: 100%; background: #534AB7; color: #fff; padding: 12px; font-size: 15px; border-radius: 12px; }
 .task-line { background: #fff; margin: 6px 10px; border-radius: 8px; padding: 10px 14px; font-size: 13px; border: 1px solid #E5E2D9; }
 .icon-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
 .icon-row small { color: #888780; }
 .ic-btn { width: 36px; height: 36px; font-size: 18px; padding: 0; background: #fff; border: 1.5px solid #D3D1C7; border-radius: 8px; cursor: pointer; }
 .ic-btn.on { border-color: #534AB7; background: #EEEDFE; }
-.f-row, .f-cell { display: flex; flex-direction: column; }
-.f-row label, .f-cell label { font-size: 12px; color: #5F5E5A; font-weight: 700; margin: 10px 0 4px; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: end; }
+
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .ev-block { margin-top: 10px; padding: 10px; background: #FAF8F3; border-radius: 8px; }
 .ev-block b { font-size: 13px; }

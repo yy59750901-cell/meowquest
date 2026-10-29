@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strings"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,6 +27,9 @@ type Snapshot struct {
 	DateMode     string `json:"date_mode"`
 	Weekdays     string `json:"weekdays"`
 	WeeklyQuota  int    `json:"weekly_quota"`
+	EvidenceSteps string `json:"evidence_steps"` // JSON [{kind,label,required}]（旧单证据自动归一）
+	AnalysisMode string `json:"analysis_mode"`  // judge / score
+	ReviewPrompt string `json:"review_prompt"`
 }
 
 // Materialize 物化指定日期（遍历所有孩子：模板×指派 → daily_task(kid_id)）
@@ -96,7 +100,8 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 			GoalType: t.GoalType, GoalValue: t.GoalValue, EvidenceType: t.EvidenceType,
 			ConfirmMode: t.ConfirmMode, BaseScore: t.BaseScore,
 			ExtraMinutes: t.ExtraMinutes, ExtraStars: t.ExtraStars, ExtraCap: t.ExtraCap,
-			DateMode: sch.DateMode, Weekdays: sch.Weekdays, WeeklyQuota: sch.WeeklyQuota}
+			DateMode: sch.DateMode, Weekdays: sch.Weekdays, WeeklyQuota: sch.WeeklyQuota,
+			EvidenceSteps: NormalizeSteps(t.EvidenceSteps, t.EvidenceType), AnalysisMode: t.AnalysisMode, ReviewPrompt: t.ReviewPrompt}
 		snapJSON, _ := json.Marshal(snap)
 		var quotaDone int64
 		db.Model(&store.DailyTask{}).
@@ -185,4 +190,21 @@ func splitWeekdays(s string) []int {
 		out = append(out, cur)
 	}
 	return out
+}
+
+
+// NormalizeSteps 步骤归一化：显式 steps 优先；空则从旧 evidence_type 转单步（向后兼容）
+func NormalizeSteps(steps, evidenceType string) string {
+	if s := strings.TrimSpace(steps); s != "" && s != "[]" {
+		return s
+	}
+	switch evidenceType {
+	case "photo":
+		return `[{"kind":"photo","label":"拍下完成情况","required":true}]`
+	case "audio":
+		return `[{"kind":"audio","label":"说说完成情况","required":true}]`
+	case "video":
+		return `[{"kind":"video","label":"录下完成情况","required":true}]`
+	}
+	return "[]"
 }

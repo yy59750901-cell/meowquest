@@ -1,0 +1,4 @@
+# 部署目标（复制为 .deploy.local 填真实值；.deploy.local 已被 gitignore）
+export MEOW_SERVER=your-ssh-alias        # ~/.ssh/config 里的主机别名
+export MEOW_REMOTE_DIR=/home/ubuntu/meowquest
+export MEOW_URL=https://your-domain      # 服务的公网地址（健康检查用）

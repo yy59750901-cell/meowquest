@@ -70,6 +70,9 @@ func (SpeciesConfig) TableName() string { return "species_config" }
 type TaskTemplate struct {
 	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	FamilyID     int64     `gorm:"index" json:"family_id"`
+	ReviewPrompt string    `gorm:"size:512" json:"review_prompt"` // b 模式：AI 验收指令（空=通用）
+	EvidenceSteps string    `gorm:"size:1024" json:"evidence_steps"` // 提交向导步骤 JSON [{kind,label,required}]
+	AnalysisMode string    `gorm:"size:16" json:"analysis_mode"`  // judge=普通判定 / score=理解度分析
 	Name         string    `gorm:"size:64" json:"name"`
 	Icon         string    `gorm:"size:16;default:⭐" json:"icon"`
 	Category     string    `gorm:"size:16;default:custom" json:"category"`
@@ -139,6 +142,7 @@ func (DailyTask) TableName() string { return "daily_task" }
 type TaskCompletion struct {
 	ID           int64      `gorm:"primaryKey;autoIncrement" json:"id"`
 	KidID        int64      `gorm:"index" json:"kid_id"`
+	ReviewResult string     `gorm:"size:1024" json:"-"` // b 模式 AI 判定 {"pass":bool,"reason":str}
 	DailyTaskID  int64      `gorm:"index;column:daily_task_id" json:"daily_task_id"`
 	Evidence     string     `json:"evidence"`
 	DurationSec  int        `gorm:"column:duration_sec" json:"duration_sec"`
@@ -196,6 +200,16 @@ type OwnedItem struct {
 	BoughtAt time.Time `gorm:"autoCreateTime;column:bought_at" json:"bought_at"`
 }
 func (OwnedItem) TableName() string { return "owned_item" }
+
+// ChatMessage 猫对话记录（per-kid，取最近 N 轮进上下文）
+type ChatMessage struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID     int64     `gorm:"index" json:"kid_id"`
+	Role      string    `gorm:"size:16" json:"role"` // user / assistant
+	Content   string    `json:"content"`
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+}
+func (ChatMessage) TableName() string { return "chat_message" }
 
 type PetEvent struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`

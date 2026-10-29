@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"log"
 	"os"
 
@@ -10,6 +11,7 @@ import (
 )
 
 func main() {
+	loadDotEnv()
 	pgDSN := envOr("MEOW_PG_DSN", "") // PG 优先（本地：host=127.0.0.1 port=5433 user=meow dbname=meowquest sslmode=disable）
 	dsn := envOr("MEOW_MYSQL_DSN", "root:@tcp(127.0.0.1:3306)/meowquest?parseTime=true&charset=utf8mb4&loc=Local")
 	pin := envOr("MEOW_ADMIN_PIN", "0426") // 家长 PIN，生产用环境变量覆盖
@@ -32,6 +34,26 @@ func main() {
 	log.Printf("meowquest backend listening on %s (gorm + mysql ok)", addr)
 	if err := srv.Router().Run(addr); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// loadDotEnv 本地开发：加载 backend/.env（线上用 systemd EnvironmentFile，不走这里）
+func loadDotEnv() {
+	b, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if i := strings.Index(line, "="); i > 0 {
+			k, v := strings.TrimSpace(line[:i]), strings.TrimSpace(line[i+1:])
+			if os.Getenv(k) == "" { // 真环境变量优先
+				os.Setenv(k, v)
+			}
+		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strings"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -45,6 +46,12 @@ func (s *Server) submitTask(c *gin.Context) {
 	if len(req.Evidence) > 0 {
 		ev = string(req.Evidence)
 	}
+
+	// 证据步骤校验：必须步骤缺证据 → 引导孩子补齐
+	if missing := missingRequiredSteps(dt.Snapshot, ev); missing != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "还差：" + missing})
+		return
+	}
 	comp := store.TaskCompletion{DailyTaskID: dt.ID, KidID: dt.KidID, Evidence: ev, DurationSec: req.DurationSec}
 	if err := s.DB.Create(&comp).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -72,6 +79,33 @@ func (s *Server) submitTask(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"settled": true})
+		return
+	}
+	// AI 验收（b）：判定 → 通过进家长终审队列；不过退回重做（无限重试）
+	if confirmModeContains(tpl.ConfirmMode, 'b') {
+		v, rerr := s.runReview(dt, EvidenceRow{Evidence: ev, DurationSec: req.DurationSec})
+		if rerr != nil {
+			// AI 走神：降级为普通家长确认（不让孩子的努力卡在机器故障上）
+			s.DB.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "submitted")
+			c.JSON(http.StatusOK, gin.H{"waiting": "parent_confirm", "ai": "unavailable"})
+			return
+		}
+		resultJSON, _ := json.Marshal(v)
+		if v.Pass {
+			s.DB.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).
+				Update("review_result", string(resultJSON))
+			s.DB.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "submitted")
+			s.DB.AddEvent(dt.KidID, "ai_review", map[string]any{"task": snap.Name, "pass": true, "score": v.Score})
+			c.JSON(http.StatusOK, gin.H{"waiting": "parent_confirm", "ai_pass": true, "ai_reason": v.Reason,
+				"ai_score": v.Score, "kid_feedback": v.KidFeedback})
+		} else {
+			// 退回重做：completion 标记 rejected，任务回 pending
+			now := time.Now()
+			s.DB.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).
+				Updates(map[string]any{"review_result": string(resultJSON), "confirm_status": "rejected", "confirmed_at": &now, "reject_reason": "AI：" + v.Reason})
+			s.DB.AddEvent(dt.KidID, "ai_review", map[string]any{"task": snap.Name, "pass": false})
+			c.JSON(http.StatusOK, gin.H{"redo": true, "ai_pass": false, "ai_reason": v.Reason, "kid_feedback": v.KidFeedback})
+		}
 		return
 	}
 	// 家长确认（c）→ 待确认
@@ -102,19 +136,20 @@ func atoi64(s string) int64 {
 // ===== 家长端：确认队列 =====
 
 type confirmItem struct {
-	ID          int64           `json:"id"`
-	KidName     string          `json:"kid_name"`
-	Date        string          `json:"date"`
-	Snapshot    json.RawMessage `json:"snapshot"`
-	Duration    int             `json:"duration_sec"`
-	Evidence    json.RawMessage `json:"evidence"`
-	SubmittedAt time.Time       `json:"submitted_at"`
+	ID           int64     `json:"id"`
+	KidName      string    `json:"kid_name"`
+	Date         string    `json:"date"`
+	Snapshot     string    `json:"snapshot"` // PG Scan 兼容：string（前端 parse）
+	Duration     int       `json:"duration_sec"`
+	ReviewResult string    `json:"review_result"`
+	Evidence     string    `json:"evidence"` // PG Scan 兼容：string
+	SubmittedAt  time.Time `json:"submitted_at"`
 }
 
 // GET /api/admin/confirm/list 待确认任务（含证据/时长/快照）
 func (s *Server) confirmList(c *gin.Context) {
 	var items []confirmItem
-	if err := s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, d.date, d.snapshot, p.duration_sec, p.evidence, p.submitted_at
+	if err := s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, d.date, d.snapshot, p.duration_sec, COALESCE(p.review_result,'') AS review_result, p.evidence, p.submitted_at
 		FROM daily_task d
 		JOIN task_completion p ON p.daily_task_id=d.id
 		JOIN kid k ON k.id = d.kid_id
@@ -123,7 +158,17 @@ func (s *Server) confirmList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	// AI 初审退回历史（孩子可重做覆盖；家长可见没通过的原因）
+	var rejected []confirmItem
+	s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, d.date, d.snapshot, p.duration_sec,
+			COALESCE(p.review_result,'') AS review_result, p.evidence, p.submitted_at
+		FROM daily_task d
+		JOIN task_completion p ON p.daily_task_id=d.id AND p.confirm_status='rejected'
+		JOIN kid k ON k.id = d.kid_id
+		WHERE p.review_result != '' AND k.family_id=?
+		ORDER BY p.submitted_at DESC LIMIT 20`, famOf(c)).Scan(&rejected)
+
+	c.JSON(http.StatusOK, gin.H{"items": items, "rejected": rejected})
 }
 
 // POST /api/admin/confirm/:id  { approve: bool, reason }
@@ -201,4 +246,40 @@ func (s *Server) ledgerKid(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+
+// missingRequiredSteps 必须步骤缺证据检查（返回缺失提示语，空=齐全）
+func missingRequiredSteps(snapshot, evidenceJSON string) string {
+	var snap struct {
+		EvidenceSteps string `json:"evidence_steps"`
+	}
+	json.Unmarshal([]byte(snapshot), &snap)
+	var steps []struct {
+		Kind     string `json:"kind"`
+		Label    string `json:"label"`
+		Required bool   `json:"required"`
+	}
+	json.Unmarshal([]byte(orDefault(snap.EvidenceSteps, "[]")), &steps)
+	if len(steps) == 0 {
+		return "" // 旧单证据任务不校验
+	}
+	got := map[string]int{}
+	var evList []struct {
+		Type string `json:"type"`
+	}
+	json.Unmarshal([]byte(orDefault(evidenceJSON, "[]")), &evList)
+	for _, e := range evList {
+		got[e.Type]++
+	}
+	var missing []string
+	for _, st := range steps {
+		if st.Required && got[st.Kind] == 0 {
+			missing = append(missing, st.Label)
+		}
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return strings.Join(missing, "、")
 }

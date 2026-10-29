@@ -11,7 +11,7 @@
 > | 家长 PIN 全局 | 家庭级（注册制：管理端注册家庭得 6 位家庭码；家长凭码+PIN） |
 > | 孩子即设备（token 全局） | 设备 token 绑 kid，多端登录/换人（孩子端三段式进入流） |
 > | 拍照=模拟/后续 | 已上线：file input capture → /api/upload → 确认队列查看（getUserMedia 因 HTTP 限制改此方案，HTTPS 后可升级） |
-> | 部署=本地跑 | 线上 https://meow.keepthinking.me（nginx + systemd + 单二进制，发版两条命令见 README） |
+> | 部署=本地跑 | 线上 https://meow.example.com（nginx + systemd + 单二进制，发版两条命令见 README） |
 > | 计时=点按钮 | 全屏计时页 + 防挂机，完成才能提交 |
 >
 > 任务调度/结算公式/连击/愿望流程/状态机等设计仍与实现一致，可继续参考。

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"meowquest/backend/internal/llm"
 	"meowquest/backend/internal/store"
 	"meowquest/backend/internal/web"
 )
@@ -13,10 +14,11 @@ import (
 type Server struct {
 	DB  *store.DB
 	PIN string // 兼容：默认家庭 PIN（存量）
+	LLM *llm.Client
 }
 
 func New(db *store.DB, pin string) *Server {
-	return &Server{DB: db, PIN: pin}
+	return &Server{DB: db, PIN: pin, LLM: llm.NewFromEnv()}
 }
 
 func (s *Server) Router() *gin.Engine {
@@ -42,6 +44,11 @@ func (s *Server) Router() *gin.Engine {
 		api.GET("/wish/stars", s.kid, s.wishStars)
 		api.POST("/wish/:id/redeem", s.kid, s.redeemWish)
 		api.POST("/wish/:id/cancel", s.kid, s.cancelWish)
+		// 猫聊天（SSE 流式）+ 语音识别
+		api.POST("/chat", s.kid, s.chat)
+		api.POST("/asr", s.kid, s.asr)
+		api.GET("/chat/history", s.kid, s.chatHistory)
+
 		// 商店与场景
 		api.GET("/shop", s.kid, s.shopList)
 		api.POST("/shop/buy", s.kid, s.buyItem)

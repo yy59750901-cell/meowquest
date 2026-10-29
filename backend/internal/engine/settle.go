@@ -103,12 +103,16 @@ func CloseDay(db *store.DB) {
 	var kids []store.Kid
 	db.Find(&kids)
 	for _, kid := range kids {
-		// 断签：昨日有 streak_enabled 指派任务未完成 → 清零
-		var broken int64
+		// 断签：昨日连击任务一个都没完成（与推进逻辑对齐：完成任意一个即算连击日；
+		// 昨日无连击任务或全部完成/请假 → 不断签）
+		var total, doneOrSkipped int64
 		db.Raw(`SELECT COUNT(*) FROM daily_task d JOIN task_template t ON t.id=d.template_id
-			WHERE d.date=? AND d.kid_id=? AND t.streak_enabled=1 AND d.status NOT IN ('approved','skipped')`,
-			yStr, kid.ID).Scan(&broken)
-		if broken > 0 {
+			WHERE d.date=? AND d.kid_id=? AND t.streak_enabled=1`, yStr, kid.ID).Scan(&total)
+		db.Raw(`SELECT COUNT(*) FROM daily_task d JOIN task_template t ON t.id=d.template_id
+			WHERE d.date=? AND d.kid_id=? AND t.streak_enabled=1 AND d.status IN ('approved','skipped')`,
+			yStr, kid.ID).Scan(&doneOrSkipped)
+		broken := total - doneOrSkipped
+		if total > 0 && doneOrSkipped == 0 && broken > 0 {
 			var pet store.Pet
 			if err := db.Where("kid_id=?", kid.ID).First(&pet).Error; err == nil && pet.Streak > 0 {
 				db.UpdatePet(kid.ID, map[string]any{"streak": 0})

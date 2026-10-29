@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -20,6 +21,9 @@ type taskReq struct {
 	GoalValue     int    `json:"goal_value"`
 	EvidenceType  string `json:"evidence_type"`
 	ConfirmMode   string `json:"confirm_mode"`
+	ReviewPrompt  string `json:"review_prompt"` // b 模式：AI 验收指令
+	EvidenceSteps string `json:"evidence_steps"` // JSON [{kind,label,required}]
+	AnalysisMode  string `json:"analysis_mode"`  // judge / score
 	BaseScore     int    `json:"base_score"`
 	StreakEnabled int    `json:"streak_enabled"`
 	ExtraMinutes  int    `json:"extra_minutes"`
@@ -48,6 +52,8 @@ func (r taskReq) toTemplate() store.TaskTemplate {
 		Name: r.Name, Icon: defStr(r.Icon, "⭐"), Category: defStr(r.Category, "custom"),
 		GoalType: defStr(r.GoalType, "free"), GoalValue: r.GoalValue,
 		EvidenceType: defStr(r.EvidenceType, "none"), ConfirmMode: defStr(r.ConfirmMode, "a"),
+		ReviewPrompt: r.ReviewPrompt, EvidenceSteps: engine.NormalizeSteps(r.EvidenceSteps, r.EvidenceType),
+		AnalysisMode: defStr(r.AnalysisMode, "judge"),
 		BaseScore: maxInt(r.BaseScore, 20), StreakEnabled: streak,
 		ExtraMinutes: r.ExtraMinutes, ExtraStars: r.ExtraStars, ExtraCap: r.ExtraCap,
 		Sort: r.Sort, Enabled: enabled,
@@ -123,7 +129,7 @@ func (s *Server) updateTask(c *gin.Context) {
 	if err := s.DB.Model(&store.TaskTemplate{}).Where("id=? AND family_id=?", c.Param("id"), famOf(c)).Updates(map[string]any{
 		"name": tpl.Name, "icon": tpl.Icon, "category": tpl.Category,
 		"goal_type": tpl.GoalType, "goal_value": tpl.GoalValue,
-		"evidence_type": tpl.EvidenceType, "confirm_mode": tpl.ConfirmMode,
+		"evidence_type": tpl.EvidenceType, "confirm_mode": tpl.ConfirmMode, "review_prompt": tpl.ReviewPrompt, "evidence_steps": tpl.EvidenceSteps, "analysis_mode": tpl.AnalysisMode,
 		"base_score": tpl.BaseScore, "streak_enabled": tpl.StreakEnabled,
 		"extra_minutes": tpl.ExtraMinutes, "extra_stars": tpl.ExtraStars, "extra_cap": tpl.ExtraCap,
 		"sort": tpl.Sort, "enabled": tpl.Enabled,
@@ -255,8 +261,27 @@ func (s *Server) todayTasks(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// had_duration：计时任务曾有达标记录（AI 退回材料后重做免重新计时，只补材料）
+	hadDur := map[int64]bool{}
+	for _, t := range tasks {
+		if t.Status == "pending" {
+			var snap struct {
+				GoalType  string `json:"goal_type"`
+				GoalValue int    `json:"goal_value"`
+			}
+			json.Unmarshal([]byte(t.Snapshot), &snap)
+			if snap.GoalType == "duration" && snap.GoalValue > 0 {
+				var n int64
+				s.DB.Model(&store.TaskCompletion{}).
+					Where("daily_task_id=? AND duration_sec>=?", t.ID, snap.GoalValue*60).Count(&n)
+				if n > 0 {
+					hadDur[t.ID] = true
+				}
+			}
+		}
+	}
 	mul := engine.DateMultiplier(s.DB, time.Now())
-	c.JSON(http.StatusOK, gin.H{"date": date, "date_multiplier": mul, "tasks": tasks})
+	c.JSON(http.StatusOK, gin.H{"date": date, "date_multiplier": mul, "tasks": tasks, "had_duration": hadDur})
 }
 
 // ===== 工具 =====

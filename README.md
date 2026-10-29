@@ -2,7 +2,7 @@
 
 给孩子做的任务养成 Web 应用：领养像素猫 → 完成每日任务赚星星 → 喂猫/买道具/兑换愿望。
 
-**线上**：https://meow.keepthinking.me
+**线上**：https://meow.example.com
 
 ## 技术栈
 
@@ -33,7 +33,7 @@
 ```
 
 - systemd 服务 `meowquest`（开机自启 + 崩溃自动拉起）
-- 证书 Let's Encrypt（SAN 含 meow.keepthinking.me，泛解析 DNS 零配置）
+- 证书 Let's Encrypt（SAN 含 meow.example.com，泛解析 DNS 零配置）
 - 二进制路径 `/home/ubuntu/meowquest/`，证据上传在 `uploads/`
 
 ## 发版（两条命令）

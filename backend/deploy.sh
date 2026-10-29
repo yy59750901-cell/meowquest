@@ -5,9 +5,11 @@
 set -e
 cd "$(dirname "$0")"
 
-SERVER=${MEOW_SERVER:-kiki}
-REMOTE_DIR=/home/ubuntu/meowquest
-URL=https://meow.keepthinking.me
+# 真实服务器/域名放 backend/.deploy.local（gitignore，模板见 .deploy.local.example）
+[ -f "$(dirname "$0")/.deploy.local" ] && source "$(dirname "$0")/.deploy.local"
+SERVER=${MEOW_SERVER:-your-server-alias}
+REMOTE_DIR=${MEOW_REMOTE_DIR:-/home/ubuntu/meowquest}
+URL=${MEOW_URL:-https://meow.example.com}
 
 echo "[1/4] 交叉编译 linux/amd64..."
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o /tmp/meowquest-linux .
