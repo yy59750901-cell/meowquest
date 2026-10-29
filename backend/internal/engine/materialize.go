@@ -55,7 +55,7 @@ func Materialize(db *store.DB, date time.Time) error {
 func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, weekStart, weekEnd string) error {
 	// 该孩子当日请假
 	var leaveCount int64
-	db.Model(&store.LeaveRecord{}).Where("`date`=? AND kid_id=?", dateStr, kid.ID).Count(&leaveCount)
+	db.Model(&store.LeaveRecord{}).Where("date=? AND kid_id=?", dateStr, kid.ID).Count(&leaveCount)
 	isLeave := leaveCount > 0
 
 	templates, err := db.TemplatesOfKid(kid.ID)
@@ -78,7 +78,7 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 		case "weekly_quota":
 			var done int64
 			db.Model(&store.DailyTask{}).
-				Where("kid_id=? AND template_id=? AND `date`>=? AND `date`<? AND status='approved'",
+				Where("kid_id=? AND template_id=? AND date>=? AND date<? AND status='approved'",
 					kid.ID, t.ID, weekStart, weekEnd).Count(&done)
 			hit = sch.WeeklyQuota > 0 && done < int64(sch.WeeklyQuota)
 		default: // weekday_fixed
@@ -100,7 +100,7 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 		snapJSON, _ := json.Marshal(snap)
 		var quotaDone int64
 		db.Model(&store.DailyTask{}).
-			Where("kid_id=? AND template_id=? AND `date`>=? AND `date`<? AND status='approved'",
+			Where("kid_id=? AND template_id=? AND date>=? AND date<? AND status='approved'",
 				kid.ID, t.ID, weekStart, weekEnd).Count(&quotaDone)
 		status := "pending"
 		if isLeave {
@@ -114,7 +114,7 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 		}
 		if isLeave && res.RowsAffected == 0 {
 			db.Model(&store.DailyTask{}).
-				Where("`date`=? AND kid_id=? AND template_id=? AND status='pending'", dateStr, kid.ID, t.ID).
+				Where("date=? AND kid_id=? AND template_id=? AND status='pending'", dateStr, kid.ID, t.ID).
 				Update("status", "skipped")
 		}
 	}
@@ -134,7 +134,7 @@ func DateMultiplier(db *store.DB, date time.Time) float64 {
 		typ = "weekend"
 	} else {
 		var n int64
-		db.Model(&store.Holiday{}).Where("`date`=?", dateStr).Count(&n)
+		db.Model(&store.Holiday{}).Where("date=?", dateStr).Count(&n)
 		if n > 0 {
 			typ = "holiday"
 		}

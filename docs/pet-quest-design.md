@@ -1,5 +1,22 @@
 # 小宠物学习养成站 · 完整方案
 
+> ## ⚠️ 实现状态修订（2026-10-29）
+> 本文档写于"单租户 + MySQL + 单孩子"时代，以下概念已演进，**以本表为准**（避免按旧设计理解现状）：
+>
+> | 文档中的旧概念 | 当前实现 |
+> |---|---|
+> | MySQL 单库 | **PostgreSQL**（双库支持：MEOW_PG_DSN 优先，回落 MySQL）；线上复用 kiki PG 容器独立建库 |
+> | 单孩子（pet 全局一行） | **多租户**：family(code+PIN)/kid/task_assign 三层，业务表全带 kid_id |
+> | 裸 SQL 手写 schema.sql | GORM AutoMigrate（model.go 是唯一表结构真源；schema_mysql.sql 已废弃仅存档） |
+> | 家长 PIN 全局 | 家庭级（注册制：管理端注册家庭得 6 位家庭码；家长凭码+PIN） |
+> | 孩子即设备（token 全局） | 设备 token 绑 kid，多端登录/换人（孩子端三段式进入流） |
+> | 拍照=模拟/后续 | 已上线：file input capture → /api/upload → 确认队列查看（getUserMedia 因 HTTP 限制改此方案，HTTPS 后可升级） |
+> | 部署=本地跑 | 线上 https://meow.keepthinking.me（nginx + systemd + 单二进制，发版两条命令见 README） |
+> | 计时=点按钮 | 全屏计时页 + 防挂机，完成才能提交 |
+>
+> 任务调度/结算公式/连击/愿望流程/状态机等设计仍与实现一致，可继续参考。
+
+
 > 版本 v0.3（方案对齐稿，未开工）
 > 单孩家庭 · Go 单体 · SQLite · 像素风前端 · LLM API Key 接入
 > 目标：孩子领养宠物，完成家长定制的每日任务（练琴/阅读/英语等）喂养宠物、与宠物对话

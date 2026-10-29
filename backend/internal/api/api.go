@@ -98,7 +98,7 @@ func (s *Server) kid(c *gin.Context) {
 	c.Next()
 }
 
-// admin：家长 token → familyID
+// admin：家长 token → familyID（验签 + 家庭必须真实存在：换库/删家庭后旧 token 立即失效）
 func (s *Server) admin(c *gin.Context) {
 	token, _ := c.Cookie("admin_token")
 	if token == "" {
@@ -107,6 +107,11 @@ func (s *Server) admin(c *gin.Context) {
 	fid := store.FamilyOfAdminToken(token)
 	if fid == 0 {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "pin required"})
+		return
+	}
+	var fam store.Family
+	if err := s.DB.First(&fam, fid).Error; err != nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "family gone"})
 		return
 	}
 	c.Set("familyID", fid)

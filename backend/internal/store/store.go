@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -22,8 +23,30 @@ type DB struct {
 	*gorm.DB
 }
 
-// OpenMySQL 连接并初始化（自动建库 + AutoMigrate + 存量数据迁移）
-func OpenMySQL(dsn string, defaultPIN string) (*DB, error) {
+// OpenDB 双库：PG DSN 优先，否则 MySQL（自动建库 + AutoMigrate + 存量迁移）
+func OpenDB(pgDSN, mysqlDSN, defaultPIN string) (*DB, error) {
+	if pgDSN != "" {
+		return openPG(pgDSN)
+	}
+	return openMySQL(mysqlDSN, defaultPIN)
+}
+
+// openPG：连接（库需先建好：createdb meowquest），AutoMigrate 即开张
+func openPG(dsn string) (*DB, error) {
+	gdb, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Warn),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := autoMigrateAll(gdb); err != nil {
+		return nil, err
+	}
+	return &DB{gdb}, nil
+}
+
+// openMySQL 连接并初始化（自动建库 + AutoMigrate + 存量数据迁移）
+func openMySQL(dsn string, defaultPIN string) (*DB, error) {
 	raw, err := gorm.Open(mysql.Open(splitBeforeDB(dsn)), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
@@ -43,25 +66,22 @@ func OpenMySQL(dsn string, defaultPIN string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB, err := gdb.DB()
-	if err != nil {
+	if err := autoMigrateAll(gdb); err != nil {
 		return nil, err
-	}
-	sqlDB.SetMaxOpenConns(8)
-	sqlDB.SetConnMaxLifetime(time.Hour)
-
-	if err := gdb.AutoMigrate(
-		&Family{}, &Kid{}, &TaskAssign{}, &DeviceToken{},
-		&Pet{}, &SpeciesConfig{}, &TaskTemplate{}, &TaskSchedule{}, &RewardPolicy{},
-		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &TaskCompletion{},
-		&SettlementLedger{}, &Wish{}, &SceneItem{}, &OwnedItem{}, &PetEvent{},
-	); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	if err := migrateLegacy(gdb, defaultPIN); err != nil {
 		return nil, fmt.Errorf("migrate legacy: %w", err)
 	}
 	return &DB{gdb}, nil
+}
+
+func autoMigrateAll(gdb *gorm.DB) error {
+	return gdb.AutoMigrate(
+		&Family{}, &Kid{}, &TaskAssign{}, &DeviceToken{},
+		&Pet{}, &SpeciesConfig{}, &TaskTemplate{}, &TaskSchedule{}, &RewardPolicy{},
+		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &TaskCompletion{},
+		&SettlementLedger{}, &Wish{}, &SceneItem{}, &OwnedItem{}, &PetEvent{},
+	)
 }
 
 // migrateLegacy 存量单租户数据 → 默认家庭 + 默认孩子（幂等）

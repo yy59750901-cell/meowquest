@@ -114,7 +114,7 @@ type confirmItem struct {
 // GET /api/admin/confirm/list 待确认任务（含证据/时长/快照）
 func (s *Server) confirmList(c *gin.Context) {
 	var items []confirmItem
-	if err := s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, CAST(d.date AS CHAR) AS date, d.snapshot, p.duration_sec, p.evidence, p.submitted_at
+	if err := s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, d.date, d.snapshot, p.duration_sec, p.evidence, p.submitted_at
 		FROM daily_task d
 		JOIN task_completion p ON p.daily_task_id=d.id
 		JOIN kid k ON k.id = d.kid_id
@@ -170,7 +170,7 @@ func (s *Server) confirmTask(c *gin.Context) {
 // GET /api/admin/ledger 家庭星星流水（join 孩子名）
 func (s *Server) ledger(c *gin.Context) {
 	var items []ledgerItem
-	if err := s.DB.Raw(`SELECT l.id, COALESCE(k.name,'') AS kid_name, CAST(l.date AS CHAR) AS date,
+	if err := s.DB.Raw(`SELECT l.id, COALESCE(k.name,'') AS kid_name, l.date,
 		COALESCE(l.daily_task_id,0), l.source, l.base, l.date_multiplier, l.streak_multiplier, l.final, l.created_at
 		FROM settlement_ledger l JOIN kid k ON k.id=l.kid_id
 		WHERE k.family_id=? ORDER BY l.id DESC LIMIT 50`, famOf(c)).Scan(&items).Error; err != nil {

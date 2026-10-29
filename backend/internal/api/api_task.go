@@ -131,6 +131,12 @@ func (s *Server) updateTask(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// 当天未完成的实例刷新快照：删 pending 重建（保新配置立即生效；
+	// approved/submitted 保旧快照不动——结算按完成当时规则，可追溯）
+	today := time.Now().Format("2006-01-02")
+	s.DB.Where("template_id=? AND date=? AND status='pending'", c.Param("id"), today).
+		Delete(&store.DailyTask{})
+
 	sch := req.toSchedule(0)
 	if err := s.DB.Model(&store.TaskSchedule{}).Where("template_id=?", c.Param("id")).Updates(map[string]any{
 		"date_mode": sch.DateMode, "weekdays": sch.Weekdays, "weekly_quota": sch.WeeklyQuota,
@@ -196,7 +202,7 @@ func (s *Server) setLeave(c *gin.Context) {
 	for _, k := range targets {
 		lr := store.LeaveRecord{Date: req.Date, KidID: k.ID, Reason: req.Reason}
 		s.DB.Where(&lr).Assign(lr).FirstOrCreate(&lr)
-		s.DB.Model(&store.DailyTask{}).Where("`date`=? AND kid_id=? AND status='pending'", req.Date, k.ID).Update("status", "skipped")
+		s.DB.Model(&store.DailyTask{}).Where("date=? AND kid_id=? AND status='pending'", req.Date, k.ID).Update("status", "skipped")
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -245,7 +251,7 @@ func (s *Server) rematerialize(c *gin.Context) {
 func (s *Server) todayTasks(c *gin.Context) {
 	date := time.Now().Format("2006-01-02")
 	var tasks []store.DailyTask
-	if err := s.DB.Where("`date`=? AND kid_id=?", date, kidOf(c)).Order("id").Find(&tasks).Error; err != nil {
+	if err := s.DB.Where("date=? AND kid_id=?", date, kidOf(c)).Order("id").Find(&tasks).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

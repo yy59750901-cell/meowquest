@@ -12,12 +12,14 @@ function parseEvidence(ev) {
     return Array.isArray(p) ? p : []
   } catch (e) { return [] }
 }
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
 
 const router = useRouter()
 const tab = ref('confirm')
+// 切 tab 即拉最新数据（tabs 不销毁组件，onMounted 只跑一次会留旧数据）
+watch(tab, () => load())
 const confirms = ref([])
 const expanded = ref(0) // 待确认卡片展开的 id（默认全收起）
 function toggleExpand(id) { expanded.value = expanded.value === id ? 0 : id }
@@ -54,6 +56,8 @@ function resetTaskForm() {
 }
 
 const admHeaders = () => ({ 'Content-Type': 'application/json', 'X-Admin-Token': localStorage.getItem('admin_token') || '' })
+
+// 登录失效：明确提示 + 清 token + 跳登录页
 function expired() {
   showToast('登录过期，请重新输 PIN')
   localStorage.removeItem('admin_token')
@@ -145,7 +149,14 @@ async function confirmPrice() {
 
 const statusText = { pending: '待定价', saving: '攒星星中', redeem_requested: '待兑现', fulfilled: '已实现', rejected: '已取消' }
 
-onMounted(load)
+onMounted(() => {
+  // 无 token / token 失效直接引导去登录（刷新/直链场景）
+  if (!localStorage.getItem('admin_token')) {
+    router.replace('/admin')
+    return
+  }
+  load()
+})
 </script>
 
 <template>

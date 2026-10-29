@@ -34,7 +34,7 @@ func Settle(db *store.DB, dailyTaskID int64, extraBase int) error {
 	streak := petRow.Streak
 	var settledToday int64
 	db.Model(&store.DailyTask{}).
-		Where("kid_id=? AND `date`=? AND status='approved'", kidID, time.Now().Format("2006-01-02")).
+		Where("kid_id=? AND date=? AND status='approved'", kidID, time.Now().Format("2006-01-02")).
 		Count(&settledToday)
 	if settledToday == 0 { // 首个结算任务推进连击（streak_enabled 判断看模板）
 		var tpl store.TaskTemplate
@@ -120,5 +120,5 @@ func CloseDay(db *store.DB) {
 
 	// 48h 仍未确认的 submitted → expired（全家庭）
 	dayBefore := time.Now().AddDate(0, 0, -2).Format("2006-01-02")
-	db.Model(&store.DailyTask{}).Where("`date`=? AND status='submitted'", dayBefore).Update("status", "expired")
+	db.Model(&store.DailyTask{}).Where("date=? AND status='submitted'", dayBefore).Update("status", "expired")
 }

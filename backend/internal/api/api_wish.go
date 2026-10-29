@@ -135,12 +135,13 @@ func (s *Server) adminWishList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// 近30天日均星星（笔均值 × 日均笔数）
+	// 近30天日均星星（笔均值 × 日均笔数；日期参数化，双库兼容）
+	d30 := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
 	var avg, perDay float64
 	s.DB.Raw(`SELECT COALESCE(AVG(final),0) FROM settlement_ledger
-		WHERE date>=DATE_SUB(CURDATE(), INTERVAL 30 DAY) AND final>0`).Scan(&avg)
+		WHERE date>=? AND final>0`, d30).Scan(&avg)
 	s.DB.Raw(`SELECT COALESCE(AVG(n),0) FROM (SELECT COUNT(*) n FROM settlement_ledger
-		WHERE date>=DATE_SUB(CURDATE(), INTERVAL 30 DAY) GROUP BY date) t`).Scan(&perDay)
+		WHERE date>=? GROUP BY date) t`, d30).Scan(&perDay)
 	healthBase := avg * perDay
 
 	out := make([]gin.H, 0, len(wishes))
