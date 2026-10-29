@@ -12,7 +12,7 @@ import (
 
 type Server struct {
 	DB  *store.DB
-	PIN string // 家长端 PIN（配置文件/环境变量）
+	PIN string // 兼容：默认家庭 PIN（存量）
 }
 
 func New(db *store.DB, pin string) *Server {
@@ -23,15 +23,19 @@ func (s *Server) Router() *gin.Engine {
 	r := gin.Default()
 	api := r.Group("/api")
 	{
-		// 孩子端（免登录 token）
-		api.GET("/species", s.speciesList)   // 可领养品种（后台配置）
-		api.POST("/adopt", s.adopt)          // 领养（签发 token）
-		api.GET("/pet", s.kid, s.pet)        // 宠物实时状态
-		api.POST("/pet/feed", s.kid, s.feed) // 喂食
+		api.GET("/species", s.speciesList)
+
+		// 孩子端进入流：输家庭码 → 列孩子/新建领养
+		api.POST("/enter", s.enter) // {code} → {family, kids}
+		api.POST("/adopt", s.adopt) // {code, kid_id?/kid_name, species, name}
+
+		api.GET("/pet", s.kid, s.pet)
+		api.POST("/pet/feed", s.kid, s.feed)
 		api.POST("/pet/touch", s.kid, s.touch)
-		api.GET("/pet/events", s.kid, s.events) // 事件流（日记素材）
+		api.GET("/pet/events", s.kid, s.events)
 		api.GET("/tasks/today", s.kid, s.todayTasks)
 		api.POST("/tasks/:id/submit", s.kid, s.submitTask)
+		api.POST("/upload", s.kid, s.uploadEvidence)
 		// 愿望
 		api.POST("/wish", s.kid, s.createWish)
 		api.GET("/wish/list", s.kid, s.wishList)
@@ -41,31 +45,32 @@ func (s *Server) Router() *gin.Engine {
 		// 商店与场景
 		api.GET("/shop", s.kid, s.shopList)
 		api.POST("/shop/buy", s.kid, s.buyItem)
-		api.POST("/upload", s.kid, s.uploadEvidence) // 任务证据上传
 		api.GET("/scene", s.kid, s.sceneLayout)
 		api.POST("/scene/place", s.kid, s.placeItem)
 		api.POST("/scene/remove", s.kid, s.removeItem)
 	}
 	admin := r.Group("/api/admin")
 	{
-		admin.POST("/login", s.adminLogin)
-		admin.GET("/pet", s.admin, s.pet) // 家长也能看猫
-		admin.POST("/task", s.admin, s.createTask)      // 创建任务（模板+调度）
-		admin.PUT("/task/:id", s.admin, s.updateTask)   // 修改
-		admin.GET("/task", s.admin, s.listTasks)        // 列表
-		admin.POST("/reward_policy", s.admin, s.upsertPolicy) // 倍数策略
-		admin.POST("/leave", s.admin, s.setLeave)       // 请假
-		admin.POST("/materialize", s.admin, s.rematerialize) // 手动物化（调试）
-		admin.GET("/confirm/list", s.admin, s.confirmList)   // 待确认队列
-		admin.POST("/confirm/:id", s.admin, s.confirmTask)   // 通过/驳回
-		admin.GET("/ledger", s.admin, s.ledger)              // 星星流水
-		admin.GET("/wish/list", s.admin, s.adminWishList)    // 愿望审批列表
-		admin.POST("/wish/:id", s.admin, s.adminWishAction)  // 定价/驳回/兑现
+		admin.POST("/login", s.adminLogin)      // {code, pin} → 家庭级 token
+		admin.POST("/family", s.createFamily)   // 注册新家庭（产品化入口）
+		admin.GET("/pet", s.admin, s.pet)       // 兼容旧接口（无 kid 维度则 404）
+		admin.GET("/kids", s.admin, s.kidsList) // 家庭孩子列表
+		admin.POST("/kid", s.admin, s.createKidAdmin)
+		admin.POST("/task", s.admin, s.createTask)
+		admin.PUT("/task/:id", s.admin, s.updateTask)
+		admin.GET("/task", s.admin, s.listTasks)
+		admin.POST("/task/:id/assign", s.admin, s.assignTask) // 指派给孩子
+		admin.POST("/reward_policy", s.admin, s.upsertPolicy)
+		admin.POST("/leave", s.admin, s.setLeave)
+		admin.POST("/materialize", s.admin, s.rematerialize)
+		admin.GET("/confirm/list", s.admin, s.confirmList)
+		admin.POST("/confirm/:id", s.admin, s.confirmTask)
+		admin.GET("/ledger", s.admin, s.ledger)
+		admin.GET("/ledger/:kid_id", s.admin, s.ledgerKid)
+		admin.GET("/wish/list", s.admin, s.adminWishList)
+		admin.POST("/wish/:id", s.admin, s.adminWishAction)
 	}
-	// 上传的证据文件（本地磁盘）
 	r.Static("/uploads", uploadDir())
-
-	// 前端产物（embed 单二进制）
 	if h, err := web.Handler(); err == nil {
 		r.NoRoute(gin.WrapH(h))
 	} else {
@@ -76,102 +81,218 @@ func (s *Server) Router() *gin.Engine {
 	return r
 }
 
-// ===== 孩子端认证中间件 =====
+// ===== 认证中间件 =====
+
+// kid：孩子设备 token → kidID
 func (s *Server) kid(c *gin.Context) {
 	token, _ := c.Cookie("kid_token")
 	if token == "" {
 		token = c.GetHeader("X-Kid-Token")
 	}
-	if !s.DB.ValidToken(token) {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "no pet, adopt first"})
+	kidID := s.DB.KidOfToken(token)
+	if kidID == 0 {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "no kid, adopt first"})
 		return
 	}
+	c.Set("kidID", kidID)
 	c.Next()
 }
 
-// ===== 家长端认证 =====
+// admin：家长 token → familyID
 func (s *Server) admin(c *gin.Context) {
 	token, _ := c.Cookie("admin_token")
 	if token == "" {
-		token = c.GetHeader("X-Admin-Token") // 手机浏览器 cookie 兼容兜底
+		token = c.GetHeader("X-Admin-Token")
 	}
-	if !store.AdminLogin(token) {
+	fid := store.FamilyOfAdminToken(token)
+	if fid == 0 {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "pin required"})
 		return
 	}
+	c.Set("familyID", fid)
 	c.Next()
 }
 
+func kidOf(c *gin.Context) int64  { return c.GetInt64("kidID") }
+func famOf(c *gin.Context) int64  { return c.GetInt64("familyID") }
+
+// ===== 家长登录 / 注册 =====
+
+// POST /api/admin/login {code, pin}
 func (s *Server) adminLogin(c *gin.Context) {
 	var req struct {
-		PIN string `json:"pin"`
+		Code string `json:"code" binding:"required"`
+		PIN  string `json:"pin" binding:"required"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.PIN != s.PIN {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "wrong pin"})
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	token := store.NewAdminToken()
+	fam, err := s.DB.FamilyLogin(req.Code, req.PIN)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "家庭码或 PIN 不对"})
+		return
+	}
+	token := store.NewAdminToken(fam.ID)
 	c.SetCookie("admin_token", token, 24*3600, "/", "", false, true)
-	c.JSON(http.StatusOK, gin.H{"ok": true, "token": token})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "token": token, "family": fam.Name, "family_id": fam.ID})
 }
 
-// ===== 业务接口 =====
-func (s *Server) speciesList(c *gin.Context) {
-	list, err := s.DB.SpeciesList()
+// POST /api/admin/family {name, pin} → 注册新家庭（返回家庭码）
+func (s *Server) createFamily(c *gin.Context) {
+	var req struct {
+		Name string `json:"name" binding:"required"`
+		PIN  string `json:"pin" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	fam, err := s.DB.CreateFamily(req.Name, req.PIN)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"species": list})
+	token := store.NewAdminToken(fam.ID)
+	c.JSON(http.StatusOK, gin.H{"family": fam, "code": fam.Code, "token": token})
 }
 
-func (s *Server) adopt(c *gin.Context) {
-	// 已有 token 且已领养 → 直接返回
-	if token, _ := c.Cookie("kid_token"); s.DB.ValidToken(token) {
-		if ok, _ := s.DB.HasPet(); ok {
-			c.JSON(http.StatusOK, gin.H{"adopted": true})
-			return
-		}
+// GET /api/admin/kids 家庭孩子列表
+func (s *Server) kidsList(c *gin.Context) {
+	kids, err := s.DB.KidsOfFamily(famOf(c))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
+	c.JSON(http.StatusOK, gin.H{"kids": kids})
+}
+
+// POST /api/admin/kid {name}
+func (s *Server) createKidAdmin(c *gin.Context) {
 	var req struct {
-		Species     string `json:"species" binding:"required"`
-		Name        string `json:"name" binding:"required"`
+		Name string `json:"name" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	kid, err := s.DB.CreateKid(famOf(c), req.Name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"kid": kid})
+}
+
+// ===== 孩子端进入流 =====
+
+// POST /api/enter {code} → {family, kids}
+func (s *Server) enter(c *gin.Context) {
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	fam, err := s.DB.FamilyByCode(req.Code)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "家庭码不存在，问问爸爸妈妈吧"})
+		return
+	}
+	kids, _ := s.DB.KidsOfFamily(fam.ID)
+	type kidInfo struct {
+		ID    int64  `json:"id"`
+		Name  string `json:"name"`
+		HasPet bool  `json:"has_pet"`
+	}
+	var out []kidInfo
+	for _, k := range kids {
+		has, _ := s.DB.HasPet(k.ID)
+		out = append(out, kidInfo{ID: k.ID, Name: k.Name, HasPet: has})
+	}
+	c.JSON(http.StatusOK, gin.H{"family": fam.Name, "kids": out})
+}
+
+// POST /api/adopt {code, kid_id?, kid_name?, species, name, personality?}
+// kid_id=选择已有孩子（换设备/多孩同设备）；无 kid_id=新建孩子并领养
+func (s *Server) adopt(c *gin.Context) {
+	var req struct {
+		Code       string `json:"code" binding:"required"`
+		KidID      int64  `json:"kid_id"`
+		KidName    string `json:"kid_name"`
+		Species    string `json:"species"` // 新建分支内校验（选已有孩子时不需要）
+		Name       string `json:"name"`
 		Personality string `json:"personality"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if ok, _ := s.DB.HasPet(); ok {
-		// 已被领养但本设备无 token：换设备场景，签发新 token 绑定同一只猫
+	fam, err := s.DB.FamilyByCode(req.Code)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "家庭码不存在"})
+		return
+	}
+
+	var kid store.Kid
+	if req.KidID > 0 {
+		if err := s.DB.Where("id=? AND family_id=?", req.KidID, fam.ID).First(&kid).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "孩子不存在"})
+			return
+		}
+		// 还没猫的孩子：顺便完成领养（前端从选择页进领养流）
+		if req.Species != "" && req.Name != "" {
+			if _, err := s.DB.AdoptPet(kid.ID, req.Name, req.Species, defStr(req.Personality, "热情开朗")); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+		}
 		token := store.NewToken()
-		if err := s.DB.SaveToken(token); err != nil {
+		if err := s.DB.SaveToken(token, kid.ID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		c.SetCookie("kid_token", token, 365*24*3600, "/", "", false, true)
-		c.JSON(http.StatusOK, gin.H{"adopted": true, "rebind": true})
+		c.SetCookie("kid_token", token, 10*365*24*3600, "/", "", false, true)
+		c.JSON(http.StatusOK, gin.H{"adopted": true, "rebind": true, "kid": kid})
+		return
+	}
+
+	// 新建孩子 + 领养（选已有孩子但没猫时 kid_id>0，上面已处理）
+	if req.Species == "" || req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "species and name required"})
+		return
+	}
+	kidName := req.KidName
+	if kidName == "" {
+		kidName = "宝贝"
+	}
+	newKid, err := s.DB.CreateKid(fam.ID, kidName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	personality := req.Personality
 	if personality == "" {
 		personality = "热情开朗"
 	}
-	if _, err := s.DB.AdoptPet(req.Name, req.Species, personality); err != nil {
+	if _, err := s.DB.AdoptPet(newKid.ID, req.Name, req.Species, personality); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	token := store.NewToken()
-	if err := s.DB.SaveToken(token); err != nil {
+	if err := s.DB.SaveToken(token, newKid.ID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.SetCookie("kid_token", token, 365*24*3600, "/", "", false, true)
-	c.JSON(http.StatusOK, gin.H{"adopted": true})
+	c.SetCookie("kid_token", token, 10*365*24*3600, "/", "", false, true)
+	c.JSON(http.StatusOK, gin.H{"adopted": true, "kid": newKid})
 }
 
+// ===== 宠物（per-kid） =====
+
 func (s *Server) pet(c *gin.Context) {
-	p, err := s.DB.GetPet()
+	p, err := s.DB.GetPet(kidOf(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -180,11 +301,13 @@ func (s *Server) pet(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no pet"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"pet": p})
+	var kid store.Kid
+	s.DB.First(&kid, p.KidID)
+	c.JSON(http.StatusOK, gin.H{"pet": p, "kid": kid})
 }
 
 func (s *Server) feed(c *gin.Context) {
-	if err := s.DB.FeedPet(); err != nil {
+	if err := s.DB.FeedPet(kidOf(c)); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -192,7 +315,7 @@ func (s *Server) feed(c *gin.Context) {
 }
 
 func (s *Server) touch(c *gin.Context) {
-	left, err := s.DB.TouchPet()
+	left, err := s.DB.TouchPet(kidOf(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -205,10 +328,19 @@ func (s *Server) events(c *gin.Context) {
 	if day == "" {
 		day = time.Now().AddDate(0, 0, -7).Format("2006-01-02")
 	}
-	list, err := s.DB.EventsSince(day)
+	list, err := s.DB.EventsSince(kidOf(c), day)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"events": list})
+}
+
+func (s *Server) speciesList(c *gin.Context) {
+	list, err := s.DB.SpeciesList()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"species": list})
 }

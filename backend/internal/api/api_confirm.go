@@ -45,7 +45,7 @@ func (s *Server) submitTask(c *gin.Context) {
 	if len(req.Evidence) > 0 {
 		ev = string(req.Evidence)
 	}
-	comp := store.TaskCompletion{DailyTaskID: dt.ID, Evidence: ev, DurationSec: req.DurationSec}
+	comp := store.TaskCompletion{DailyTaskID: dt.ID, KidID: dt.KidID, Evidence: ev, DurationSec: req.DurationSec}
 	if err := s.DB.Create(&comp).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -103,6 +103,7 @@ func atoi64(s string) int64 {
 
 type confirmItem struct {
 	ID          int64           `json:"id"`
+	KidName     string          `json:"kid_name"`
 	Date        string          `json:"date"`
 	Snapshot    json.RawMessage `json:"snapshot"`
 	Duration    int             `json:"duration_sec"`
@@ -113,10 +114,12 @@ type confirmItem struct {
 // GET /api/admin/confirm/list 待确认任务（含证据/时长/快照）
 func (s *Server) confirmList(c *gin.Context) {
 	var items []confirmItem
-	if err := s.DB.Raw(`SELECT d.id, d.date, d.snapshot, p.duration_sec, p.evidence, p.submitted_at
-		FROM daily_task d JOIN task_completion p ON p.daily_task_id=d.id
-		WHERE d.status='submitted' AND p.confirm_status='pending'
-		ORDER BY p.submitted_at DESC LIMIT 50`).Scan(&items).Error; err != nil {
+	if err := s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, CAST(d.date AS CHAR) AS date, d.snapshot, p.duration_sec, p.evidence, p.submitted_at
+		FROM daily_task d
+		JOIN task_completion p ON p.daily_task_id=d.id
+		JOIN kid k ON k.id = d.kid_id
+		WHERE d.status='submitted' AND p.confirm_status='pending' AND k.family_id=?
+		ORDER BY p.submitted_at DESC LIMIT 50`, famOf(c)).Scan(&items).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -135,7 +138,8 @@ func (s *Server) confirmTask(c *gin.Context) {
 		return
 	}
 	var dt store.DailyTask
-	if err := s.DB.First(&dt, "id=?", id).Error; err != nil {
+	if err := s.DB.Raw(`SELECT d.* FROM daily_task d JOIN kid k ON k.id=d.kid_id
+		WHERE d.id=? AND k.family_id=?`, id, famOf(c)).Scan(&dt).Error; err != nil || dt.ID == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
@@ -159,14 +163,40 @@ func (s *Server) confirmTask(c *gin.Context) {
 	s.DB.Model(&store.TaskCompletion{}).Where("daily_task_id=? AND confirm_status='pending'", dt.ID).
 		Updates(map[string]any{"confirm_status": "rejected", "confirmed_at": &now, "reject_reason": req.Reason})
 	s.DB.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "pending")
-	s.DB.AddEvent("task_rejected", map[string]any{"task_id": dt.ID, "reason": req.Reason})
+	s.DB.AddEvent(dt.KidID, "task_rejected", map[string]any{"task_id": dt.ID, "reason": req.Reason})
 	c.JSON(http.StatusOK, gin.H{"rejected": true})
 }
 
-// GET /api/admin/ledger 星星流水（家长看板）
+// GET /api/admin/ledger 家庭星星流水（join 孩子名）
 func (s *Server) ledger(c *gin.Context) {
+	var items []ledgerItem
+	if err := s.DB.Raw(`SELECT l.id, COALESCE(k.name,'') AS kid_name, CAST(l.date AS CHAR) AS date,
+		COALESCE(l.daily_task_id,0), l.source, l.base, l.date_multiplier, l.streak_multiplier, l.final, l.created_at
+		FROM settlement_ledger l JOIN kid k ON k.id=l.kid_id
+		WHERE k.family_id=? ORDER BY l.id DESC LIMIT 50`, famOf(c)).Scan(&items).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+type ledgerItem struct {
+	ID          int64     `json:"id"`
+	KidName     string    `json:"kid_name"`
+	Date        string    `json:"date"`
+	DailyTaskID int64     `json:"daily_task_id"`
+	Source      string    `json:"source"`
+	Base        int       `json:"base"`
+	DateMultiplier float64 `json:"date_multiplier"`
+	StreakMultiplier float64 `json:"streak_multiplier"`
+	Final       int       `json:"final"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// GET /api/admin/ledger/:kid_id 单孩子流水
+func (s *Server) ledgerKid(c *gin.Context) {
 	var items []store.SettlementLedger
-	if err := s.DB.Order("id DESC").Limit(50).Find(&items).Error; err != nil {
+	if err := s.DB.Where("kid_id=?", c.Param("kid_id")).Order("id DESC").Limit(50).Find(&items).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

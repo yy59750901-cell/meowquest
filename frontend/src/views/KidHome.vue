@@ -12,6 +12,62 @@ const species = ref('orange')
 const speciesList = ref([])
 const adoptSel = ref('orange')
 const petNameInput = ref('')
+const familyCodeInput = ref('')
+const kidNameInput = ref('')
+
+// 领养/登录两步流：step1 输家庭码 → 有孩子则选择（多端登录同一孩子）；无孩子或点"新孩子" → 选猫领养
+const adoptStep = ref('code') // code | pick | new
+const enterFamily = ref('')
+const enterKids = ref([])
+async function doEnter(silent) {
+  const code = familyCodeInput.value.trim()
+  if (!code) return showToast('先输入家庭码哦～')
+  const { data } = await jpost('/enter', { code })
+  if (data.error) { if (!silent) showToast(data.error); return false }
+  enterFamily.value = data.family
+  enterKids.value = data.kids || []
+  adoptStep.value = enterKids.value.length ? 'pick' : 'new'
+  localStorage.setItem('familyCode', code) // 换人/新设备免再输码
+  return true
+}
+
+// 换人：清本设备登录态，凭记忆的家庭码直接进"你是谁"
+async function switchKid() {
+  try {
+    await showConfirmDialog({ title: '换一个小朋友？', message: '这只小猫会等你回来的～' })
+  } catch (e) { return }
+  document.cookie = 'kid_token=; Max-Age=0; path=/'
+  adopted.value = false
+  pet.value = null
+  catAnim.value = 'sit'
+  const code = localStorage.getItem('familyCode') || ''
+  if (code) {
+    familyCodeInput.value = code
+    await doEnter(true)
+  } else {
+    adoptStep.value = 'code'
+  }
+}
+async function pickKid(k) {
+  if (!k.has_pet) {
+    // 还没猫的孩子 → 进领养流程（kid_id 记住，领完猫直接归到这个孩子名下）
+    pickedKidID = k.id
+    kidNameInput.value = k.name
+    adoptStep.value = 'new'
+    return
+  }
+  const { data } = await jpost('/adopt', { code: familyCodeInput.value.trim(), kid_id: k.id })
+  if (data.adopted) {
+    adopted.value = true
+    await loadAll()
+    say('我等到你啦！')
+    setTimeout(behaviorTick, 800)
+  } else if (data.error) {
+    showToast(data.error)
+  }
+}
+let pickedKidID = 0 // 选择页进入领养的孩子（0=全新孩子）
+function gotoNewKid() { pickedKidID = 0; adoptStep.value = 'new' }
 const pet = ref(null)
 const today = ref({ date: '', date_multiplier: 1, tasks: [] })
 const wishes = ref([])
@@ -71,12 +127,19 @@ async function refreshPet() {
 // ===== 领养 =====
 async function doAdopt() {
   const name = petNameInput.value.trim() || '橘子'
-  const { data } = await jpost('/adopt', { species: adoptSel.value, name })
+  const code = familyCodeInput.value.trim()
+  const kidName = kidNameInput.value.trim() || '宝贝'
+  const payload = { code, species: adoptSel.value, name }
+  if (pickedKidID) payload.kid_id = pickedKidID // 已有孩子补领猫
+  else payload.kid_name = kidName
+  const { data } = await jpost('/adopt', payload)
   if (data.adopted) {
     adopted.value = true
     await loadAll()
     say(`我是${name}！以后请多多关照喵～`)
     setTimeout(behaviorTick, 1000)
+  } else if (data.error) {
+    showToast(data.error)
   }
 }
 
@@ -481,7 +544,16 @@ function initCat() {
 }
 onMounted(async () => {
   await loadAll()
-  if (adopted.value) initCat()
+  if (adopted.value) {
+    initCat()
+  } else {
+    // 换设备/换人回来：记住过家庭码则免输码直达"你是谁"
+    const code = localStorage.getItem('familyCode')
+    if (code) {
+      familyCodeInput.value = code
+      await doEnter(true)
+    }
+  }
   checkNarrow()
 })
 // 领养完成 → 初始化猫位置（修复：猫从左上角 0,0 起步的问题）
@@ -493,8 +565,32 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
   <!-- 领养页 -->
   <div v-if="!adopted" class="adopt-mask">
     <div class="adopt-box">
-      <h2>🐱 领养你的小猫</h2>
-      <p class="sub">选一只喜欢的猫咪，给它取个名字，它会陪你完成每天的任务</p>
+      <!-- 第一步：家庭码 -->
+      <template v-if="adoptStep === 'code'">
+        <h2>🐱 喵星成长屋</h2>
+        <p class="sub">输入家庭码开始（问问爸爸妈妈）</p>
+        <input v-model="familyCodeInput" maxlength="6" inputmode="numeric" class="code-input"
+          placeholder="家庭码（6 位数字）" @keyup.enter="doEnter">
+        <button class="enter-btn" @click="doEnter">进入</button>
+        <p class="tiny">换新设备也能进：输同样的家庭码，选择"我是谁"即可</p>
+      </template>
+
+      <!-- 第二步：选择孩子（已有孩子的家庭 = 多端登录入口） -->
+      <template v-else-if="adoptStep === 'pick'">
+        <h2>你是谁呀？</h2>
+        <p class="sub">{{ enterFamily }} 的小朋友，选自己吧～</p>
+        <div class="pick-list">
+          <button v-for="k in enterKids" :key="k.id" class="pick-btn" @click="pickKid(k)">
+            {{ k.name }}<small v-if="!k.has_pet">（还没猫，先去领一只）</small>
+          </button>
+        </div>
+        <a class="new-kid" @click="gotoNewKid">我是新来的 ➕</a>
+      </template>
+
+      <!-- 第三步：新孩子领养 -->
+      <template v-else>
+        <h2>🐱 领养你的小猫</h2>
+        <p class="sub">选一只喜欢的猫咪，它会陪你完成每天的任务</p>
       <div class="cats">
         <div v-for="sp in speciesList" :key="sp.species" class="cat-card" :class="{ sel: adoptSel === sp.species }"
           @click="adoptSel = sp.species">
@@ -504,9 +600,11 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
         </div>
       </div>
       <div class="adopt-row">
-        <input v-model="petNameInput" maxlength="8" placeholder="给它取个名字（比如：橘子）" />
-        <button @click="doAdopt">领养！</button>
+        <input v-model="kidNameInput" maxlength="8" placeholder="你的名字" style="width:46%" />
+        <input v-model="petNameInput" maxlength="8" placeholder="给小猫取名字（比如：橘子）" style="width:54%" />
       </div>
+      <button class="enter-btn" @click="doAdopt">领养！</button>
+      </template>
     </div>
   </div>
 
@@ -554,6 +652,7 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
       <div class="chip tippable" @mouseenter="showTip('streak')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('streak', e)" @pointerup="tipUp" @pointerleave="tipUp">连击 ×{{ pet?.streak }}</div>
       <div class="chip mini tippable" @mouseenter="showTip('hunger')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('hunger', e)" @pointerup="tipUp" @pointerleave="tipUp">饱腹<div class="bar"><i :style="{ width: (pet?.hunger || 0) + '%' }" /></div><small>{{ Math.round(pet?.hunger || 0) }}</small></div>
       <div class="chip mini tippable" @mouseenter="showTip('mood')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('mood', e)" @pointerup="tipUp" @pointerleave="tipUp">心情<div class="bar"><i class="mood" :style="{ width: (pet?.mood || 0) + '%' }" /></div><small>{{ Math.round(pet?.mood || 0) }}</small></div>
+      <div class="chip switch" @click="switchKid" title="换一个小朋友登录">👤 换人</div>
     </div>
 
     <!-- 提示气泡（触屏长按后松手/移开消失） -->
@@ -659,6 +758,14 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
 .cat-card.sel { background: #EEEDFE; border-color: #534AB7; border-width: 3px; }
 .cat-card .nm { font-size: 14px; font-weight: 700; margin-top: 6px; }
 .cat-card .ds { font-size: 11px; color: #888780; margin-top: 2px; }
+.code-input { width: 100%; font-size: 22px; text-align: center; letter-spacing: 8px; border: 2px solid #2C2C2A; border-radius: 10px; padding: 12px; outline: none; margin-bottom: 12px; }
+.enter-btn { width: 100%; font-size: 16px; font-weight: 700; color: #fff; background: #534AB7; border: 2px solid #2C2C2A; border-radius: 10px; padding: 12px; cursor: pointer; box-shadow: 3px 3px 0 rgba(44,44,42,.7); }
+.tiny { font-size: 11px; color: #888780; margin-top: 12px; text-align: center; }
+.pick-list { display: flex; flex-direction: column; gap: 10px; margin: 16px 0; }
+.pick-btn small { font-size: 12px; color: #888780; font-weight: 400; margin-left: 8px; }
+.pick-btn { font-size: 17px; font-weight: 700; background: #fff; border: 2px solid #2C2C2A; border-radius: 12px; padding: 14px; cursor: pointer; box-shadow: 3px 3px 0 rgba(44,44,42,.6); }
+.pick-btn:active { transform: translate(2px, 2px); box-shadow: none; }
+.new-kid { display: block; text-align: center; color: #534AB7; font-size: 13px; font-weight: 600; cursor: pointer; padding: 8px; }
 .adopt-row { display: flex; gap: 10px; }
 .adopt-row input { flex: 1; font-size: 14px; border: 2px solid #2C2C2A; border-radius: 8px; padding: 9px 12px; outline: none; }
 .adopt-row button { font-size: 15px; font-weight: 700; cursor: pointer; color: #fff; background: #534AB7; border: 2px solid #2C2C2A; border-radius: 8px; padding: 9px 22px; box-shadow: 3px 3px 0 rgba(44, 44, 42, .85); }
@@ -756,6 +863,8 @@ onBeforeUnmount(() => clearTimeout(stateTimer))
 .pbtn.feed { background: #F0997B; }
 .pbtn.hint { background: #534AB7; font-size: 13px; }
 .pbtn small { display: block; font-size: 10px; font-weight: 400; opacity: .9; }
+.chip.switch { cursor: pointer; background: #EEEDFE; color: #534AB7; }
+.chip.switch:active { transform: translate(1px, 1px); }
 .chip.tippable { cursor: help; -webkit-touch-callout: none; user-select: none; }
 .chip.mini small { font-size: 10px; color: #5F5E5A; font-weight: 700; }
 .tip-bubble { position: absolute; left: 12px; top: 54px; z-index: 90; max-width: 300px; background: #2C2C2A; color: #FDF6E3; border: 2px solid #FDF6E3; border-radius: 10px; padding: 10px 14px; font-size: 12px; line-height: 1.65; box-shadow: 3px 3px 0 rgba(44,44,42,.4); animation: tipin .18s ease; }

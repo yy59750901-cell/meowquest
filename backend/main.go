@@ -14,7 +14,7 @@ func main() {
 	pin := envOr("MEOW_ADMIN_PIN", "0426") // 家长 PIN，生产用环境变量覆盖
 	addr := envOr("MEOW_ADDR", "127.0.0.1:8600")
 
-	db, err := store.OpenMySQL(dsn)
+	db, err := store.OpenMySQL(dsn, pin)
 	if err != nil {
 		log.Fatalf("open mysql: %v", err)
 	}

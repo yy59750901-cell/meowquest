@@ -25,7 +25,7 @@ const tasks = ref([])
 const wishes = ref([])
 const wishHealth = ref(0)
 const ledger = ref([])
-const newTask = ref({ name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,3,5', weekly_quota: 3 })
+const newTask = ref({ name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3 })
 const evChecks = ref([]) // 成果提交方式复选：photo / audio / video
 const ICONS = ['⭐', '🎹', '📖', '🔤', '🏃', '🧹', '✍️', '🎨', '🧠', '🦷']
 const EV_OPTIONS = [
@@ -43,14 +43,14 @@ function editTask(t) {
     goal_type: t.goal_type || 'duration', goal_value: t.goal_value || 0,
     confirm_mode: t.confirm_mode || 'c', base_score: t.base_score || 20,
     date_mode: t.schedule?.date_mode || 'weekday_fixed',
-    weekdays: t.schedule?.weekdays || '1,3,5',
+    weekdays: t.schedule?.weekdays || '1,2,3,4,5',
     weekly_quota: t.schedule?.weekly_quota || 3,
   }
 }
 function resetTaskForm() {
   editingId.value = 0
   evChecks.value = []
-  newTask.value = { name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,3,5', weekly_quota: 3 }
+  newTask.value = { name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3 }
 }
 
 const admHeaders = () => ({ 'Content-Type': 'application/json', 'X-Admin-Token': localStorage.getItem('admin_token') || '' })
@@ -104,12 +104,18 @@ async function createTask() {
   const payload = { ...newTask.value, evidence_type: evChecks.value.length ? evChecks.value.join(',') : 'none' }
   if (editingId.value) {
     // 编辑模式：PUT 更新
-    const { ok } = await jput(`/api/admin/task/${editingId.value}`, payload)
-    if (ok) { showToast('已保存'); resetTaskForm(); await load() }
+    const { ok, data } = await jput(`/api/admin/task/${editingId.value}`, payload)
+    if (ok) {
+      showToast((data.today_hit || 0) > 0 ? '已保存，今天就会出现在孩子端 ✓' : '已保存（今天不在安排的周几）')
+      resetTaskForm(); await load()
+    }
     return
   }
-  const { ok } = await jpost('/api/admin/task', payload)
-  if (ok) { showToast('已创建'); resetTaskForm(); await load() }
+  const { ok, data } = await jpost('/api/admin/task', payload)
+  if (ok) {
+    showToast((data.today_hit || 0) > 0 ? '已创建，今天就会出现在孩子端 ✓' : '已创建（今天不在安排的周几，命中日出现）')
+    resetTaskForm(); await load()
+  }
 }
 
 const priceModal = ref(null) // { wish, price }
@@ -126,6 +132,17 @@ async function wishAction(w, action) {
   await load()
 }
 
+async function confirmPrice() {
+  const pm = priceModal.value
+  if (!pm) return
+  const price = parseInt(pm.price) || 0
+  if (price <= 0) return showToast('星星数要大于 0')
+  await jpost(`/api/admin/wish/${pm.wish.id}`, { action: 'approve', price })
+  priceModal.value = null
+  showToast(`已定价 ${price} 星`)
+  await load()
+}
+
 const statusText = { pending: '待定价', saving: '攒星星中', redeem_requested: '待兑现', fulfilled: '已实现', rejected: '已取消' }
 
 onMounted(load)
@@ -138,7 +155,7 @@ onMounted(load)
         <div v-if="!confirms.length" class="empty">没有待确认的任务</div>
         <div v-for="it in confirms" :key="it.id" class="confirm-card" @click="toggleExpand(it.id)">
           <div class="row1">
-            <b>{{ it.snapshot?.icon }} {{ it.snapshot?.name }}</b>
+            <b>{{ it.kid_name ? it.kid_name + ' · ' : '' }}{{ it.snapshot?.icon }} {{ it.snapshot?.name }}</b>
             <em>{{ Math.round(it.duration_sec / 60) }}分钟 · {{ (parseEvidence(it.evidence) || []).length ? parseEvidence(it.evidence).length + '个材料' : '无材料' }}</em>
             <span class="arrow">{{ expanded === it.id ? '▾' : '▸' }}</span>
           </div>
@@ -161,31 +178,55 @@ onMounted(load)
         <div class="card">
           <b>{{ editingId ? '✏️ 修改任务 #' + editingId : '➕ 新建任务' }}</b>
           <a v-if="editingId" class="cancel-edit" @click="resetTaskForm">取消编辑</a>
-          <input v-model="newTask.name" placeholder="任务名（如：琴键小挑战）" />
-          <div class="grid">
-            <select v-model="newTask.date_mode">
-              <option value="weekday_fixed">固定周几</option>
-              <option value="weekly_quota">每周次数</option>
-            </select>
-            <input v-if="newTask.date_mode === 'weekday_fixed'" v-model="newTask.weekdays" placeholder="周几，如 1,3,5" />
-            <input v-else v-model.number="newTask.weekly_quota" type="number" placeholder="每周次数" />
+          <div class="f-row">
+            <label>任务名</label>
+            <input v-model="newTask.name" placeholder="如：琴键小挑战" />
           </div>
-          <div class="grid">
-            <select v-model="newTask.goal_type">
-              <option value="duration">⏱ 时长任务</option>
-              <option value="free">自由完成</option>
-            </select>
-            <input v-if="newTask.goal_type === 'duration'" v-model.number="newTask.goal_value" type="number" placeholder="时长(分钟)" />
+          <div class="grid2">
+            <div class="f-cell">
+              <label>执行日期</label>
+              <select v-model="newTask.date_mode">
+                <option value="weekday_fixed">固定每周几</option>
+                <option value="weekly_quota">每周完成 N 次</option>
+              </select>
+            </div>
+            <div class="f-cell" v-if="newTask.date_mode === 'weekday_fixed'">
+              <label>哪几天</label>
+              <input v-model="newTask.weekdays" placeholder="1=一 … 7=日，如 1,3,5" />
+            </div>
+            <div class="f-cell" v-else>
+              <label>每周次数</label>
+              <input v-model.number="newTask.weekly_quota" type="number" placeholder="如 4" />
+            </div>
           </div>
-          <div class="grid">
-            <input v-model.number="newTask.base_score" type="number" placeholder="完成奖励(星星数)" />
-            <select v-model="newTask.confirm_mode">
-              <option value="a">自动确认</option>
-              <option value="c">需家长确认</option>
-            </select>
+          <div class="grid2">
+            <div class="f-cell">
+              <label>任务类型</label>
+              <select v-model="newTask.goal_type">
+                <option value="duration">⏱ 计时任务</option>
+                <option value="free">自由完成</option>
+              </select>
+            </div>
+            <div class="f-cell" v-if="newTask.goal_type === 'duration'">
+              <label>时长（分钟）</label>
+              <input v-model.number="newTask.goal_value" type="number" placeholder="如 30" />
+            </div>
+          </div>
+          <div class="grid2">
+            <div class="f-cell">
+              <label>完成奖励（⭐）</label>
+              <input v-model.number="newTask.base_score" type="number" placeholder="如 20" />
+            </div>
+            <div class="f-cell">
+              <label>确认方式</label>
+              <select v-model="newTask.confirm_mode">
+                <option value="a">自动确认</option>
+                <option value="c">需家长确认</option>
+              </select>
+            </div>
           </div>
           <div class="icon-row">
-            <small>图标</small>
+            <small>任务图标</small>
             <button v-for="ic in ICONS" :key="ic" type="button" class="ic-btn" :class="{ on: newTask.icon === ic }" @click="newTask.icon = ic">{{ ic }}</button>
           </div>
           <div class="ev-block">
@@ -211,7 +252,7 @@ onMounted(load)
       <van-tab title="🌠 愿望审批" name="wish">
         <div v-if="!wishes.length" class="empty">还没有愿望</div>
         <div v-for="w in wishes" :key="w.id" class="card">
-          <div class="row1"><b>✨ {{ w.title }}</b><em>{{ statusText[w.status] }}</em></div>
+          <div class="row1"><b>✨ {{ w.kid_name ? w.kid_name + ' · ' : '' }}{{ w.title }}</b><em>{{ statusText[w.status] }}</em></div>
           <div class="row2" v-if="w.status === 'pending'">孩子期望：{{ w.hoped_price }}⭐ · 预计 {{ w.suggest_days || '?' }} 天</div>
           <div class="row2" v-else-if="w.status === 'saving'">定价 {{ w.price }}⭐</div>
           <div class="btns" v-if="['pending', 'saving', 'redeem_requested'].includes(w.status)">
@@ -224,22 +265,24 @@ onMounted(load)
 
       <van-tab title="📊 流水" name="ledger">
         <div v-for="i in ledger" :key="i.id" class="task-line">
-          {{ i.date }} · {{ i.source }} · 基础{{ i.base }} × {{ i.date_multiplier }} × {{ i.streak_multiplier.toFixed(1) }} = <b>+{{ i.final }}⭐</b>
+          {{ i.date }} {{ i.kid_name }} · {{ i.source }} · 基础{{ i.base }} × {{ i.date_multiplier }} × {{ i.streak_multiplier.toFixed ? i.streak_multiplier.toFixed(1) : i.streak_multiplier }} = <b>+{{ i.final }}⭐</b>
         </div>
       </van-tab>
-      <!-- 愿望定价输入 -->
-      <div v-if="priceModal" class="pm-mask" @click.self="priceModal = null">
-        <div class="pm-box">
-          <b>🌠 给「{{ priceModal.wish.title }}」定价</b>
-          <p class="hint">孩子期望 {{ priceModal.wish.hoped_price || '?' }} 星 · 近30天日均 {{ Math.round(wishHealth) }} 星 · 约 {{ priceModal.wish.suggest_days || '?' }} 天达成</p>
-          <input v-model="priceModal.price" type="number" placeholder="定价多少颗星星？" />
-          <div class="pm-btns">
-            <button class="ghost" @click="priceModal = null">取消</button>
-            <button class="ok" @click="confirmPrice">确认定价</button>
-          </div>
-        </div>
-      </div>
+
     </van-tabs>
+
+    <!-- 愿望定价输入（放 tabs 外：van-tabs 内非 van-tab 元素不渲染） -->
+<div v-if="priceModal" class="pm-mask" @click.self="priceModal = null">
+    <div class="pm-box">
+    <b>🌠 给「{{ priceModal.wish.title }}」定价{{ priceModal.wish.kid_name ? '（' + priceModal.wish.kid_name + '）' : '' }}</b>
+    <p class="hint">孩子期望 {{ priceModal.wish.hoped_price || '?' }} 星 · 近30天日均 {{ Math.round(wishHealth) }} 星 · 约 {{ priceModal.wish.suggest_days || '?' }} 天达成</p>
+    <input v-model="priceModal.price" type="number" placeholder="定价多少颗星星？" />
+    <div class="pm-btns">
+      <button class="ghost" @click="priceModal = null">取消</button>
+      <button class="ok" @click="confirmPrice">确认定价</button>
+    </div>
+    </div>
+    </div>
   </div>
 </template>
 
@@ -249,8 +292,6 @@ onMounted(load)
 .card { background: #fff; margin: 10px; border-radius: 10px; padding: 14px; border: 1px solid #E5E2D9; }
 .card b { font-size: 15px; }
 .card input, .card select { width: 100%; margin-top: 8px; font-size: 14px; border: 1.5px solid #D3D1C7; border-radius: 6px; padding: 8px 10px; outline: none; }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.grid input, .grid select { margin-top: 8px; }
 .row1 { display: flex; justify-content: space-between; align-items: center; }
 .row1 em { font-style: normal; font-size: 12px; color: #534AB7; font-weight: 700; }
 .row2 { font-size: 12px; color: #888780; margin-top: 6px; }
@@ -265,6 +306,10 @@ button:active { transform: translate(2px, 2px); box-shadow: none; }
 .icon-row small { color: #888780; }
 .ic-btn { width: 36px; height: 36px; font-size: 18px; padding: 0; background: #fff; border: 1.5px solid #D3D1C7; border-radius: 8px; cursor: pointer; }
 .ic-btn.on { border-color: #534AB7; background: #EEEDFE; }
+.f-row, .f-cell { display: flex; flex-direction: column; }
+.f-row label, .f-cell label { font-size: 12px; color: #5F5E5A; font-weight: 700; margin: 10px 0 4px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: end; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .ev-block { margin-top: 10px; padding: 10px; background: #FAF8F3; border-radius: 8px; }
 .ev-block b { font-size: 13px; }
 .ev-block small { display: block; color: #888780; font-size: 11px; margin: 4px 0 8px; }

@@ -6,8 +6,6 @@ import (
 	"log"
 	"time"
 
-	"gorm.io/gorm"
-
 	"meowquest/backend/internal/store"
 )
 
@@ -30,20 +28,10 @@ type Snapshot struct {
 	WeeklyQuota  int    `json:"weekly_quota"`
 }
 
-// Materialize 物化指定日期的每日任务（幂等：UNIQUE(date,template_id)）
+// Materialize 物化指定日期（遍历所有孩子：模板×指派 → daily_task(kid_id)）
+// 幂等：UNIQUE(date, kid_id, template_id)
 func Materialize(db *store.DB, date time.Time) error {
 	dateStr := date.Format("2006-01-02")
-
-	var leaveCount int64
-	db.Model(&store.LeaveRecord{}).Where("`date`=?", dateStr).Count(&leaveCount)
-	isLeave := leaveCount > 0
-
-	// 模板 + 调度（preload）
-	var templates []store.TaskTemplate
-	if err := db.Preload("Schedule").Where("enabled=1").Order("sort,id").Find(&templates).Error; err != nil {
-		return err
-	}
-
 	weekday := int(date.Weekday())
 	if weekday == 0 {
 		weekday = 7
@@ -52,12 +40,33 @@ func Materialize(db *store.DB, date time.Time) error {
 	weekStart := monday.Format("2006-01-02")
 	weekEnd := monday.AddDate(0, 0, 7).Format("2006-01-02")
 
+	var kids []store.Kid
+	if err := db.Find(&kids).Error; err != nil {
+		return err
+	}
+	for _, kid := range kids {
+		if err := materializeKid(db, kid, dateStr, weekday, weekStart, weekEnd); err != nil {
+			return fmt.Errorf("kid %d: %w", kid.ID, err)
+		}
+	}
+	return nil
+}
+
+func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, weekStart, weekEnd string) error {
+	// 该孩子当日请假
+	var leaveCount int64
+	db.Model(&store.LeaveRecord{}).Where("`date`=? AND kid_id=?", dateStr, kid.ID).Count(&leaveCount)
+	isLeave := leaveCount > 0
+
+	templates, err := db.TemplatesOfKid(kid.ID)
+	if err != nil {
+		return err
+	}
 	for _, t := range templates {
 		sch := t.Schedule
 		if sch == nil {
 			continue
 		}
-		// 生效范围
 		if sch.ValidFrom != nil && dateStr < *sch.ValidFrom {
 			continue
 		}
@@ -69,8 +78,8 @@ func Materialize(db *store.DB, date time.Time) error {
 		case "weekly_quota":
 			var done int64
 			db.Model(&store.DailyTask{}).
-				Where("template_id=? AND `date`>=? AND `date`<? AND status='approved'", t.ID, weekStart, weekEnd).
-				Count(&done)
+				Where("kid_id=? AND template_id=? AND `date`>=? AND `date`<? AND status='approved'",
+					kid.ID, t.ID, weekStart, weekEnd).Count(&done)
 			hit = sch.WeeklyQuota > 0 && done < int64(sch.WeeklyQuota)
 		default: // weekday_fixed
 			for _, d := range splitWeekdays(sch.Weekdays) {
@@ -91,29 +100,28 @@ func Materialize(db *store.DB, date time.Time) error {
 		snapJSON, _ := json.Marshal(snap)
 		var quotaDone int64
 		db.Model(&store.DailyTask{}).
-			Where("template_id=? AND `date`>=? AND `date`<? AND status='approved'", t.ID, weekStart, weekEnd).
-			Count(&quotaDone)
+			Where("kid_id=? AND template_id=? AND `date`>=? AND `date`<? AND status='approved'",
+				kid.ID, t.ID, weekStart, weekEnd).Count(&quotaDone)
 		status := "pending"
 		if isLeave {
 			status = "skipped"
 		}
-		dt := store.DailyTask{Date: dateStr, TemplateID: t.ID, Snapshot: string(snapJSON),
-			Status: status, QuotaDone: int(quotaDone)}
-		// 幂等：已存在则跳过（不覆盖 pending 为 skipped 之外的状态）
-		res := db.Where(store.DailyTask{Date: dateStr, TemplateID: t.ID}).FirstOrCreate(&dt)
+		dt := store.DailyTask{Date: dateStr, KidID: kid.ID, TemplateID: t.ID,
+			Snapshot: string(snapJSON), Status: status, QuotaDone: int(quotaDone)}
+		res := db.Where(store.DailyTask{Date: dateStr, KidID: kid.ID, TemplateID: t.ID}).FirstOrCreate(&dt)
 		if res.Error != nil {
 			return fmt.Errorf("materialize %s tpl %d: %w", dateStr, t.ID, res.Error)
 		}
-		// 请假补标（pending → skipped）
 		if isLeave && res.RowsAffected == 0 {
-			db.Model(&store.DailyTask{}).Where("`date`=? AND template_id=? AND status='pending'", dateStr, t.ID).
+			db.Model(&store.DailyTask{}).
+				Where("`date`=? AND kid_id=? AND template_id=? AND status='pending'", dateStr, kid.ID, t.ID).
 				Update("status", "skipped")
 		}
 	}
 	return nil
 }
 
-// DateMultiplier 当日倍数（固定日期 > 日期类型；无策略=1）
+// DateMultiplier 当日倍数（全局策略：周末/节假日）
 func DateMultiplier(db *store.DB, date time.Time) float64 {
 	dateStr := date.Format("2006-01-02")
 	var rp store.RewardPolicy
@@ -178,5 +186,3 @@ func splitWeekdays(s string) []int {
 	}
 	return out
 }
-
-var _ = gorm.ErrRecordNotFound

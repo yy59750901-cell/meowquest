@@ -13,6 +13,19 @@ import (
 
 func now() time.Time { return time.Now() }
 
+type wishAdminItem struct {
+	ID           int64     `json:"id"`
+	KidID        int64     `json:"kid_id"`
+	KidName      string    `json:"kid_name"`
+	Title        string    `json:"title"`
+	Photo        string    `json:"photo"`
+	Status       string    `json:"status"`
+	Price        int       `json:"price"`
+	HopedPrice   int       `json:"hoped_price"`
+	RejectReason string    `json:"reject_reason"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
 // ===== 愿望系统 =====
 
 // POST /api/wish 孩子许愿
@@ -27,28 +40,28 @@ func (s *Server) createWish(c *gin.Context) {
 		return
 	}
 	var active int64
-	s.DB.Model(&store.Wish{}).Where("status NOT IN ('fulfilled','rejected')").Count(&active)
+	s.DB.Model(&store.Wish{}).Where("kid_id=? AND status NOT IN ('fulfilled','rejected')", kidOf(c)).Count(&active)
 	if active >= 3 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "最多同时许 3 个愿望哦，先等等吧"})
 		return
 	}
-	w := store.Wish{Title: req.Title, Photo: req.Photo, HopedPrice: req.HopedPrice}
+	w := store.Wish{KidID: kidOf(c), Title: req.Title, Photo: req.Photo, HopedPrice: req.HopedPrice}
 	if err := s.DB.Create(&w).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	s.DB.AddEvent("wish_created", map[string]any{"title": req.Title})
+	s.DB.AddEvent(kidOf(c), "wish_created", map[string]any{"title": req.Title})
 	c.JSON(http.StatusOK, gin.H{"id": w.ID, "status": w.Status})
 }
 
 // GET /api/wish/list 孩子端：愿望列表 + 进度
 func (s *Server) wishList(c *gin.Context) {
 	var wishes []store.Wish
-	if err := s.DB.Where("status<>'rejected'").Order("id DESC").Find(&wishes).Error; err != nil {
+	if err := s.DB.Where("kid_id=? AND status<>'rejected'", kidOf(c)).Order("id DESC").Find(&wishes).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	pet, _ := s.DB.GetPet()
+	pet, _ := s.DB.GetPet(kidOf(c))
 	var balance int64
 	if pet != nil {
 		balance = pet.Balance
@@ -84,12 +97,12 @@ func (s *Server) redeemWish(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "wish status " + w.Status})
 		return
 	}
-	if err := s.DB.SpendStars(w.Price); err != nil {
+	if err := s.DB.SpendStars(kidOf(c), w.Price); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "星星还不够，继续加油喵！"})
 		return
 	}
 	s.DB.Model(&w).Updates(map[string]any{"status": "redeem_requested", "redeemed_at": now()})
-	s.DB.AddEvent("wish_redeem", map[string]any{"wish_id": w.ID, "price": w.Price})
+	s.DB.AddEvent(kidOf(c), "wish_redeem", map[string]any{"wish_id": w.ID, "price": w.Price})
 	c.JSON(http.StatusOK, gin.H{"redeem_requested": true})
 }
 
@@ -103,7 +116,7 @@ func (s *Server) cancelWish(c *gin.Context) {
 // GET /api/wish/stars 愿望星图（已兑现墙）
 func (s *Server) wishStars(c *gin.Context) {
 	var wishes []store.Wish
-	if err := s.DB.Where("status='fulfilled'").Order("fulfilled_at DESC").Find(&wishes).Error; err != nil {
+	if err := s.DB.Where("kid_id=? AND status='fulfilled'", kidOf(c)).Order("fulfilled_at DESC").Find(&wishes).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -114,8 +127,11 @@ func (s *Server) wishStars(c *gin.Context) {
 
 // GET /api/admin/wish/list 全部愿望 + 定价健康度
 func (s *Server) adminWishList(c *gin.Context) {
-	var wishes []store.Wish
-	if err := s.DB.Order("id DESC").Find(&wishes).Error; err != nil {
+	var wishes []wishAdminItem
+	if err := s.DB.Raw(`SELECT w.id, w.kid_id, COALESCE(k.name,'') AS kid_name, w.title, COALESCE(w.photo,'') AS photo,
+		w.status, w.price, w.hoped_price, COALESCE(w.reject_reason,'') AS reject_reason, w.created_at
+		FROM wish w JOIN kid k ON k.id=w.kid_id
+		WHERE k.family_id=? ORDER BY w.id DESC`, famOf(c)).Scan(&wishes).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -181,7 +197,7 @@ func (s *Server) adminWishAction(c *gin.Context) {
 	case "fulfill":
 		s.DB.Model(&w).Where("status='redeem_requested'").
 			Updates(map[string]any{"status": "fulfilled", "fulfilled_at": now()})
-		s.DB.AddEvent("wish_fulfilled", map[string]any{"wish_id": w.ID})
+		s.DB.AddEvent(w.KidID, "wish_fulfilled", map[string]any{"wish_id": w.ID})
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown action"})
@@ -203,7 +219,7 @@ var ITEM_REGISTRY = []gin.H{
 // GET /api/shop 注册表 + 已购
 func (s *Server) shopList(c *gin.Context) {
 	var owned []store.OwnedItem
-	s.DB.Find(&owned)
+	s.DB.Where("kid_id=?", kidOf(c)).Find(&owned)
 	ownedMap := map[string]bool{}
 	for _, o := range owned {
 		ownedMap[o.ItemKey] = true
@@ -240,7 +256,7 @@ func (s *Server) buyItem(c *gin.Context) {
 		return
 	}
 	var exists int64
-	s.DB.Model(&store.OwnedItem{}).Where("item_key=?", req.Key).Count(&exists)
+	s.DB.Model(&store.OwnedItem{}).Where("kid_id=? AND item_key=?", kidOf(c), req.Key).Count(&exists)
 	if exists > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "already owned"})
 		return
@@ -255,20 +271,20 @@ func (s *Server) buyItem(c *gin.Context) {
 		if res.RowsAffected == 0 {
 			return fmt.Errorf("insufficient stars")
 		}
-		return tx.Create(&store.OwnedItem{ItemKey: req.Key}).Error
+		return tx.Create(&store.OwnedItem{KidID: kidOf(c), ItemKey: req.Key}).Error
 	})
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "星星不够，先做任务！"})
 		return
 	}
-	s.DB.AddEvent("item_bought", map[string]any{"key": req.Key, "price": price})
+	s.DB.AddEvent(kidOf(c), "item_bought", map[string]any{"key": req.Key, "price": price})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // GET /api/scene 场景布局
 func (s *Server) sceneLayout(c *gin.Context) {
 	var items []store.SceneItem
-	if err := s.DB.Order("placed_at").Find(&items).Error; err != nil {
+	if err := s.DB.Where("kid_id=?", kidOf(c)).Order("placed_at").Find(&items).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -288,7 +304,7 @@ func (s *Server) placeItem(c *gin.Context) {
 		return
 	}
 	var owned int64
-	s.DB.Model(&store.OwnedItem{}).Where("item_key=?", req.Key).Count(&owned)
+	s.DB.Model(&store.OwnedItem{}).Where("kid_id=? AND item_key=?", kidOf(c), req.Key).Count(&owned)
 	if owned == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not owned"})
 		return
@@ -297,7 +313,7 @@ func (s *Server) placeItem(c *gin.Context) {
 		s.DB.Model(&store.SceneItem{}).Where("id=? AND item_key=?", req.ID, req.Key).
 			Updates(map[string]any{"x": req.X, "y": req.Y})
 	} else {
-		s.DB.Create(&store.SceneItem{ItemKey: req.Key, X: req.X, Y: req.Y})
+		s.DB.Create(&store.SceneItem{KidID: kidOf(c), ItemKey: req.Key, X: req.X, Y: req.Y})
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

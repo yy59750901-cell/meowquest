@@ -4,15 +4,44 @@ import "time"
 
 // GORM 模型（表名与已建库一致，AutoMigrate 增量兼容）
 
+// Family 家庭（多租户根：家长权限域 + 共享配置）
+type Family struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	Code      string    `gorm:"size:8;uniqueIndex" json:"code"`
+	PIN       string    `gorm:"size:8" json:"-"`
+	Name      string    `gorm:"size:32;default:我的家" json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+func (Family) TableName() string { return "family" }
+
+// Kid 孩子（业务核心单元）
+type Kid struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	FamilyID  int64     `gorm:"index" json:"family_id"`
+	Name      string    `gorm:"size:32" json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+func (Kid) TableName() string { return "kid" }
+
+// TaskAssign 任务指派（家庭模板 → 孩子）
+type TaskAssign struct {
+	ID         int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	TemplateID int64  `gorm:"uniqueIndex:uk_assign" json:"template_id"`
+	KidID      int64  `gorm:"uniqueIndex:uk_assign" json:"kid_id"`
+}
+func (TaskAssign) TableName() string { return "task_assign" }
+
 type DeviceToken struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	Token     string    `gorm:"size:64;uniqueIndex" json:"token"`
+	KidID     int64     `gorm:"index" json:"kid_id"`
 	CreatedAt time.Time `json:"created_at"`
 }
 func (DeviceToken) TableName() string { return "device_token" }
 
 type Pet struct {
 	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID        int64     `gorm:"uniqueIndex" json:"kid_id"`
 	Name         string    `gorm:"size:32" json:"name"`
 	Species      string    `gorm:"size:16" json:"species"`
 	Personality  string    `gorm:"size:64;default:热情开朗" json:"personality"`
@@ -24,7 +53,7 @@ type Pet struct {
 	HungerDecay  float64    `gorm:"default:2.0;column:hunger_decay" json:"-"`
 	Streak       int64     `json:"streak"`
 	LastTick     *time.Time `gorm:"column:last_tick" json:"-"`
-	HatchedAt    time.Time `json:"hatched_at"`
+	HatchedAt    time.Time `gorm:"autoCreateTime" json:"hatched_at"`
 }
 func (Pet) TableName() string { return "pet" }
 
@@ -40,6 +69,7 @@ func (SpeciesConfig) TableName() string { return "species_config" }
 
 type TaskTemplate struct {
 	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	FamilyID     int64     `gorm:"index" json:"family_id"`
 	Name         string    `gorm:"size:64" json:"name"`
 	Icon         string    `gorm:"size:16;default:⭐" json:"icon"`
 	Category     string    `gorm:"size:16;default:custom" json:"category"`
@@ -87,7 +117,8 @@ type Holiday struct {
 func (Holiday) TableName() string { return "holiday" }
 
 type LeaveRecord struct {
-	Date   string `gorm:"primaryKey;size:10;column:date" json:"date"`
+	Date   string `gorm:"uniqueIndex:uk_leave;size:10;column:date" json:"date"`
+	KidID  int64  `gorm:"uniqueIndex:uk_leave" json:"kid_id"`
 	Reason string `gorm:"size:128" json:"reason"`
 }
 func (LeaveRecord) TableName() string { return "leave_record" }
@@ -95,6 +126,7 @@ func (LeaveRecord) TableName() string { return "leave_record" }
 type DailyTask struct {
 	ID             int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	Date           string    `gorm:"size:10;uniqueIndex:uk_daily" json:"date"`
+	KidID          int64     `gorm:"uniqueIndex:uk_daily" json:"kid_id"`
 	TemplateID     int64     `gorm:"uniqueIndex:uk_daily;column:template_id" json:"template_id"`
 	Snapshot       string    `json:"snapshot"`
 	Status         string    `gorm:"size:16;default:pending" json:"status"` // pending/submitted/approved/rejected/skipped/expired
@@ -106,6 +138,7 @@ func (DailyTask) TableName() string { return "daily_task" }
 
 type TaskCompletion struct {
 	ID           int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID        int64      `gorm:"index" json:"kid_id"`
 	DailyTaskID  int64      `gorm:"index;column:daily_task_id" json:"daily_task_id"`
 	Evidence     string     `json:"evidence"`
 	DurationSec  int        `gorm:"column:duration_sec" json:"duration_sec"`
@@ -118,6 +151,7 @@ func (TaskCompletion) TableName() string { return "task_completion" }
 
 type SettlementLedger struct {
 	ID             int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID          int64     `gorm:"index" json:"kid_id"`
 	Date           string    `gorm:"size:10;column:date" json:"date"`
 	DailyTaskID    *int64    `gorm:"column:daily_task_id" json:"daily_task_id"`
 	Source         string    `gorm:"size:32" json:"source"` // task/task_extra/wish_refund
@@ -133,6 +167,7 @@ func (SettlementLedger) TableName() string { return "settlement_ledger" }
 
 type Wish struct {
 	ID           int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID        int64      `gorm:"index" json:"kid_id"`
 	Title        string     `gorm:"size:128" json:"title"`
 	Photo        string     `json:"photo"`
 	Status       string     `gorm:"size:16;default:pending" json:"status"` // pending/approved/saving/redeem_requested/fulfilled/rejected
@@ -147,6 +182,7 @@ func (Wish) TableName() string { return "wish" }
 
 type SceneItem struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID     int64     `gorm:"index" json:"kid_id"`
 	ItemKey   string    `gorm:"size:32;column:item_key" json:"item_key"`
 	X         float64   `json:"x"`
 	Y         float64   `json:"y"`
@@ -155,13 +191,15 @@ type SceneItem struct {
 func (SceneItem) TableName() string { return "scene_item" }
 
 type OwnedItem struct {
-	ItemKey  string    `gorm:"primaryKey;size:32;column:item_key" json:"item_key"`
+	KidID   int64  `gorm:"uniqueIndex:uk_owned" json:"kid_id"`
+	ItemKey string `gorm:"uniqueIndex:uk_owned;size:32;column:item_key" json:"item_key"`
 	BoughtAt time.Time `gorm:"autoCreateTime;column:bought_at" json:"bought_at"`
 }
 func (OwnedItem) TableName() string { return "owned_item" }
 
 type PetEvent struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID     int64     `gorm:"index" json:"kid_id"`
 	Type      string    `gorm:"size:32;index:idx_pet_event_day,priority:1" json:"type"`
 	Payload   string    `json:"payload"`
 	Day       string    `gorm:"size:10;index:idx_pet_event_day,priority:2" json:"day"`

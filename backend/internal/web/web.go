@@ -15,6 +15,7 @@ func FS() (fs.FS, error) {
 }
 
 // Handler 静态伺服 + SPA fallback
+// HTML 禁缓存（保证发版即生效）；带 hash 的资源长缓存
 func Handler() (http.Handler, error) {
 	sub, err := FS()
 	if err != nil {
@@ -27,8 +28,13 @@ func Handler() (http.Handler, error) {
 			p = "/index.html"
 		}
 		// 资源存在直接伺服；否则回 index.html（hash 路由兜底）
+		isFallback := false
 		if _, err := fs.Stat(sub, p[1:]); err != nil {
 			r.URL.Path = "/"
+			isFallback = true
+		}
+		if p == "/index.html" || p == "/" || isFallback || p == "/manifest.json" {
+			w.Header().Set("Cache-Control", "no-cache") // html 每次校验，防浏览器缓存旧版本引用
 		}
 		fileServer.ServeHTTP(w, r)
 	}), nil

@@ -32,6 +32,7 @@ type taskReq struct {
 	WeeklyQuota   int    `json:"weekly_quota"`
 	ValidFrom     string `json:"valid_from"`
 	ValidTo       string `json:"valid_to"`
+	KidIDs        []int64 `json:"kid_ids"` // 指派孩子（空=全部）
 }
 
 func (r taskReq) toTemplate() store.TaskTemplate {
@@ -76,6 +77,7 @@ func (s *Server) createTask(c *gin.Context) {
 		return
 	}
 	tpl := req.toTemplate()
+	tpl.FamilyID = famOf(c)
 	if err := s.DB.Create(&tpl).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -85,11 +87,29 @@ func (s *Server) createTask(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// 指派：kid_ids 空 = 指派给家庭全部现有孩子
+	if len(req.KidIDs) == 0 {
+		kids, _ := s.DB.KidsOfFamily(famOf(c))
+		for _, k := range kids {
+			s.DB.AssignTask(tpl.ID, k.ID)
+		}
+	} else {
+		for _, kidID := range req.KidIDs {
+			s.DB.AssignTask(tpl.ID, kidID)
+		}
+	}
 	if err := engine.Materialize(s.DB, time.Now()); err != nil {
 		c.JSON(http.StatusOK, gin.H{"id": tpl.ID, "materialize_error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"id": tpl.ID})
+	c.JSON(http.StatusOK, gin.H{"id": tpl.ID, "today_hit": s.todayHit(tpl.ID)})
+}
+
+// todayHit 今天是否有孩子命中该模板（家长创建后的即时反馈）
+func (s *Server) todayHit(templateID int64) int64 {
+	var n int64
+	s.DB.Model(&store.DailyTask{}).Where("template_id=? AND date=?", templateID, time.Now().Format("2006-01-02")).Count(&n)
+	return n
 }
 
 // PUT /api/admin/task/:id 修改（快照隔离：历史实例不受影响）
@@ -100,7 +120,7 @@ func (s *Server) updateTask(c *gin.Context) {
 		return
 	}
 	tpl := req.toTemplate()
-	if err := s.DB.Model(&store.TaskTemplate{}).Where("id=?", c.Param("id")).Updates(map[string]any{
+	if err := s.DB.Model(&store.TaskTemplate{}).Where("id=? AND family_id=?", c.Param("id"), famOf(c)).Updates(map[string]any{
 		"name": tpl.Name, "icon": tpl.Icon, "category": tpl.Category,
 		"goal_type": tpl.GoalType, "goal_value": tpl.GoalValue,
 		"evidence_type": tpl.EvidenceType, "confirm_mode": tpl.ConfirmMode,
@@ -120,16 +140,16 @@ func (s *Server) updateTask(c *gin.Context) {
 		return
 	}
 	if err := engine.Materialize(s.DB, time.Now()); err != nil {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "materialize_error": err.Error()})
+		c.JSON(http.StatusOK, gin.H{"ok": true, "materialize_error": err.Error(), "today_hit": s.todayHit(atoi64(c.Param("id")))})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "today_hit": s.todayHit(atoi64(c.Param("id")))})
 }
 
 // GET /api/admin/task 列表（含调度）
 func (s *Server) listTasks(c *gin.Context) {
 	var tpls []store.TaskTemplate
-	if err := s.DB.Preload("Schedule").Order("sort,id").Find(&tpls).Error; err != nil {
+	if err := s.DB.Preload("Schedule").Where("family_id=?", famOf(c)).Order("sort,id").Find(&tpls).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -162,17 +182,51 @@ func (s *Server) setLeave(c *gin.Context) {
 	var req struct {
 		Date   string `json:"date" binding:"required"`
 		Reason string `json:"reason"`
+		KidID  int64  `json:"kid_id"` // 可选：只给这个孩子请假
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	lr := store.LeaveRecord{Date: req.Date, Reason: req.Reason}
-	if err := s.DB.Where(&lr).Assign(lr).FirstOrCreate(&lr).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	kids, _ := s.DB.KidsOfFamily(famOf(c))
+	targets := kids
+	if req.KidID > 0 {
+		targets = []store.Kid{{ID: req.KidID}}
+	}
+	for _, k := range targets {
+		lr := store.LeaveRecord{Date: req.Date, KidID: k.ID, Reason: req.Reason}
+		s.DB.Where(&lr).Assign(lr).FirstOrCreate(&lr)
+		s.DB.Model(&store.DailyTask{}).Where("`date`=? AND kid_id=? AND status='pending'", req.Date, k.ID).Update("status", "skipped")
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// POST /api/admin/task/:id/assign { kid_ids: [1,2], replace: true }
+func (s *Server) assignTask(c *gin.Context) {
+	var req struct {
+		KidIDs  []int64 `json:"kid_ids" binding:"required"`
+		Replace bool    `json:"replace"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	s.DB.Model(&store.DailyTask{}).Where("`date`=? AND status='pending'", req.Date).Update("status", "skipped")
+	tid := c.Param("id")
+	var tpl store.TaskTemplate
+	if err := s.DB.Where("id=? AND family_id=?", tid, famOf(c)).First(&tpl).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
+	if req.Replace {
+		s.DB.Where("template_id=?", tpl.ID).Delete(&store.TaskAssign{})
+	}
+	for _, kidID := range req.KidIDs {
+		s.DB.AssignTask(tpl.ID, kidID)
+	}
+	if err := engine.Materialize(s.DB, time.Now()); err != nil {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "materialize_error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -191,7 +245,7 @@ func (s *Server) rematerialize(c *gin.Context) {
 func (s *Server) todayTasks(c *gin.Context) {
 	date := time.Now().Format("2006-01-02")
 	var tasks []store.DailyTask
-	if err := s.DB.Where("`date`=?", date).Order("id").Find(&tasks).Error; err != nil {
+	if err := s.DB.Where("`date`=? AND kid_id=?", date, kidOf(c)).Order("id").Find(&tasks).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
