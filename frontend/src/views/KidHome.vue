@@ -1278,7 +1278,7 @@ onBeforeUnmount(() => {
       <div class="panel-bar">🛒 像素商店<button class="sheet-close" @click="sheet = ''" aria-label="关闭商店"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
         <div v-for="it in shopRows" :key="it.key" class="shop-row">
-          <PixelItem v-if="!isWallpaper(it.key) && !it.builtin" :item-key="it.key" :size="32" />
+          <PixelItem v-if="!isWallpaper(it.key) && !it.builtin" :item-key="it.key" :size="26" />
           <i v-else class="wallpaper-swatch" :style="wallStyle(it.builtin ? '' : it.key, 64)" aria-hidden="true"></i>
           <span>{{ it.name }}</span><em>{{ it.builtin ? '免费' : it.price + '⭐' }}</em>
           <button :class="{ owned: it.owned }" :disabled="wallpaperSaving" @click="shopAction(it)">{{ shopButtonText(it) }}</button>
@@ -1527,9 +1527,13 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .wsub { font-size: 11px; color: #88786A; }
 .wsub.done { color: #A67B3F; font-weight: 700; }
 .wish-row .cancel { float: right; color: #A56860; font-weight: 700; cursor: pointer; margin-left: 8px; font-size: 12px; padding: 2px 6px; }
-.shop-row { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 8px; }
-.shop-row span { flex: 1; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
-.shop-row em { font-style: normal; color: #94692F; font-weight: 700; white-space: nowrap; }
+/* 固定四列（图标/名称/价格/按钮），保证各行左右边缘与列宽一致 */
+.shop-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) 52px 62px; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 8px; }
+/* 图标统一坐在同一种 32px 格子里：道具是小图居中，壁纸是图案铺满 */
+.shop-row > :first-child { justify-self: center; display: flex; align-items: center; justify-content: center; box-sizing: border-box; width: 32px; height: 32px; overflow: hidden; border: 2px solid #cbb392; border-radius: 4px; background: #fff6e6; }
+.shop-row span { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.shop-row em { font-style: normal; color: #94692F; font-weight: 700; white-space: nowrap; text-align: right; }
+.shop-row button { text-align: center; }
 .shop-row button.owned { background: #EDF3E8; color: #4C6B39; border-color: #C3D3B6; }
 
 /* 互动操作、独立相机工具与可横滚物品栏 */
@@ -1555,7 +1559,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .scene-viewport .inv-bar { bottom: 16px; left: 16px; max-width: min(580px, calc(100% - 32px)); }
 .inv-bar .lbl { flex-shrink: 0; font-size: 11px; color: #88786A; white-space: nowrap; }
 .inv-item { flex: 0 0 44px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; border: 2px dashed #b39b73; border-radius: 4px; cursor: grab; user-select: none; touch-action: none; background: #fff1d8; }
-.wallpaper-swatch { display: block; flex: 0 0 24px; width: 24px; height: 24px; border: 2px solid #b09b78; background-repeat: repeat; background-position: center; image-rendering: pixelated; }
+.wallpaper-swatch { display: block; width: 100%; height: 100%; background-repeat: repeat; background-position: center; image-rendering: pixelated; }
 .drop-retrieve { position: absolute; z-index: 40; bottom: 14px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border: 2px dashed #b4584f; border-radius: 12px; background: rgba(255, 246, 238, .96); color: #8d453c; font-size: 13px; font-weight: 500; white-space: nowrap; pointer-events: none; box-shadow: 0 4px 10px rgba(80, 50, 40, .18); }
 :global(.drag-ghost) { position: fixed; width: 72px; height: 72px; opacity: 0; pointer-events: none; z-index: 999; image-rendering: pixelated; }
 .status-pointer { position: absolute; width: 14px; height: 10px; background: #b09b78; clip-path: polygon(50% 0, 100% 100%, 0 100%); z-index: 33; pointer-events: none; }
