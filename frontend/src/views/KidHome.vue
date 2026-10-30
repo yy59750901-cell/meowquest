@@ -188,6 +188,7 @@ async function loadAll() {
   if (w) wishes.value = w.wishes || []
   if (s) shopItems.value = s.items || []
   if (sc) sceneItems.value = sc.items || []
+  restoreTimer()
 }
 
 async function refreshPet() {
@@ -373,24 +374,70 @@ let viewportObserver = null
 
 // ===== 语音输入：按住录音 → 转码 16k WAV → /api/asr → 文字填框 =====
 const recState = ref('idle') // idle | recording | uploading
+const recCancelHint = ref(false) // 上滑取消手势中
 let mediaRec = null, recChunks = [], recStream = null
+// 按住-松手手势：麦克风启动是异步的，松手可能早于真正开始录音，
+// 所以用一个"是否还按着"的标记兜底，避免录音开始后没人停（表现为要点两下）。
+let recHolding = false, recStartedAt = 0, recCancelled = false
 
+function releaseStream() {
+  recStream?.getTracks().forEach((t) => t.stop())
+  recStream = null
+}
 async function recStart() {
   if (recState.value !== 'idle' || chatStreaming.value) return
+  recHolding = true
+  recCancelled = false
+  recStartedAt = 0
+  recChunks = []
   try {
     recStream = await navigator.mediaDevices.getUserMedia({ audio: true })
-  } catch (e) { return showToast('麦克风没开权限哦，去设置里打开～') }
-  recChunks = []
+  } catch (e) {
+    recHolding = false
+    recState.value = 'idle'
+    return showToast('麦克风没开权限哦，去设置里打开～')
+  }
+  // 等麦克风期间已经松手 → 立刻收尾，不留一个停不下来的录音
+  if (!recHolding) { releaseStream(); recState.value = 'idle'; return }
   mediaRec = new MediaRecorder(recStream)
   mediaRec.ondataavailable = (e) => recChunks.push(e.data)
   mediaRec.onstop = onRecStop
   mediaRec.start()
   recState.value = 'recording'
+  recStartedAt = Date.now()
+  if (!recHolding) recStop() // 竞态保护：刚好在这一刻松手
 }
-function recStop() {
-  if (recState.value !== 'recording') return
+function recStop(cancel) {
+  recHolding = false
+  if (cancel) recCancelled = true
+  if (recState.value !== 'recording') return // 还在等麦克风：recStart 里会自行收尾
+  if (cancel || Date.now() - recStartedAt < 500) recCancelled = true // 太短的按一下不算
   recState.value = 'uploading'
   try { mediaRec.stop() } catch (e) { recState.value = 'idle' }
+}
+// 按住说话、松手结束、上滑取消（微信式）
+function onRecPointerDown(e) {
+  if (recState.value === 'uploading') return
+  e.preventDefault()
+  recCancelHint.value = false
+  recStart()
+  const pid = e.pointerId
+  const move = (ev) => {
+    if (ev.pointerId !== pid) return
+    recCancelHint.value = e.clientY - ev.clientY > 60 // 上滑 60px 进入取消
+  }
+  const up = (ev) => {
+    if (ev.pointerId !== pid) return
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+    window.removeEventListener('pointercancel', up)
+    const cancel = recCancelHint.value
+    recCancelHint.value = false
+    recStop(cancel)
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+  window.addEventListener('pointercancel', up)
 }
 
 // 录音 Blob → 16kHz 单声道 WAV（全浏览器格式归一：Safari mp4 / Chrome webm / Firefox ogg 都解进来重编）
@@ -433,7 +480,11 @@ async function blobToWav16k(blob) {
 }
 
 async function onRecStop() {
-  recStream.getTracks().forEach((t) => t.stop())
+  releaseStream()
+  if (recCancelled) {
+    recState.value = 'idle'
+    return showToast('松开太快啦，按住不放说一会儿～')
+  }
   const blob = new Blob(recChunks, { type: recChunks[0]?.type || 'audio/webm' })
   if (blob.size < 2000) { // 太短（<~0.1s）忽略
     recState.value = 'idle'
@@ -688,12 +739,36 @@ async function submitTask(t, body = {}) {
 
 // ===== 任务入口分流：计时 / 拍照 / 录音 / 直接打卡 =====
 const timerTask = ref(null) // 打开全屏计时页的任务
+const timerStartAt = ref(0) // 本次计时的开始时间戳（毫秒）
+// 计时进度存本地：刷新/关掉页面/切后台回来都能接着算，不从头再来
+const timerStoreKey = () => `meow_timer_${pet.value?.kid_id || 0}`
+function saveTimer() {
+  const t = timerTask.value
+  if (!t) return localStorage.removeItem(timerStoreKey())
+  localStorage.setItem(timerStoreKey(), JSON.stringify({ id: t.id, startAt: timerStartAt.value }))
+}
+function clearTimer() { localStorage.removeItem(timerStoreKey()) }
+function restoreTimer() {
+  if (timerTask.value) return
+  try {
+    const raw = localStorage.getItem(timerStoreKey())
+    if (!raw) return
+    const saved = JSON.parse(raw)
+    const t = today.value?.tasks?.find((x) => x.id === saved.id)
+    // 任务已提交/已完成或已计过时长的，残留记录直接清掉
+    if (!t || t.status !== 'pending' || hadDuration.value[t.id]) return clearTimer()
+    timerTask.value = t
+    timerStartAt.value = saved.startAt
+  } catch { clearTimer() }
+}
 function startTask(t) {
   const snap = t.snapshot
   if (snap.goal_type === 'duration' && snap.goal_value > 0) {
     // 计时曾达标（材料被 AI 退回重做）→ 免重新计时，直接补材料
     if (!hadDuration.value[t.id]) {
       timerTask.value = t
+      timerStartAt.value = Date.now()
+      saveTimer()
       return
     }
   }
@@ -809,6 +884,7 @@ async function wizardSubmit() {
 async function onTimerDone(sec) {
   const t = timerTask.value
   timerTask.value = null
+  clearTimer()
   if (!t) return
   // 计时达标 + 配置了证据步骤 → 转向导补材料（duration 暂存随提交带上）
   const steps = parseSteps(t.snapshot)
@@ -826,7 +902,7 @@ async function onTimerDone(sec) {
   await submitTask(t, { duration_sec: sec })
 }
 let timerSec = 0
-function onTimerGiveup() { timerTask.value = null }
+function onTimerGiveup() { timerTask.value = null; clearTimer() }
 
 // 拍照/录音（file input：HTTP 局域网下摄像头 API 不可用，iPad 会调起相机/录音）
 const evidenceInput = ref(null)
@@ -1375,12 +1451,13 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="chat-input">
-          <button class="rec-btn" :class="recState" @pointerdown.prevent="recStart" @pointerup.prevent="recStop" @pointerleave="recStop" :disabled="recState === 'uploading'">
+          <button class="rec-btn" :class="{ recording: recState === 'recording', uploading: recState === 'uploading', cancel: recCancelHint }" @pointerdown.prevent="onRecPointerDown" :disabled="recState === 'uploading'" :aria-label="recState === 'recording' ? '松开结束录音' : '按住说话'">
             <template v-if="recState === 'recording'">🎙<i></i></template>
             <template v-else-if="recState === 'uploading'">⏳</template>
             <template v-else>🎤</template>
           </button>
-          <input v-model="chatInput" maxlength="200" :placeholder="recState === 'recording' ? '松开结束，在听呢…' : recState === 'uploading' ? '猫在听写…' : '跟它说点什么（按🎤说话）'"
+          <div v-if="recState === 'recording'" class="rec-hint" :class="{ cancel: recCancelHint }">{{ recCancelHint ? '松开手指，取消发送' : '松手结束 · 上滑取消' }}</div>
+          <input v-model="chatInput" maxlength="200" :placeholder="recState === 'recording' ? '松开结束，在听呢…' : recState === 'uploading' ? '猫在听写…' : '跟它说点什么（按住🎤说话）'"
             @keyup.enter="sendChat" :disabled="chatStreaming" />
           <button @click="sendChat" :disabled="chatStreaming || !chatInput.trim()">喵！</button>
         </div>
@@ -1388,7 +1465,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 全屏计时页 -->
-    <TimerOverlay v-if="timerTask" :minutes="timerTask.snapshot.goal_value"
+    <TimerOverlay v-if="timerTask" :minutes="timerTask.snapshot.goal_value" :start-at="timerStartAt"
       :task-name="timerTask.snapshot.name" :icon="timerTask.snapshot.icon" :species="species"
       @done="onTimerDone" @giveup="onTimerGiveup" />
 
@@ -1606,11 +1683,14 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .msg.user .bubble-txt { background: #EEEBF7; border-color: #DCD2EB; }
 .cursor { animation: blink .8s infinite; font-style: normal; }
 @keyframes blink { 50% { opacity: 0; } }
-.chat-input { display: flex; align-items: center; flex-shrink: 0; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid #E6D8C5; background: #FFFCF6; }
+.chat-input { position: relative; display: flex; align-items: center; flex-shrink: 0; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid #E6D8C5; background: #FFFCF6; }
 .chat-input input { flex: 1 1 0; min-width: 0; width: 0; height: 44px; border: 1.5px solid #D5C1A8; border-radius: 10px; padding: 10px; font-size: 16px; background: #fff; }
 .chat-input button { flex-shrink: 0; height: 44px; font-size: 14px; font-weight: 700; color: #805A32; background: #FFF0D5; border: 1.5px solid #D8BFA1; border-radius: 10px; padding: 8px 12px; cursor: pointer; }
-.chat-input .rec-btn { position: static; flex: 0 0 44px; width: 44px; height: 44px; padding: 0; font-size: 20px; color: #75609D; background: #EEEBF7; border-color: #CFC2E3; box-shadow: 0 2px 6px rgba(103, 75, 47, .06); opacity: 1; touch-action: manipulation; user-select: none; }
+.chat-input .rec-btn { position: static; flex: 0 0 44px; width: 44px; height: 44px; padding: 0; font-size: 20px; color: #75609D; background: #EEEBF7; border-color: #CFC2E3; box-shadow: 0 2px 6px rgba(103, 75, 47, .06); opacity: 1; touch-action: none; -webkit-touch-callout: none; user-select: none; }
 .chat-input .rec-btn.recording { background: #AF6D66; color: #fff; border-color: #975B55; }
+.chat-input .rec-btn.cancel { background: #8d7f72; border-color: #756759; }
+.rec-hint { position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); padding: 6px 12px; border-radius: 10px; background: rgba(60, 45, 35, .9); color: #fff; font-size: 12px; white-space: nowrap; z-index: 3; }
+.rec-hint.cancel { background: #8d453c; }
 .chat-input .rec-btn.recording i { display: inline-block; width: 6px; height: 6px; background: #fff; border-radius: 50%; margin-left: 2px; animation: pulse .8s infinite; }
 .chat-input .rec-btn.uploading { background: #FAEEDA; }
 @keyframes pulse { 50% { opacity: .2; } }

@@ -10,13 +10,18 @@ const props = defineProps({
   taskName: { type: String, default: '' },
   icon: { type: String, default: '⏱' },
   species: { type: String, default: 'orange' },
+  startAt: { type: Number, default: 0 }, // 恢复已有计时：传开始的时间戳（毫秒）
 })
 const emit = defineEmits(['done', 'giveup'])
 
 const totalSec = computed(() => props.minutes * 60)
-const leftSec = ref(props.minutes * 60)
+// 按真实时间算而不是每秒减一：切后台/锁屏被系统节流、或刷新页面，回来都接着算，不会少算也不会作废。
+const startAtMs = ref(props.startAt || Date.now())
+const elapsed = ref(0)
 const paused = ref(false)
-const done = computed(() => leftSec.value <= 0)
+let pausedAtMs = 0
+const leftSec = computed(() => Math.max(0, totalSec.value - elapsed.value))
+const done = computed(() => elapsed.value >= totalSec.value)
 const catAnim = ref('sit')
 
 let tickTimer = null
@@ -28,15 +33,27 @@ const mmss = computed(() => {
   const ss = leftSec.value % 60
   return `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
 })
-const progress = computed(() => ((totalSec.value - leftSec.value) / totalSec.value) * 100)
+const progress = computed(() => Math.min(100, (elapsed.value / totalSec.value) * 100))
 
-function tick() {
-  if (paused.value || done.value) return
-  leftSec.value--
+function syncElapsed() {
+  const end = paused.value ? pausedAtMs : Date.now()
+  elapsed.value = Math.max(0, Math.floor((end - startAtMs.value) / 1000))
   if (done.value) {
     stopGuard()
     catAnim.value = 'eat'
   }
+}
+function pauseNow() {
+  if (paused.value || done.value) return
+  pausedAtMs = Date.now()
+  paused.value = true
+  syncElapsed()
+}
+function resumeNow() {
+  if (!paused.value) return
+  startAtMs.value += Date.now() - pausedAtMs
+  paused.value = false
+  syncElapsed()
 }
 
 // 防挂机：随机 60~120s 弹"还在练吗"，15 秒不点暂停计时
@@ -45,7 +62,7 @@ function scheduleGuard() {
   guardTimer = setTimeout(() => {
     showGuard.value = true
     guardTimeout = setTimeout(() => {
-      paused.value = true
+      pauseNow()
       catAnim.value = 'sleep'
     }, 15000)
   }, 60000 + Math.random() * 60000)
@@ -53,9 +70,9 @@ function scheduleGuard() {
 const showGuard = ref(false)
 function stillHere() {
   showGuard.value = false
-  paused.value = false
   catAnim.value = 'sit'
   clearTimeout(guardTimeout)
+  resumeNow()
   scheduleGuard()
 }
 function stopGuard() {
@@ -78,7 +95,8 @@ async function quit() {
 
 function finish() {
   cleanup()
-  emit('done', totalSec.value)
+  // 上报真实经过的秒数（不再是写死的目标值），家长端能看到这次练了多久
+  emit('done', Math.max(elapsed.value, totalSec.value))
 }
 
 function cleanup() {
@@ -87,8 +105,9 @@ function cleanup() {
 }
 
 onMounted(() => {
-  tickTimer = setInterval(tick, 1000)
-  scheduleGuard()
+  syncElapsed()
+  tickTimer = setInterval(syncElapsed, 500)
+  if (!done.value) scheduleGuard()
 })
 onBeforeUnmount(cleanup)
 </script>
