@@ -1,9 +1,15 @@
 package main
 
 import (
-	"strings"
+	"context"
+	"errors"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
 	"meowquest/backend/internal/api"
 	"meowquest/backend/internal/engine"
@@ -30,11 +36,24 @@ func main() {
 	})
 
 	srv := api.New(db, pin)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	workerDone := srv.StartReviewWorker(ctx)
 	engine.StartCron(db) // 每日 00:05 物化 + 启动补物化
 	log.Printf("meowquest backend listening on %s (gorm + mysql ok)", addr)
-	if err := srv.Router().Run(addr); err != nil {
+	httpServer := &http.Server{Addr: addr, Handler: srv.Router(), ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("关闭 HTTP 服务失败: %v", err)
+		}
+	}()
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+	<-workerDone
 }
 
 // loadDotEnv 本地开发：加载 backend/.env（线上用 systemd EnvironmentFile，不走这里）

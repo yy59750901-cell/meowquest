@@ -105,6 +105,30 @@ CREATE TABLE IF NOT EXISTS task_completion (
     INDEX idx_completion_task (daily_task_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS ai_review_job (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    completion_id BIGINT NOT NULL,
+    daily_task_id BIGINT NOT NULL,
+    kid_id BIGINT NOT NULL,
+    snapshot TEXT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'queued',
+    stage VARCHAR(32) NOT NULL DEFAULT 'queued',
+    attempt INT NOT NULL DEFAULT 0,
+    error TEXT NULL,
+    result TEXT NULL,
+    asr_cache TEXT NULL,
+    lease_token VARCHAR(64) NULL,
+    lease_expires_at DATETIME(3) NULL,
+    started_at DATETIME(3) NULL,
+    finished_at DATETIME(3) NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    UNIQUE KEY idx_ai_review_job_completion_id (completion_id),
+    INDEX idx_ai_review_job_daily_task_id (daily_task_id),
+    INDEX idx_ai_review_job_kid_id (kid_id),
+    INDEX idx_ai_review_queue (status, lease_expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS settlement_ledger (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     `date` DATE NOT NULL,

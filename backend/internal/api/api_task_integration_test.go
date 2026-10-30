@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -70,7 +71,7 @@ func taskIntegrationDB(t *testing.T) *store.DB {
 	}
 	t.Cleanup(func() { sqlDB.Close() })
 	if err := gdb.AutoMigrate(&store.Family{}, &store.Kid{}, &store.TaskTemplate{}, &store.TaskSchedule{},
-		&store.TaskAssign{}, &store.DailyTask{}, &store.TaskCompletion{}, &store.LeaveRecord{},
+		&store.TaskAssign{}, &store.DailyTask{}, &store.TaskCompletion{}, &store.AIReviewJob{}, &store.LeaveRecord{},
 		&store.RewardPolicy{}, &store.Holiday{}, &store.Pet{}, &store.PetEvent{}, &store.SettlementLedger{}); err != nil {
 		t.Fatal(err)
 	}
@@ -377,8 +378,15 @@ func TestAIRejectedEditKeepsDurationAndExplicitEmptyPrompt(t *testing.T) {
 	w := taskTestRequest(r, http.MethodPost, fmt.Sprintf("/api/tasks/%d/submit", dt.ID),
 		map[string]any{"duration_sec": 1377, "evidence": []map[string]string{{"type": "photo", "path": "/uploads/a.jpg"}}})
 	requireTaskStatus(t, w, http.StatusOK)
-	if !strings.Contains(w.Body.String(), `"redo":true`) {
-		t.Fatalf("AI 未按快照进入驳回分支：%s", w.Body)
+	if !strings.Contains(w.Body.String(), `"ai_queued":true`) {
+		t.Fatalf("AI 未进入异步队列：%s", w.Body)
+	}
+	job, err := s.claimReviewJob(time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("未能领取审核: %v", err)
+	}
+	if err := s.executeReviewJob(context.Background(), *job, time.Minute); err != nil {
+		t.Fatal(err)
 	}
 	select {
 	case prompt := <-prompts:

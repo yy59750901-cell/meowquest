@@ -87,6 +87,11 @@ func (s *Server) submitTask(c *gin.Context) {
 			}
 			mode = tpl.ConfirmMode
 		}
+		// 无论新提交的确认模式是否仍为 AI，都取消旧提交尚未完成的审核。
+		if err := tx.Model(&store.AIReviewJob{}).Where("daily_task_id=? AND status IN ('queued','running')", dt.ID).
+			Updates(map[string]any{"status": "canceled", "stage": "canceled", "finished_at": time.Now(), "lease_token": "", "lease_expires_at": nil}).Error; err != nil {
+			return err
+		}
 		if confirmModeContains(mode, 'a') {
 			extraBase := 0
 			if snap.ExtraMinutes > 0 && req.ExtraSec >= snap.ExtraMinutes*60 {
@@ -107,32 +112,15 @@ func (s *Server) submitTask(c *gin.Context) {
 			return nil
 		}
 		if confirmModeContains(mode, 'b') {
-			reviewer := *s
-			reviewer.DB = db
-			v, rerr := reviewer.runReview(dt, EvidenceRow{Evidence: ev, DurationSec: duration})
-			if rerr != nil {
-				result = gin.H{"waiting": "parent_confirm", "ai": "unavailable"}
-			} else {
-				resultJSON, err := json.Marshal(v)
-				if err != nil {
-					return err
-				}
-				cols := map[string]any{"review_result": string(resultJSON)}
-				if !v.Pass {
-					now := time.Now()
-					cols["confirm_status"], cols["confirmed_at"], cols["reject_reason"] = "rejected", &now, "AI："+v.Reason
-				}
-				if err := tx.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).Updates(cols).Error; err != nil {
-					return err
-				}
-				db.AddEvent(dt.KidID, "ai_review", map[string]any{"task": snap.Name, "pass": v.Pass, "score": v.Score})
-				if !v.Pass {
-					result = gin.H{"redo": true, "ai_pass": false, "ai_reason": v.Reason, "kid_feedback": v.KidFeedback}
-					return nil
-				}
-				result = gin.H{"waiting": "parent_confirm", "ai_pass": true, "ai_reason": v.Reason,
-					"ai_score": v.Score, "kid_feedback": v.KidFeedback}
+			// 只入队，所有 ASR/LLM 网络调用由 worker 在事务外执行。
+			job, err := newReviewJob(tx, dt, comp)
+			if err != nil {
+				return err
 			}
+			if err := tx.Create(&job).Error; err != nil {
+				return err
+			}
+			result = gin.H{"submitted": true, "ai_queued": true, "completion_id": comp.ID, "waiting": "parent_confirm"}
 		} else {
 			result = gin.H{"waiting": "parent_confirm"}
 		}
@@ -168,38 +156,49 @@ func atoi64(s string) int64 {
 // ===== 家长端：确认队列 =====
 
 type confirmItem struct {
-	ID           int64     `json:"id"`
-	KidName      string    `json:"kid_name"`
-	Date         string    `json:"date"`
-	Snapshot     string    `json:"snapshot"` // PG Scan 兼容：string（前端 parse）
-	Duration     int       `json:"duration_sec"`
-	ReviewResult string    `json:"review_result"`
-	Evidence     string    `json:"evidence"` // PG Scan 兼容：string
-	SubmittedAt  time.Time `json:"submitted_at"`
+	ID            int64         `gorm:"column:id" json:"id"` // 兼容旧前端：daily_task_id
+	DailyTaskID   int64         `gorm:"column:daily_task_id" json:"daily_task_id"`
+	CompletionID  int64         `gorm:"column:completion_id" json:"completion_id"`
+	KidName       string        `gorm:"column:kid_name" json:"kid_name"`
+	Date          string        `gorm:"column:date" json:"date"`
+	Snapshot      string        `gorm:"column:snapshot" json:"snapshot"`
+	Duration      int           `gorm:"column:duration_sec" json:"duration_sec"`
+	ReviewResult  string        `gorm:"column:review_result" json:"review_result"`
+	Evidence      string        `gorm:"column:evidence" json:"evidence"`
+	SubmittedAt   time.Time     `gorm:"column:submitted_at" json:"submitted_at"`
+	ConfirmStatus string        `gorm:"column:confirm_status" json:"confirm_status"`
+	ConfirmedAt   *time.Time    `gorm:"column:confirmed_at" json:"confirmed_at"`
+	RejectReason  string        `gorm:"column:reject_reason" json:"reject_reason"`
+	AIReview      *aiReviewView `gorm:"-" json:"ai_review"`
 }
 
-// GET /api/admin/confirm/list 待确认任务（含证据/时长/快照）
+const confirmSelect = `SELECT d.id, d.id AS daily_task_id, p.id AS completion_id,
+	COALESCE(k.name,'') AS kid_name, d.date, COALESCE(j.snapshot,d.snapshot) AS snapshot,
+	p.duration_sec, COALESCE(p.review_result,'') AS review_result, p.evidence, p.submitted_at,
+	p.confirm_status, p.confirmed_at, COALESCE(p.reject_reason,'') AS reject_reason
+	FROM task_completion p JOIN daily_task d ON d.id=p.daily_task_id
+	JOIN kid k ON k.id=d.kid_id LEFT JOIN ai_review_job j ON j.completion_id=p.id `
+
+// GET /api/admin/confirm/list 保留兼容字段，只展示最新待审和 AI 拒绝历史。
 func (s *Server) confirmList(c *gin.Context) {
-	var items []confirmItem
-	if err := s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, d.date, d.snapshot, p.duration_sec, COALESCE(p.review_result,'') AS review_result, p.evidence, p.submitted_at
-		FROM daily_task d
-		JOIN task_completion p ON p.daily_task_id=d.id
-		JOIN kid k ON k.id = d.kid_id
-		WHERE d.status='submitted' AND p.confirm_status='pending' AND k.family_id=?
-		ORDER BY p.submitted_at DESC LIMIT 50`, famOf(c)).Scan(&items).Error; err != nil {
+	items, rejected := []confirmItem{}, []confirmItem{}
+	err := s.DB.Raw(confirmSelect+`WHERE d.status='submitted' AND p.confirm_status='pending' AND k.family_id=?
+		AND NOT EXISTS (SELECT 1 FROM task_completion newer WHERE newer.daily_task_id=d.id AND newer.id>p.id)
+		ORDER BY p.submitted_at DESC,p.id DESC LIMIT 50`, famOf(c)).Scan(&items).Error
+	if err == nil {
+		err = s.DB.Raw(confirmSelect+`WHERE p.confirm_status='rejected' AND p.review_result<>'' AND k.family_id=?
+			ORDER BY p.submitted_at DESC,p.id DESC LIMIT 20`, famOf(c)).Scan(&rejected).Error
+	}
+	if err == nil {
+		err = attachReviewViews(s.DB.DB, items)
+	}
+	if err == nil {
+		err = attachReviewViews(s.DB.DB, rejected)
+	}
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// AI 初审退回历史（孩子可重做覆盖；家长可见没通过的原因）
-	var rejected []confirmItem
-	s.DB.Raw(`SELECT d.id, COALESCE(k.name,'') AS kid_name, d.date, d.snapshot, p.duration_sec,
-			COALESCE(p.review_result,'') AS review_result, p.evidence, p.submitted_at
-		FROM daily_task d
-		JOIN task_completion p ON p.daily_task_id=d.id AND p.confirm_status='rejected'
-		JOIN kid k ON k.id = d.kid_id
-		WHERE p.review_result != '' AND k.family_id=?
-		ORDER BY p.submitted_at DESC LIMIT 20`, famOf(c)).Scan(&rejected)
-
 	c.JSON(http.StatusOK, gin.H{"items": items, "rejected": rejected})
 }
 
@@ -207,8 +206,9 @@ func (s *Server) confirmList(c *gin.Context) {
 func (s *Server) confirmTask(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {
-		Approve bool   `json:"approve"`
-		Reason  string `json:"reason"`
+		Approve      bool   `json:"approve"`
+		Reason       string `json:"reason"`
+		CompletionID int64  `json:"completion_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -229,6 +229,49 @@ func (s *Server) confirmTask(c *gin.Context) {
 			status = http.StatusBadRequest
 			return fmt.Errorf("task status %s", dt.Status)
 		}
+		var latest store.TaskCompletion
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("daily_task_id=?", dt.ID).Order("id DESC").First(&latest).Error; err != nil {
+			return err
+		}
+		if latest.ConfirmStatus != "pending" || (req.CompletionID != 0 && req.CompletionID != latest.ID) {
+			status = http.StatusConflict
+			return fmt.Errorf("提交已更新或已处理，请刷新")
+		}
+		// 旧 submitted 空结果记录在提前人审时也要明确展示 canceled。
+		var job store.AIReviewJob
+		if err := tx.Where("completion_id=?", latest.ID).First(&job).Error; err != nil {
+			if err != gorm.ErrRecordNotFound {
+				return err
+			}
+			var snap engine.Snapshot
+			if err := json.Unmarshal([]byte(dt.Snapshot), &snap); err != nil {
+				return err
+			}
+			mode := snap.ConfirmMode
+			if mode == "" {
+				var tpl store.TaskTemplate
+				if err := tx.First(&tpl, dt.TemplateID).Error; err != nil {
+					return err
+				}
+				mode = tpl.ConfirmMode
+			}
+			if confirmModeContains(mode, 'b') && latest.ReviewResult == "" {
+				var err error
+				job, err = newReviewJob(tx, dt, latest)
+				if err != nil {
+					return err
+				}
+				job.Status, job.Stage = "canceled", "canceled"
+				now := time.Now()
+				job.FinishedAt = &now
+				if err := tx.Create(&job).Error; err != nil {
+					return err
+				}
+			}
+		}
+		if err := cancelReviewJob(tx, latest.ID); err != nil {
+			return err
+		}
 		now := time.Now()
 		confirmStatus := "rejected"
 		if req.Approve {
@@ -238,7 +281,7 @@ func (s *Server) confirmTask(c *gin.Context) {
 		if !req.Approve {
 			cols["reject_reason"] = req.Reason
 		}
-		if err := tx.Model(&store.TaskCompletion{}).Where("daily_task_id=? AND confirm_status='pending'", dt.ID).
+		if err := tx.Model(&store.TaskCompletion{}).Where("id=? AND confirm_status='pending'", latest.ID).
 			Updates(cols).Error; err != nil {
 			return err
 		}

@@ -23,6 +23,9 @@ func taskTestRouter(s *Server, familyID, kidID int64) *gin.Engine {
 	r.POST("/api/admin/task", s.createTask)
 	r.PUT("/api/admin/task/:id", s.updateTask)
 	r.POST("/api/tasks/:id/submit", s.submitTask)
+	r.GET("/api/admin/confirm/list", s.confirmList)
+	r.GET("/api/admin/confirm/history", s.confirmHistory)
+	r.POST("/api/admin/confirm/:id/ai-retry", s.retryAIReview)
 	r.POST("/api/admin/confirm/:id", s.confirmTask)
 	r.GET("/api/tasks/today", s.todayTasks)
 	return r

@@ -38,6 +38,8 @@ func (s *Server) Router() *gin.Engine {
 		api.GET("/tasks/today", s.kid, s.todayTasks)
 		api.POST("/tasks/:id/submit", s.kid, s.submitTask)
 		api.POST("/upload", s.kid, s.uploadEvidence)
+		api.GET("/media/thumbnail", s.mediaThumbnail)
+		api.HEAD("/media/thumbnail", s.mediaThumbnail)
 		// 愿望
 		api.POST("/wish", s.kid, s.createWish)
 		api.GET("/wish/list", s.kid, s.wishList)
@@ -71,6 +73,8 @@ func (s *Server) Router() *gin.Engine {
 		admin.POST("/leave", s.admin, s.setLeave)
 		admin.POST("/materialize", s.admin, s.rematerialize)
 		admin.GET("/confirm/list", s.admin, s.confirmList)
+		admin.GET("/confirm/history", s.admin, s.confirmHistory)
+		admin.POST("/confirm/:id/ai-retry", s.admin, s.retryAIReview)
 		admin.POST("/confirm/:id", s.admin, s.confirmTask)
 		admin.GET("/ledger", s.admin, s.ledger)
 		admin.GET("/ledger/:kid_id", s.admin, s.ledgerKid)
@@ -125,8 +129,8 @@ func (s *Server) admin(c *gin.Context) {
 	c.Next()
 }
 
-func kidOf(c *gin.Context) int64  { return c.GetInt64("kidID") }
-func famOf(c *gin.Context) int64  { return c.GetInt64("familyID") }
+func kidOf(c *gin.Context) int64 { return c.GetInt64("kidID") }
+func famOf(c *gin.Context) int64 { return c.GetInt64("familyID") }
 
 // ===== 家长登录 / 注册 =====
 
@@ -214,9 +218,9 @@ func (s *Server) enter(c *gin.Context) {
 	}
 	kids, _ := s.DB.KidsOfFamily(fam.ID)
 	type kidInfo struct {
-		ID    int64  `json:"id"`
-		Name  string `json:"name"`
-		HasPet bool  `json:"has_pet"`
+		ID     int64  `json:"id"`
+		Name   string `json:"name"`
+		HasPet bool   `json:"has_pet"`
 	}
 	var out []kidInfo
 	for _, k := range kids {
@@ -230,11 +234,11 @@ func (s *Server) enter(c *gin.Context) {
 // kid_id=选择已有孩子（换设备/多孩同设备）；无 kid_id=新建孩子并领养
 func (s *Server) adopt(c *gin.Context) {
 	var req struct {
-		Code       string `json:"code" binding:"required"`
-		KidID      int64  `json:"kid_id"`
-		KidName    string `json:"kid_name"`
-		Species    string `json:"species"` // 新建分支内校验（选已有孩子时不需要）
-		Name       string `json:"name"`
+		Code        string `json:"code" binding:"required"`
+		KidID       int64  `json:"kid_id"`
+		KidName     string `json:"kid_name"`
+		Species     string `json:"species"` // 新建分支内校验（选已有孩子时不需要）
+		Name        string `json:"name"`
 		Personality string `json:"personality"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {

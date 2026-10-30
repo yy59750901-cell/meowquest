@@ -79,7 +79,7 @@ func autoMigrateAll(gdb *gorm.DB) error {
 	return gdb.AutoMigrate(
 		&Family{}, &Kid{}, &TaskAssign{}, &DeviceToken{},
 		&Pet{}, &SpeciesConfig{}, &TaskTemplate{}, &TaskSchedule{}, &RewardPolicy{},
-		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &TaskCompletion{},
+		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &TaskCompletion{}, &AIReviewJob{},
 		&SettlementLedger{}, &Wish{}, &SceneItem{}, &OwnedItem{}, &PetEvent{}, &ChatMessage{},
 	)
 }

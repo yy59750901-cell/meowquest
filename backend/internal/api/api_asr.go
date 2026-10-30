@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -42,8 +43,10 @@ func (s *Server) asr(c *gin.Context) {
 	}
 	audioURL := publicURL() + "/uploads/" + time.Now().Format("200601") + "/" + name
 
-	// 转写（客户端 30s 超时）
-	text, err := s.LLM.Transcribe(c.Request.Context(), audioURL)
+	// 聊天请求仍有服务端时间上限，不沿用后台审核的五分钟窗口。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	text, err := s.LLM.Transcribe(ctx, audioURL)
 	os.Remove(path) // 转写完即删，音频不留存（隐私）
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "猫没听清，再试一次喵～"})

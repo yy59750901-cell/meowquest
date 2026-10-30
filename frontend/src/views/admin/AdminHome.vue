@@ -12,7 +12,9 @@ function parseEvidence(ev) {
     return Array.isArray(p) ? p : []
   } catch (e) { return [] }
 }
-import { onMounted, ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import TaskReviewCard from '../../components/TaskReviewCard.vue'
+import { reviewPending } from '../../ai-review.js'
 import { useRouter } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
 import { evidenceSteps } from '../../task-evidence.js'
@@ -20,9 +22,40 @@ import { evidenceSteps } from '../../task-evidence.js'
 const router = useRouter()
 const tab = ref('confirm')
 // 切 tab 即拉最新数据（tabs 不销毁组件，onMounted 只跑一次会留旧数据）
-watch(tab, () => load())
+watch(tab, () => { if (tab.value === 'history') loadHistory(1); else load() })
 const confirms = ref([])
-const rejectedItems = ref([]) // AI 初审退回历史（孩子可覆盖重做）
+const rejectedItems = ref([])
+const historyItems = ref([])
+const historyPage = ref(1)
+const historyTotal = ref(0)
+const historyLoading = ref(false)
+const historyError = ref('')
+const busyReview = ref(0)
+const now = ref(Date.now())
+let statusTicker = null
+let loadingReviews = false
+const itemKey = it => it.completion_id || it.id
+async function loadReviews() {
+  if (loadingReviews) return
+  loadingReviews = true
+  try {
+    const c = await jget('/api/admin/confirm/list')
+    if (Array.isArray(c.items)) confirms.value = c.items
+    if (Array.isArray(c.rejected)) rejectedItems.value = c.rejected
+  } catch { /* 保留原数据，下一次轮询恢复 */ }
+  finally { loadingReviews = false }
+}
+async function loadHistory(page = 1) {
+  if (historyLoading.value) return
+  historyLoading.value = true; historyError.value = ''
+  try {
+    const data = await jget(`/api/admin/confirm/history?page=${page}&page_size=20`)
+    if (!Array.isArray(data.items)) throw new Error(data.error || '历史加载失败')
+    historyItems.value = page === 1 ? data.items : [...historyItems.value, ...data.items]
+    historyPage.value = page; historyTotal.value = data.total || 0
+  } catch (e) { historyError.value = e.message }
+  finally { historyLoading.value = false }
+}
 const expanded = ref(0) // 待确认卡片展开的 id（默认全收起）
 function toggleExpand(id) { expanded.value = expanded.value === id ? 0 : id }
 function snapOf(it) {
@@ -100,17 +133,33 @@ async function load() {
   ledger.value = l.items || []
 }
 
-async function approve(id) {
-  const { ok } = await jpost(`/api/admin/confirm/${id}`, { approve: true })
-  if (ok) { showToast('已通过'); await load() }
+async function decideReview(it, approve) {
+  if (busyReview.value) return
+  busyReview.value = itemKey(it)
+  try {
+    const incomplete = reviewPending(it.ai_review)
+    if (!approve || incomplete) await showConfirmDialog({
+      title: incomplete ? 'AI 尚未完成，提前审核？' : '驳回补交',
+      message: incomplete ? '确认后将停止本次 AI 分析；你的决定不会被晚到的 AI 结果覆盖。' : '孩子可以补交材料，已达标计时不用重做。',
+    })
+    const { ok, data } = await jpost(`/api/admin/confirm/${it.daily_task_id || it.id}`, {
+      approve, completion_id: it.completion_id, reason: approve ? '' : '请补充材料，再认真试一次哦～',
+    })
+    if (!ok) return showToast(data.error || '审核失败，请刷新后再试')
+    showToast(approve ? '已通过，AI 评价可在审核历史回看' : '已退回，可补交材料')
+    expanded.value = 0; await loadReviews()
+  } catch (e) { if (e !== 'cancel' && e !== 'close') showToast('网络异常，请刷新核对任务状态') }
+  finally { busyReview.value = 0 }
 }
-async function reject(id) {
-  const r = await showConfirmDialog({ title: '驳回', message: '孩子可以重新完成后再次提交' })
-  if (r === 'confirm') {
-    await jpost(`/api/admin/confirm/${id}`, { approve: false, reason: '再认真做一遍哦～' })
-    showToast('已驳回')
-    await load()
-  }
+async function retryReview(it) {
+  if (busyReview.value) return
+  busyReview.value = itemKey(it)
+  try {
+    const { ok, data } = await jpost(`/api/admin/confirm/${it.completion_id}/ai-retry`, {})
+    if (!ok) return showToast(data.error || '重试失败')
+    showToast('已加入后台队列，无需让孩子重新提交'); await loadReviews()
+  } catch { showToast('网络异常，请稍后查看执行状态') }
+  finally { busyReview.value = 0 }
 }
 
 async function createTask() {
@@ -172,53 +221,38 @@ onMounted(() => {
     return
   }
   load()
+  statusTicker = setInterval(() => {
+    now.value = Date.now()
+    if (!document.hidden && tab.value === 'confirm') loadReviews()
+  }, 5000)
 })
+onBeforeUnmount(() => clearInterval(statusTicker))
 </script>
 
 <template>
   <div class="admin">
-    <van-tabs v-model:active="tab" sticky>
+    <van-tabs v-model:active="tab" sticky :ellipsis="false">
       <van-tab title="✅ 待确认" name="confirm">
         <div v-if="!confirms.length" class="empty">没有待确认的任务</div>
-        <div v-for="it in confirms" :key="it.id" class="confirm-card" @click="toggleExpand(it.id)">
-          <div class="row1">
-            <b>{{ it.kid_name ? it.kid_name + ' · ' : '' }}{{ snapOf(it).icon }} {{ snapOf(it).name }}</b>
-            <em>{{ Math.round(it.duration_sec / 60) }}分钟 · {{ (parseEvidence(it.evidence) || []).length ? parseEvidence(it.evidence).length + '个材料' : '无材料' }}</em>
-            <span class="arrow">{{ expanded === it.id ? '▾' : '▸' }}</span>
-          </div>
-          <div class="row2">提交于 {{ new Date(it.submitted_at).toLocaleString('zh-CN') }}</div>
-          <div v-if="expanded === it.id" class="detail">
-            <div v-for="(ev, i) in parseEvidence(it.evidence)" :key="i" class="evidence">
-              <img v-if="ev.type === 'photo' || ev.type === 'video'" :src="ev.path" @click.stop />
-              <audio v-else-if="ev.type === 'audio'" :src="ev.path" controls @click.stop />
-            </div>
-            <div v-if="it.review_result" class="ai-report" :class="safeReview(it.review_result).pass ? 'ok' : 'warn'">
-              <div class="ai-head">
-                🤖 AI {{ safeReview(it.review_result).pass ? '初审通过' : '有疑问' }}
-                <span v-if="safeReview(it.review_result).score" class="ai-stars">{{ '⭐'.repeat(safeReview(it.review_result).score) }}</span>
-              </div>
-              <div class="ai-reason">{{ safeReview(it.review_result).reason }}</div>
-              <div v-if="safeReview(it.review_result).kid_feedback" class="ai-kid">🐱 对孩子说：{{ safeReview(it.review_result).kid_feedback }}</div>
-            </div>
-            <div v-if="!(parseEvidence(it.evidence) || []).length" class="no-ev">（无照片/录音材料，只有计时数据）</div>
-            <div class="btns">
-              <button class="ok" @click.stop="approve(it.id)">✓ 通过并结算</button>
-              <button class="no" @click.stop="reject(it.id)">驳回重做</button>
-            </div>
-          </div>
-        </div>
-        <!-- AI 初审退回（孩子可重做覆盖提交） -->
+        <TaskReviewCard v-for="it in confirms" :key="itemKey(it)" :item="it" :now="now"
+          :expanded="expanded === itemKey(it)" :busy="!!busyReview"
+          @toggle="toggleExpand(itemKey(it))" @approve="decideReview(it, true)" @reject="decideReview(it, false)" @retry="retryReview(it)" />
         <div v-if="rejectedItems.length" class="reject-block">
-          <b>❌ AI 初审未通过（{{ rejectedItems.length }}）</b>
-          <small>孩子收到猫的反馈后可重新提交覆盖</small>
-          <div v-for="it in rejectedItems" :key="'r' + it.id" class="task-line reject-line">
-            <div class="row1">
-              <b>{{ snapOf(it).icon }} {{ it.kid_name }} · {{ snapOf(it).name }}</b>
-              <em class="reject-tag">{{ safeReview(it.review_result).pass ? "曾通过" : "未通过" }}</em>
-            </div>
-            <div class="row2">{{ safeReview(it.review_result).reason }} · {{ Math.round((it.duration_sec || 0) / 60) }}分钟</div>
-          </div>
+          <b>近期退回记录（{{ rejectedItems.length }}）</b>
+          <small>孩子可以补交，原提交及 AI 评价仍保留。</small>
+          <TaskReviewCard v-for="it in rejectedItems" :key="'r' + itemKey(it)" :item="it" history :now="now"
+            :expanded="expanded === itemKey(it)" @toggle="toggleExpand(itemKey(it))" />
         </div>
+      </van-tab>
+
+      <van-tab title="审核历史" name="history">
+        <div class="history-tools"><small>每次提交独立保留，审核通过后也能回看 AI 评价和材料。</small><button :disabled="historyLoading" @click="loadHistory(1)">刷新</button></div>
+        <div v-if="historyError" class="history-tools">{{ historyError }}<button @click="loadHistory(historyPage)">重试</button></div>
+        <div v-if="!historyItems.length && !historyLoading && !historyError" class="empty">还没有已处理的提交</div>
+        <TaskReviewCard v-for="it in historyItems" :key="itemKey(it)" :item="it" history :now="now"
+          :expanded="expanded === itemKey(it)" @toggle="toggleExpand(itemKey(it))" />
+        <button v-if="historyItems.length < historyTotal" class="history-more" :disabled="historyLoading" @click="loadHistory(historyPage + 1)">{{ historyLoading ? '加载中…' : '加载更多' }}</button>
+        <p v-if="historyItems.length" class="history-count">已显示 {{ historyItems.length }} / {{ historyTotal }} 条</p>
       </van-tab>
 
       <van-tab title="📋 任务配置" name="tasks">
@@ -362,6 +396,13 @@ onMounted(() => {
 
 <style scoped>
 .admin { max-width: 560px; margin: 0 auto; min-height: 100vh; background: #F7F5F0; }
+.history-tools { display: flex; align-items: center; gap: 8px; padding: 12px; color: #6F6E68; font-size: 12px; line-height: 1.5; }
+.history-tools small { flex: 1; }
+.history-tools button { flex-shrink: 0; font-size: 12px; padding: 6px 10px; background: #fff; color: #534AB7; border: 1px solid #D3D1C7; box-shadow: none; }
+.history-more { display: block; margin: 14px auto; color: #534AB7; background: #fff; }
+.history-count { text-align: center; color: #6F6E68; font-size: 12px; padding-bottom: 12px; }
+.admin :deep(.van-tabs__nav) { overflow-x: auto; }
+.admin :deep(.van-tab) { flex: 0 0 auto !important; min-width: 86px; padding: 0 10px; }
 
 /* ===== 统一控件 token（修复对齐：所有输入/下拉同高同边框） ===== */
 .ctl {

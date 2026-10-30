@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
-// asrBase filetrans 系列走原生 /api/v1（与 chat 的 compatible-mode 前缀不同）
+// asrBase filetrans 系列走原生 /api/v1。
 func asrBase() string {
 	if v := os.Getenv("MEOW_ASR_BASE_URL"); v != "" {
 		return v
@@ -19,95 +22,180 @@ func asrBase() string {
 	return "https://cn-beijing.maas.qianwenaiapi.com/api/v1"
 }
 
-// Transcribe 文件转写：音频公网 URL → 提交 filetrans 异步任务 → 轮询 → 返回文字
-// 适合"按住说完松开"的非实时场景（延迟 3~6 秒）
+// TranscriptionState 可持久化的上游任务与结果，避免网络失败或重启后重复提交。
+type TranscriptionState struct {
+	TaskID        string `json:"task_id,omitempty"`
+	TranscriptURL string `json:"transcript_url,omitempty"`
+	Text          string `json:"text,omitempty"`
+	Done          bool   `json:"done,omitempty"`
+	Failed        bool   `json:"failed,omitempty"`
+}
+
 func (c *Client) Transcribe(ctx context.Context, audioURL string) (string, error) {
-	if !c.Enabled() {
+	return c.TranscribeCached(ctx, audioURL, &TranscriptionState{}, nil)
+}
+
+// TranscribeCached 轮询到调用方 context 截止；每次获得 task ID 或结果立即持久化。
+func (c *Client) TranscribeCached(ctx context.Context, audioURL string, state *TranscriptionState, save func() error) (string, error) {
+	if c == nil || !c.Enabled() {
 		return "", fmt.Errorf("LLM 未配置")
 	}
-	// 1. 提交任务
-	body := map[string]any{
-		"model": "qwen-audio-3.0-asr-flash-filetrans",
-		"input": map[string]any{"file_urls": []string{audioURL}},
-	}
-	b, _ := json.Marshal(body)
-	req, _ := http.NewRequestWithContext(ctx, "POST", asrBase()+"/services/audio/asr/transcription", bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	req.Header.Set("X-DashScope-Async", "enable") // 异步任务标志（漏了会报 does not support synchronous calls）
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("asr submit: %w", err)
-	}
-	defer resp.Body.Close()
-	var submit struct {
-		Output struct {
-			TaskID     string `json:"task_id"`
-			TaskStatus string `json:"task_status"`
-		} `json:"output"`
-		Message string `json:"message"`
-	}
-	json.NewDecoder(resp.Body).Decode(&submit)
-	if submit.Output.TaskID == "" {
-		return "", fmt.Errorf("asr submit failed: %s", submit.Message)
-	}
-
-	// 2. 轮询（最多 15s，一句话通常 2~4s）
-	taskURL := asrBase() + "/tasks/" + submit.Output.TaskID
-	for i := 0; i < 15; i++ {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(time.Second):
+	persist := func() error {
+		if save != nil {
+			return save()
 		}
-		r2, _ := http.NewRequestWithContext(ctx, "GET", taskURL, nil)
-		r2.Header.Set("Authorization", "Bearer "+c.APIKey)
-		resp2, err := http.DefaultClient.Do(r2)
+		return nil
+	}
+	if state.Done {
+		return state.Text, nil
+	}
+	if state.Failed {
+		*state = TranscriptionState{}
+	}
+	if state.TaskID == "" {
+		body, _ := json.Marshal(map[string]any{
+			"model": "qwen-audio-3.0-asr-flash-filetrans",
+			"input": map[string]any{"file_urls": []string{audioURL}},
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, asrBase()+"/services/audio/asr/transcription", bytes.NewReader(body))
 		if err != nil {
-			continue
+			return "", err
 		}
-		var poll struct {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+		req.Header.Set("X-DashScope-Async", "enable")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("asr submit: %w", err)
+		}
+		var submit struct {
 			Output struct {
-				TaskStatus string `json:"task_status"`
-				Results    []struct {
-					TranscriptionURL string `json:"transcription_url"`
-				} `json:"results"`
+				TaskID string `json:"task_id"`
 			} `json:"output"`
 			Message string `json:"message"`
 		}
-		json.NewDecoder(resp2.Body).Decode(&poll)
-		resp2.Body.Close()
-		switch poll.Output.TaskStatus {
-		case "SUCCEEDED":
-			if len(poll.Output.Results) == 0 || poll.Output.Results[0].TranscriptionURL == "" {
-				return "", fmt.Errorf("asr no result")
-			}
-			return fetchTranscript(poll.Output.Results[0].TranscriptionURL)
-		case "FAILED":
-			return "", fmt.Errorf("asr failed: %s", poll.Message)
+		err = json.NewDecoder(resp.Body).Decode(&submit)
+		resp.Body.Close()
+		if err != nil {
+			return "", fmt.Errorf("asr submit: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 || submit.Output.TaskID == "" {
+			return "", fmt.Errorf("asr submit failed (%d): %s", resp.StatusCode, submit.Message)
+		}
+		state.TaskID = submit.Output.TaskID
+		if err := persist(); err != nil {
+			return "", err
 		}
 	}
-	return "", fmt.Errorf("asr timeout")
-}
 
-// fetchTranscript 拉转写结果 JSON → transcripts[0].text
-func fetchTranscript(url string) (string, error) {
-	r3, err := http.Get(url)
+	if state.TranscriptURL == "" {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-ticker.C:
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, asrBase()+"/tasks/"+url.PathEscape(state.TaskID), nil)
+			if err != nil {
+				return "", err
+			}
+			req.Header.Set("Authorization", "Bearer "+c.APIKey)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
+				continue
+			}
+			var poll struct {
+				Output struct {
+					TaskStatus string `json:"task_status"`
+					Results    []struct {
+						TranscriptionURL string `json:"transcription_url"`
+						SubtaskStatus    string `json:"subtask_status"`
+					} `json:"results"`
+				} `json:"output"`
+				Message string `json:"message"`
+			}
+			err = json.NewDecoder(resp.Body).Decode(&poll)
+			resp.Body.Close()
+			if err != nil {
+				return "", fmt.Errorf("asr poll: %w", err)
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return "", fmt.Errorf("asr poll failed (%d): %s", resp.StatusCode, poll.Message)
+			}
+			switch poll.Output.TaskStatus {
+			case "SUCCEEDED":
+				if len(poll.Output.Results) == 0 || poll.Output.Results[0].TranscriptionURL == "" {
+					state.Failed = true
+					if err := persist(); err != nil {
+						return "", err
+					}
+					return "", fmt.Errorf("asr no result")
+				}
+				state.TranscriptURL = poll.Output.Results[0].TranscriptionURL
+			case "FAILED", "CANCELED":
+				state.Failed = true
+				if err := persist(); err != nil {
+					return "", err
+				}
+				return "", fmt.Errorf("asr failed: %s", poll.Message)
+			}
+			if state.TranscriptURL != "" {
+				if err := persist(); err != nil {
+					return "", err
+				}
+				break
+			}
+		}
+	}
+	text, err := fetchTranscript(ctx, state.TranscriptURL)
 	if err != nil {
 		return "", err
 	}
-	defer r3.Body.Close()
+	state.Text, state.Done = text, true
+	if err := persist(); err != nil {
+		return "", err
+	}
+	return text, nil
+}
+
+func fetchTranscript(ctx context.Context, transcriptURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, transcriptURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// 转写结果 URL 可能带签名，错误展示不能泄露 URL 查询参数。
+		var requestErr *url.Error
+		if errors.As(err, &requestErr) {
+			return "", fmt.Errorf("asr transcript fetch: %w", requestErr.Err)
+		}
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("asr transcript http %d", resp.StatusCode)
+	}
 	var out struct {
 		Transcripts []struct {
 			Text string `json:"text"`
 		} `json:"transcripts"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r3.Body, 1<<20)).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&out); err != nil {
 		return "", err
 	}
-	if len(out.Transcripts) == 0 {
+	texts := make([]string, 0, len(out.Transcripts))
+	for _, transcript := range out.Transcripts {
+		texts = append(texts, transcript.Text)
+	}
+	text := strings.Join(texts, "\n")
+	if strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("empty transcript")
 	}
-	return out.Transcripts[0].Text, nil
+	return text, nil
 }

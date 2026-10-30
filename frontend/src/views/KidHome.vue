@@ -8,6 +8,7 @@ import GardenBackdrop from '../components/GardenBackdrop.vue'
 import { decorArt, getSceneLighting, isWallpaper, wallStyle } from '../scene-art.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
 import { evidenceSteps } from '../task-evidence.js'
+import { reviewPending, reviewStages } from '../ai-review.js'
 
 const API = '/api'
 
@@ -118,7 +119,15 @@ function applyToday(t) {
   if (!t || !Array.isArray(t.tasks)) return false
   try {
     const tasks = t.tasks.map(x => ({ ...x, snapshot: typeof x.snapshot === 'string' ? JSON.parse(x.snapshot) : x.snapshot }))
+    const previous = today.value?.tasks || []
     today.value = { ...t, tasks }
+    for (const task of tasks) {
+      const old = previous.find(x => x.id === task.id)
+      if (reviewPending(old?.ai_review) && task.ai_review?.status === 'succeeded') {
+        const result = task.ai_review.result
+        if (result) say(result.kid_feedback || (result.pass ? '猫看完啦，等妈妈最后确认～' : '材料还可以再补充，不用重新计时哦～'))
+      }
+    }
     hadDuration.value = t.had_duration || {}
     achievedDuration.value = t.achieved_duration || {}
     if (timerTask.value && (hadDuration.value[timerTask.value.id] || !tasks.some(x => x.id === timerTask.value.id && x.status === 'pending'))) {
@@ -717,13 +726,13 @@ async function submitTask(t, body = {}) {
     extra_sec: body.duration_sec || 0,
     evidence: body.evidence || [],
   }
-  // b 模式：显示"猫在看作业"状态层（后端判定 ~20 秒，期间锁操作）
+  // 只等待短事务保存提交；AI 在服务器后台执行，不阻塞孩子操作。
   const isB = (t.snapshot && t.snapshot.confirm_mode || '').includes('b')
-  if (isB) aiThinking.value = true
-
-  const { ok, data } = await jpost(`/tasks/${t.id}/submit`, payload)
-  submitting.value = 0
-  aiThinking.value = false
+  let response
+  try { response = await jpost(`/tasks/${t.id}/submit`, payload) }
+  catch { await refreshTasks(); showToast('网络异常，请先查看任务是否已提交，再决定重试'); return }
+  finally { submitting.value = 0 }
+  const { data } = response
 
   // AI 反馈写入猫聊天面板（可回看，不再一闪而过）
   const aiFeedback = data && (data.kid_feedback || data.ai_reason)
@@ -741,6 +750,10 @@ async function submitTask(t, body = {}) {
     showToast('任务完成！')
     hearts(6)
     say('主人真棒！')
+    await loadAll()
+  } else if (data.ai_queued) {
+    showToast('提交成功！猫会在后台看材料，可以离开页面啦')
+    say('材料收到啦！我慢慢看，你可以先休息～')
     await loadAll()
   } else if (data.waiting && data.ai_pass) {
     // b 模式：AI 初审通过 → 等家长终审（score 模式带星级与猫反馈）
@@ -903,8 +916,6 @@ function wizardRemoveFile(idx, fi) {
 function wizardReady(w) {
   return !w.steps.some((st, i) => st.required && !(w.done[i] && w.done[i].length))
 }
-const aiThinking = ref(false) // b 模式：AI 分析中（全屏状态层 + 锁操作）
-let aiThinkTimer = null
 function previewPhoto(url) {
   photoPreview.value = url
 }
@@ -1369,11 +1380,14 @@ onBeforeUnmount(() => {
           <div class="info">
             <div class="nm">{{ t.snapshot?.name }}</div>
             <div class="sub">{{ t.snapshot?.goal_type === 'duration' ? t.snapshot.goal_value + ' 分钟' : '自由完成' }} · {{ t.snapshot?.base_score }}⭐{{ today.date_multiplier > 1 ? '×' + today.date_multiplier : '' }}</div>
+            <div v-if="reviewPending(t.ai_review)" class="task-ai">{{ t.ai_review.status === 'queued' ? '猫在排队看材料' : reviewStages[t.ai_review.stage] || '猫在分析材料' }}，可以先休息。</div>
+            <div v-else-if="t.ai_review?.status === 'failed'" class="task-ai">AI 暂时没看完，家长可以重试，不用重交。</div>
+            <div v-else-if="t.ai_review?.result" class="task-ai">{{ t.ai_review.result.kid_feedback || t.ai_review.result.reason }}<span v-if="!t.ai_review.result.pass"> 可以补交材料。</span></div>
           </div>
           <span v-if="t.status === 'approved'" class="st ok">✓</span>
-          <span v-else-if="t.status === 'submitted'" class="st wait-t">等妈妈…</span>
+          <span v-else-if="t.status === 'submitted'" class="st wait-t">{{ reviewPending(t.ai_review) ? 'AI 分析中' : '等妈妈…' }}</span>
           <span v-else-if="t.status === 'skipped'" class="st skip">请假</span>
-          <button v-else :disabled="!!startingTask" @click="startTask(t)">{{ taskBtnLabel(t) }}</button>
+          <button v-else :disabled="!!startingTask || !!submitting" @click="startTask(t)">{{ submitting === t.id ? '提交中…' : taskBtnLabel(t) }}</button>
         </div>
         <div v-if="!today.tasks.length" class="empty">今天没有任务，和猫玩吧～</div>
       </div>
@@ -1429,14 +1443,6 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- AI 分析状态层（b 模式提交后 ~20 秒） -->
-    <div v-if="aiThinking" class="think-mask">
-      <div class="think-box">
-        <div class="think-cat">🐱</div>
-        <b>猫正在认真看你的作业…</b>
-        <div class="think-dots"><i></i><i></i><i></i></div>
-        <small>别走开，马上就好喵～</small>
-      </div>
-    </div>
 
     <!-- 照片大图预览 -->
     <div v-if="photoPreview" class="pprev-mask" @click.self="photoPreview = null">
@@ -1633,6 +1639,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .task.wait { background: #F1EDF9; border-color: #DED6ED; }
 .task .ic { flex: 0 0 30px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; font-size: 17px; border: 1px solid #E3CFB1; border-radius: 8px; background: #FAEEDA; }
 .task .info { flex: 1; min-width: 0; }
+.task-ai { margin-top: 5px; color: #75609D; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .task .nm { font-size: 12.5px; line-height: 1.45; font-weight: 600; overflow-wrap: anywhere; }
 .task .sub { font-size: 10.5px; line-height: 1.5; color: #88786A; }
 .task button, .shop-row button { flex-shrink: 0; font-size: 11px; font-weight: 600; cursor: pointer; color: #75609D; border: 1px solid #D5C8E7; border-radius: 8px; padding: 6px 8px; background: #EEEBF7; white-space: nowrap; box-shadow: 0 2px 0 #E5DDEE; }

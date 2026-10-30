@@ -340,8 +340,13 @@ func (s *Server) todayTasks(c *gin.Context) {
 			achievedDur[t.ID] = duration
 		}
 	}
+	out, err := s.todaySubmissionViews(tasks)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	mul := engine.DateMultiplier(s.DB, time.Now())
-	c.JSON(http.StatusOK, gin.H{"date": date, "date_multiplier": mul, "tasks": tasks,
+	c.JSON(http.StatusOK, gin.H{"date": date, "date_multiplier": mul, "tasks": out,
 		"had_duration": hadDur, "achieved_duration": achievedDur})
 }
 

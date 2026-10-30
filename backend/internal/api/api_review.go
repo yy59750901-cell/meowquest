@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"meowquest/backend/internal/llm"
 	"meowquest/backend/internal/store"
@@ -20,11 +19,13 @@ type reviewVerdict struct {
 	KidFeedback string `json:"kid_feedback"` // 给孩子（猫说）
 }
 
-// runReview 判定入口：evidence JSON（[{type,path}]）→ (pass, reason, error)
-// 失败时返回 error（调用方降级为"AI 走神了"，退回普通家长确认）
-func (s *Server) runReview(dt store.DailyTask, comp EvidenceRow) (reviewVerdict, error) {
+// runReview 的长调用均在事务外，进度和上游任务缓存由租约持有者落库。
+func (s *Server) runReview(ctx context.Context, dt store.DailyTask, comp EvidenceRow, cache map[string]*llm.TranscriptionState, report func(string) error) (reviewVerdict, error) {
+	if err := report("preparing"); err != nil {
+		return reviewVerdict{}, err
+	}
 	client := s.LLM
-	if !client.Enabled() {
+	if client == nil || !client.Enabled() {
 		return reviewVerdict{}, fmt.Errorf("llm 未配置")
 	}
 
@@ -37,18 +38,7 @@ func (s *Server) runReview(dt store.DailyTask, comp EvidenceRow) (reviewVerdict,
 	if err := json.Unmarshal([]byte(dt.Snapshot), &snap); err != nil {
 		return reviewVerdict{}, err
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(dt.Snapshot), &fields); err != nil {
-		return reviewVerdict{}, err
-	}
-	// 仅旧快照缺字段时兜底；显式空指令使用通用提示，不读取新模板规则。
-	if _, ok := fields["review_prompt"]; !ok {
-		var tpl struct {
-			ReviewPrompt string `gorm:"column:review_prompt"`
-		}
-		s.DB.Raw("SELECT review_prompt FROM task_template WHERE id=?", dt.TemplateID).Scan(&tpl)
-		snap.ReviewPrompt = tpl.ReviewPrompt
-	}
+	// job 创建时已冻结旧快照兼容字段，执行和重试不再读取可变模板。
 
 	prompt := fmt.Sprintf(`你是儿童任务的验收助手（后台判定，孩子看不到你的原文）。任务「%s」。
 验收要求：%s
@@ -56,9 +46,6 @@ func (s *Server) runReview(dt store.DailyTask, comp EvidenceRow) (reviewVerdict,
 判定宽松原则：这是孩子的努力，只要基本达标就 pass；明显没做/内容完全不符才 false。`,
 		snap.Name,
 		orDefault(snap.ReviewPrompt, "提交的证据是否体现孩子认真完成了任务"))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
 
 	// 证据收集：多图 + 多录音
 	evList := parseEvidenceJSON(comp.Evidence)
@@ -73,17 +60,26 @@ func (s *Server) runReview(dt store.DailyTask, comp EvidenceRow) (reviewVerdict,
 		}
 	}
 
-	// 录音逐个转写（拼接为文本证据）
-	transcripts := ""
+	// 每条提交录音都必须成功转写，完整文本不按字节截断。
+	var transcriptList []string
 	for _, au := range audioURLs {
-		t, terr := client.Transcribe(ctx, au)
-		if terr != nil {
-			continue // 单条失败不阻塞整体判定
+		state := cache[au]
+		if state == nil {
+			state = &llm.TranscriptionState{}
+			cache[au] = state
 		}
-		transcripts += t + "\n"
+		if err := report("transcribing"); err != nil {
+			return reviewVerdict{}, err
+		}
+		text, err := client.TranscribeCached(ctx, au, state, func() error { return report("transcribing") })
+		if err != nil {
+			return reviewVerdict{}, fmt.Errorf("录音转写失败: %w", err)
+		}
+		transcriptList = append(transcriptList, text)
 	}
-	if len(transcripts) > 900 {
-		transcripts = transcripts[:900]
+	transcripts := strings.Join(transcriptList, "\n")
+	if err := report("reviewing"); err != nil {
+		return reviewVerdict{}, err
 	}
 
 	// 分析模式：score 输出星级+双反馈
@@ -105,10 +101,10 @@ JSON 格式：{"pass": bool, "score": 1-5, "reason": "给家长（20字内）", 
 		}
 		raw, err = llm.LLMVisionMulti(ctx, client.BaseURL, client.APIKey, client.Model, ask, photoURLs)
 	case transcripts != "":
-		raw, err = client.ChatOnce(ctx, []llm.Msg{{Role: "user", Content: prompt + "\n孩子的录音内容（转写）：" + transcripts}})
+		raw, err = llm.LLMVisionMulti(ctx, client.BaseURL, client.APIKey, client.Model, prompt+"\n孩子的录音内容（转写）："+transcripts, nil)
 	default:
 		// 无媒体证据：用计时时长判定（自由任务家长兜底）
-		raw, err = client.ChatOnce(ctx, []llm.Msg{{Role: "user", Content: prompt + "\n（无照片/录音，仅计时 " + fmtDurationSec(comp.DurationSec) + "，无法核实内容时判 false 并注明）"}})
+		raw, err = llm.LLMVisionMulti(ctx, client.BaseURL, client.APIKey, client.Model, prompt+"\n（无照片/录音，仅计时 "+fmtDurationSec(comp.DurationSec)+"，无法核实内容时判 false 并注明）", nil)
 	}
 	if err != nil {
 		return reviewVerdict{}, err
@@ -119,6 +115,14 @@ JSON 格式：{"pass": bool, "score": 1-5, "reason": "给家长（20字内）", 
 	end := strings.LastIndex(raw, "}")
 	if start < 0 || end <= start {
 		return reviewVerdict{}, fmt.Errorf("bad json: %s", raw[:min(80, len(raw))])
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &fields); err != nil {
+		return reviewVerdict{}, err
+	}
+	var pass *bool
+	if err := json.Unmarshal(fields["pass"], &pass); err != nil || pass == nil {
+		return reviewVerdict{}, fmt.Errorf("AI 结果缺少有效 pass 字段")
 	}
 	var v reviewVerdict
 	if err := json.Unmarshal([]byte(raw[start:end+1]), &v); err != nil {

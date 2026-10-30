@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -161,8 +162,8 @@ func LLMVisionMulti(ctx context.Context, baseURL, apiKey, model, text string, im
 		content = append(content, map[string]any{"type": "image_url", "image_url": map[string]string{"url": u}})
 	}
 	body := map[string]any{
-		"model":    model,
-		"messages": []map[string]any{{"role": "user", "content": content}},
+		"model":           model,
+		"messages":        []map[string]any{{"role": "user", "content": content}},
 		"enable_thinking": false,
 		"max_tokens":      400,
 	}
@@ -173,11 +174,33 @@ func LLMVisionMulti(ctx context.Context, baseURL, apiKey, model, text string, im
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var failure struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Error   *struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&failure)
+		code, message := failure.Code, failure.Message
+		if failure.Error != nil {
+			code, message = failure.Error.Code, failure.Error.Message
+		}
+		if apiKey != "" {
+			message = strings.ReplaceAll(message, apiKey, "[redacted]")
+		}
+		if len(message) > 1000 {
+			message = message[:1000]
+		}
+		return "", fmt.Errorf("llm http %d %s: %s", resp.StatusCode, code, message)
+	}
 	var out struct {
 		Choices []struct {
 			Message struct {
@@ -188,7 +211,9 @@ func LLMVisionMulti(ctx context.Context, baseURL, apiKey, model, text string, im
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
 	if out.Error != nil {
 		return "", errors.New(out.Error.Message)
 	}
