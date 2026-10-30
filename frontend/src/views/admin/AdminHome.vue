@@ -15,6 +15,7 @@ function parseEvidence(ev) {
 import { onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
+import { evidenceSteps } from '../../task-evidence.js'
 
 const router = useRouter()
 const tab = ref('confirm')
@@ -38,24 +39,20 @@ const wishes = ref([])
 const wishHealth = ref(0)
 const ledger = ref([])
 const newTask = ref({ name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3, review_prompt: '' })
-const evChecks = ref([]) // 旧单证据复选（无步骤时）
 const evSteps = ref([]) // 提交步骤：[{kind,label,required}]
 const ICONS = ['⭐', '🎹', '📖', '🔤', '🏃', '🧹', '✍️', '🎨', '🧠', '🦷']
-const EV_OPTIONS = [
-  { v: 'photo', label: '📷 拍照', desc: '调起相机拍作业/成果' },
-  { v: 'audio', label: '🎙 录音', desc: '调起录音（朗读/背诵）' },
-  { v: 'video', label: '🎬 录像', desc: '调起录像（练琴过程）' },
-]
 const editingId = ref(0) // >0 = 编辑模式
 
 function editTask(t) {
+  let steps
+  try { steps = evidenceSteps(t.evidence_steps, t.evidence_type || '') }
+  catch { return showToast('原提交步骤配置无效，未打开编辑，避免覆盖材料要求') }
   editingId.value = t.id
-  evChecks.value = (t.evidence_type || '').split(',').filter((x) => ['photo', 'audio', 'video'].includes(x))
-  try { evSteps.value = JSON.parse(t.evidence_steps || '[]') } catch (e) { evSteps.value = [] }
+  evSteps.value = steps
   newTask.value = {
     name: t.name, icon: t.icon || '⭐', category: t.category || 'custom',
     goal_type: t.goal_type || 'duration', goal_value: t.goal_value || 0, review_prompt: t.review_prompt || '', analysis_mode: t.analysis_mode || 'judge',
-    confirm_mode: t.confirm_mode || 'c', base_score: t.base_score || 20,
+    confirm_mode: (t.confirm_mode || '').includes('b') ? 'b' : t.confirm_mode || 'c', base_score: t.base_score || 20,
     date_mode: t.schedule?.date_mode || 'weekday_fixed',
     weekdays: t.schedule?.weekdays || '1,2,3,4,5',
     weekly_quota: t.schedule?.weekly_quota || 3,
@@ -63,7 +60,6 @@ function editTask(t) {
 }
 function resetTaskForm() {
   editingId.value = 0
-  evChecks.value = []
   evSteps.value = []
   newTask.value = { name: '', icon: '⭐', category: 'custom', goal_type: 'duration', goal_value: 30, confirm_mode: 'c', base_score: 20, date_mode: 'weekday_fixed', weekdays: '1,2,3,4,5', weekly_quota: 3, review_prompt: '' }
 }
@@ -119,9 +115,13 @@ async function reject(id) {
 
 async function createTask() {
   if (!newTask.value.name) return showToast('任务名必填')
-  const payload = { ...newTask.value, evidence_type: evChecks.value.length ? evChecks.value.join(',') : 'none' }
-  // 有步骤 → 优先走步骤（evidence_type 仍存着兼容）
-  if (evSteps.value.length) payload.evidence_steps = JSON.stringify(evSteps.value.filter((st) => (st.label || '').trim()))
+  let steps
+  try { steps = evidenceSteps(evSteps.value) }
+  catch { return showToast('请检查提交步骤的类型和必须选项') }
+  const payload = { ...newTask.value,
+    evidence_type: [...new Set(steps.map(st => st.kind))].join(',') || 'none',
+    evidence_steps: JSON.stringify(steps),
+  }
   if (editingId.value) {
     // 编辑模式：PUT 更新
     const { ok, data } = await jput(`/api/admin/task/${editingId.value}`, payload)
@@ -300,20 +300,16 @@ onMounted(() => {
                 <select v-model="st.kind" class="ctl">
                   <option value="photo">📷 拍照</option>
                   <option value="audio">🎙 录音</option>
+                  <option value="video">🎬 录像</option>
                 </select>
-                <label class="step-req"><input type="checkbox" v-model="st.required" />必须</label>
+                <label class="step-req"><input type="checkbox" v-model="st.required" />{{ st.required ? '必须' : '可选' }}</label>
                 <a class="step-del" @click="evSteps.splice(i, 1)">删除</a>
               </div>
               <input v-model="st.label" class="ctl step-label" maxlength="20" placeholder="给孩子的提示语，如：拍下你今天读的内容" />
             </div>
             <button type="button" class="step-add" @click="evSteps.push({ kind: 'photo', label: '', required: true })">＋ 添加一步</button>
-            <small class="hint-txt">不配步骤 = 沿用旧的单一提交方式（拍照/录音/录像复选）</small>
-            <div v-if="!evSteps.length" class="legacy-ev">
-              <label v-for="o in EV_OPTIONS" :key="o.v" class="ev-opt">
-                <input type="checkbox" :value="o.v" v-model="evChecks" />
-                <span>{{ o.label }}</span><em>{{ o.desc }}</em>
-              </label>
-            </div>
+            <small class="hint-txt">不添加步骤 = 无需上传材料；提示语留空会使用默认提示，不会删除步骤。</small>
+            <small v-if="editingId" class="hint-txt">修改材料要求会用于今天的待提交任务；已计时达标的不必重计时，新时长要求用于后续任务。</small>
           </div>
           <button class="primary" @click="createTask">{{ editingId ? '保存修改' : '创建' }}</button>
         </div>
@@ -429,7 +425,10 @@ input.ctl[type=number] { -moz-appearance: textfield; }
 .ai-kid { font-size: 12px; color: #534AB7; margin-top: 4px; font-style: italic; }
 .step-card { background: #F7F5F0; border: 1.5px solid #E5E2D9; border-radius: 12px; padding: 10px 12px; margin: 8px 0; display: flex; flex-direction: column; gap: 8px; }
 .step-top { display: flex; gap: 10px; align-items: center; }
-.step-top .ctl { width: 130px; flex: 0 0 130px; height: 36px; }
+.step-top .ctl { width: 130px; min-width: 72px; flex: 0 1 130px; height: 36px; }
+.step-top > :not(.ctl) { flex-shrink: 0; }
+.step-del { white-space: nowrap; }
+@media (max-width: 360px) { .step-top { gap: 6px; } .step-top .ctl { padding-left: 8px; padding-right: 22px; } .step-del { padding-left: 3px; padding-right: 3px; } }
 .step-no { flex: 0 0 22px; height: 22px; display: flex; align-items: center; justify-content: center; background: #534AB7; color: #fff; border-radius: 50%; font-size: 12px; font-weight: 800; }
 .step-req { font-size: 12.5px; color: #5F5E5A; font-weight: 600; white-space: nowrap; display: flex; align-items: center; gap: 5px; margin-left: auto; }
 .step-req input { width: 16px; height: 16px; accent-color: #534AB7; }

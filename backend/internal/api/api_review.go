@@ -34,9 +34,15 @@ func (s *Server) runReview(dt store.DailyTask, comp EvidenceRow) (reviewVerdict,
 		ConfirmMode  string `json:"confirm_mode"`
 		AnalysisMode string `json:"analysis_mode"`
 	}
-	json.Unmarshal([]byte(dt.Snapshot), &snap)
-	// 快照可能没有 review_prompt（旧任务）——查模板兜底
-	if snap.ReviewPrompt == "" {
+	if err := json.Unmarshal([]byte(dt.Snapshot), &snap); err != nil {
+		return reviewVerdict{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(dt.Snapshot), &fields); err != nil {
+		return reviewVerdict{}, err
+	}
+	// 仅旧快照缺字段时兜底；显式空指令使用通用提示，不读取新模板规则。
+	if _, ok := fields["review_prompt"]; !ok {
 		var tpl struct {
 			ReviewPrompt string `gorm:"column:review_prompt"`
 		}
@@ -165,4 +171,9 @@ func fmtDurationSec(sec int) string {
 	return fmt.Sprintf("%d 分钟", sec/60)
 }
 
-func min(a, b int) int { if a < b { return a }; return b }
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

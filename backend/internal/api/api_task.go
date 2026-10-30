@@ -2,10 +2,15 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"meowquest/backend/internal/engine"
 	"meowquest/backend/internal/store"
@@ -14,32 +19,60 @@ import (
 // ===== 家长端：任务配置 =====
 
 type taskReq struct {
-	Name          string `json:"name" binding:"required"`
-	Icon          string `json:"icon"`
-	Category      string `json:"category"`
-	GoalType      string `json:"goal_type"`
-	GoalValue     int    `json:"goal_value"`
-	EvidenceType  string `json:"evidence_type"`
-	ConfirmMode   string `json:"confirm_mode"`
-	ReviewPrompt  string `json:"review_prompt"` // b 模式：AI 验收指令
-	EvidenceSteps string `json:"evidence_steps"` // JSON [{kind,label,required}]
-	AnalysisMode  string `json:"analysis_mode"`  // judge / score
-	BaseScore     int    `json:"base_score"`
-	StreakEnabled int    `json:"streak_enabled"`
-	ExtraMinutes  int    `json:"extra_minutes"`
-	ExtraStars    int    `json:"extra_stars"`
-	ExtraCap      int    `json:"extra_cap"`
-	Sort          int    `json:"sort"`
-	Enabled       *bool  `json:"enabled"`
-	DateMode      string `json:"date_mode"`
-	Weekdays      string `json:"weekdays"`
-	WeeklyQuota   int    `json:"weekly_quota"`
-	ValidFrom     string `json:"valid_from"`
-	ValidTo       string `json:"valid_to"`
-	KidIDs        []int64 `json:"kid_ids"` // 指派孩子（空=全部）
+	Name          string          `json:"name" binding:"required"`
+	Icon          string          `json:"icon"`
+	Category      string          `json:"category"`
+	GoalType      string          `json:"goal_type"`
+	GoalValue     int             `json:"goal_value"`
+	EvidenceType  string          `json:"evidence_type"`
+	ConfirmMode   string          `json:"confirm_mode"`
+	ReviewPrompt  string          `json:"review_prompt"`  // b 模式：AI 验收指令
+	EvidenceSteps json.RawMessage `json:"evidence_steps"` // JSON 字符串；区分未提供和显式清空
+	AnalysisMode  string          `json:"analysis_mode"`  // judge / score
+	BaseScore     int             `json:"base_score"`
+	StreakEnabled int             `json:"streak_enabled"`
+	ExtraMinutes  int             `json:"extra_minutes"`
+	ExtraStars    int             `json:"extra_stars"`
+	ExtraCap      int             `json:"extra_cap"`
+	Sort          int             `json:"sort"`
+	Enabled       *bool           `json:"enabled"`
+	DateMode      string          `json:"date_mode"`
+	Weekdays      string          `json:"weekdays"`
+	WeeklyQuota   int             `json:"weekly_quota"`
+	ValidFrom     string          `json:"valid_from"`
+	ValidTo       string          `json:"valid_to"`
+	KidIDs        []int64         `json:"kid_ids"` // 指派孩子（空=全部）
 }
 
-func (r taskReq) toTemplate() store.TaskTemplate {
+func (r taskReq) toTemplate() (store.TaskTemplate, error) {
+	steps := ""
+	if len(r.EvidenceSteps) > 0 {
+		if string(r.EvidenceSteps) == "null" || json.Unmarshal(r.EvidenceSteps, &steps) != nil {
+			return store.TaskTemplate{}, fmt.Errorf("evidence_steps 必须是 JSON 数组字符串")
+		}
+		if strings.TrimSpace(steps) == "" {
+			steps = "[]"
+		}
+		if _, err := engine.ParseSteps(steps); err != nil {
+			return store.TaskTemplate{}, err
+		}
+	}
+	// 显式步骤是唯一来源；清空步骤时也清空旧媒体字段，避免旧 UI 再复活。
+	if len(r.EvidenceSteps) > 0 {
+		parsed, _ := engine.ParseSteps(steps)
+		kinds := make([]string, 0, len(parsed))
+		seen := map[string]bool{}
+		for _, step := range parsed {
+			if !seen[step.Kind] {
+				kinds = append(kinds, step.Kind)
+				seen[step.Kind] = true
+			}
+		}
+		r.EvidenceType = strings.Join(kinds, ",")
+		if r.EvidenceType == "" {
+			r.EvidenceType = "none"
+		}
+	}
 	enabled := 1
 	if r.Enabled != nil && !*r.Enabled {
 		enabled = 0
@@ -52,12 +85,12 @@ func (r taskReq) toTemplate() store.TaskTemplate {
 		Name: r.Name, Icon: defStr(r.Icon, "⭐"), Category: defStr(r.Category, "custom"),
 		GoalType: defStr(r.GoalType, "free"), GoalValue: r.GoalValue,
 		EvidenceType: defStr(r.EvidenceType, "none"), ConfirmMode: defStr(r.ConfirmMode, "a"),
-		ReviewPrompt: r.ReviewPrompt, EvidenceSteps: engine.NormalizeSteps(r.EvidenceSteps, r.EvidenceType),
+		ReviewPrompt: r.ReviewPrompt, EvidenceSteps: engine.NormalizeSteps(steps, r.EvidenceType),
 		AnalysisMode: defStr(r.AnalysisMode, "judge"),
-		BaseScore: maxInt(r.BaseScore, 20), StreakEnabled: streak,
+		BaseScore:    maxInt(r.BaseScore, 20), StreakEnabled: streak,
 		ExtraMinutes: r.ExtraMinutes, ExtraStars: r.ExtraStars, ExtraCap: r.ExtraCap,
 		Sort: r.Sort, Enabled: enabled,
-	}
+	}, nil
 }
 
 func (r taskReq) toSchedule(tid int64) store.TaskSchedule {
@@ -82,7 +115,11 @@ func (s *Server) createTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	tpl := req.toTemplate()
+	tpl, err := req.toTemplate()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	tpl.FamilyID = famOf(c)
 	if err := s.DB.Create(&tpl).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -125,30 +162,50 @@ func (s *Server) updateTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	tpl := req.toTemplate()
-	if err := s.DB.Model(&store.TaskTemplate{}).Where("id=? AND family_id=?", c.Param("id"), famOf(c)).Updates(map[string]any{
-		"name": tpl.Name, "icon": tpl.Icon, "category": tpl.Category,
-		"goal_type": tpl.GoalType, "goal_value": tpl.GoalValue,
-		"evidence_type": tpl.EvidenceType, "confirm_mode": tpl.ConfirmMode, "review_prompt": tpl.ReviewPrompt, "evidence_steps": tpl.EvidenceSteps, "analysis_mode": tpl.AnalysisMode,
-		"base_score": tpl.BaseScore, "streak_enabled": tpl.StreakEnabled,
-		"extra_minutes": tpl.ExtraMinutes, "extra_stars": tpl.ExtraStars, "extra_cap": tpl.ExtraCap,
-		"sort": tpl.Sort, "enabled": tpl.Enabled,
-	}).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	tpl, err := req.toTemplate()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	// 当天未完成的实例刷新快照：删 pending 重建（保新配置立即生效；
-	// approved/submitted 保旧快照不动——结算按完成当时规则，可追溯）
 	today := time.Now().Format("2006-01-02")
-	s.DB.Where("template_id=? AND date=? AND status='pending'", c.Param("id"), today).
-		Delete(&store.DailyTask{})
-
-	sch := req.toSchedule(0)
-	if err := s.DB.Model(&store.TaskSchedule{}).Where("template_id=?", c.Param("id")).Updates(map[string]any{
-		"date_mode": sch.DateMode, "weekdays": sch.Weekdays, "weekly_quota": sch.WeeklyQuota,
-		"valid_from": sch.ValidFrom, "valid_to": sch.ValidTo,
-	}).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		var existing store.TaskTemplate
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id=? AND family_id=?", c.Param("id"), famOf(c)).First(&existing).Error; err != nil {
+			return err
+		}
+		tpl.ID, tpl.FamilyID = existing.ID, existing.FamilyID
+		// 未提供步骤时沿用已保存的显式配置，不能从隐藏的旧媒体字段恢复材料。
+		if len(req.EvidenceSteps) == 0 {
+			tpl.EvidenceType = defStr(req.EvidenceType, existing.EvidenceType)
+			tpl.EvidenceSteps = engine.NormalizeSteps(existing.EvidenceSteps, tpl.EvidenceType)
+		}
+		if err := tx.Model(&store.TaskTemplate{}).Where("id=?", tpl.ID).Updates(map[string]any{
+			"name": tpl.Name, "icon": tpl.Icon, "category": tpl.Category,
+			"goal_type": tpl.GoalType, "goal_value": tpl.GoalValue,
+			"evidence_type": tpl.EvidenceType, "confirm_mode": tpl.ConfirmMode, "review_prompt": tpl.ReviewPrompt, "evidence_steps": tpl.EvidenceSteps, "analysis_mode": tpl.AnalysisMode,
+			"base_score": tpl.BaseScore, "streak_enabled": tpl.StreakEnabled,
+			"extra_minutes": tpl.ExtraMinutes, "extra_stars": tpl.ExtraStars, "extra_cap": tpl.ExtraCap,
+			"sort": tpl.Sort, "enabled": tpl.Enabled,
+		}).Error; err != nil {
+			return err
+		}
+		sch := req.toSchedule(tpl.ID)
+		if err := tx.Model(&store.TaskSchedule{}).Where("template_id=?", tpl.ID).Updates(map[string]any{
+			"date_mode": sch.DateMode, "weekdays": sch.Weekdays, "weekly_quota": sch.WeeklyQuota,
+			"valid_from": sch.ValidFrom, "valid_to": sch.ValidTo,
+		}).Error; err != nil {
+			return err
+		}
+		// submitted/approved 不动；pending 同 ID 刷新，有历史达标记录时冻结目标。
+		return engine.RefreshPendingTasks(&store.DB{DB: tx}, tpl, sch, today)
+	})
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	if err := engine.Materialize(s.DB, time.Now()); err != nil {
@@ -261,27 +318,31 @@ func (s *Server) todayTasks(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// had_duration：计时任务曾有达标记录（AI 退回材料后重做免重新计时，只补材料）
+	// submitted 也返回达标信息，孩子刷新时可缓存补交状态和真实时长。
 	hadDur := map[int64]bool{}
+	achievedDur := map[int64]int{}
 	for _, t := range tasks {
-		if t.Status == "pending" {
-			var snap struct {
-				GoalType  string `json:"goal_type"`
-				GoalValue int    `json:"goal_value"`
-			}
-			json.Unmarshal([]byte(t.Snapshot), &snap)
-			if snap.GoalType == "duration" && snap.GoalValue > 0 {
-				var n int64
-				s.DB.Model(&store.TaskCompletion{}).
-					Where("daily_task_id=? AND duration_sec>=?", t.ID, snap.GoalValue*60).Count(&n)
-				if n > 0 {
-					hadDur[t.ID] = true
-				}
-			}
+		if t.Status != "pending" && t.Status != "submitted" {
+			continue
+		}
+		var snap engine.Snapshot
+		if err := json.Unmarshal([]byte(t.Snapshot), &snap); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		duration, err := engine.AchievedDuration(s.DB, t.ID, snap)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if duration > 0 {
+			hadDur[t.ID] = true
+			achievedDur[t.ID] = duration
 		}
 	}
 	mul := engine.DateMultiplier(s.DB, time.Now())
-	c.JSON(http.StatusOK, gin.H{"date": date, "date_multiplier": mul, "tasks": tasks, "had_duration": hadDur})
+	c.JSON(http.StatusOK, gin.H{"date": date, "date_multiplier": mul, "tasks": tasks,
+		"had_duration": hadDur, "achieved_duration": achievedDur})
 }
 
 // ===== 工具 =====

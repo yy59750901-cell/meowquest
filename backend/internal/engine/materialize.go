@@ -1,35 +1,37 @@
 package engine
 
 import (
-	"strings"
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"meowquest/backend/internal/store"
+
+	"gorm.io/gorm/clause"
 )
 
 // Snapshot 物化时的模板快照（结算可追溯，改历史规则不影响已生成任务）
 type Snapshot struct {
-	ID           int64  `json:"id"`
-	Name         string `json:"name"`
-	Icon         string `json:"icon"`
-	Category     string `json:"category"`
-	GoalType     string `json:"goal_type"`
-	GoalValue    int    `json:"goal_value"`
-	EvidenceType string `json:"evidence_type"`
-	ConfirmMode  string `json:"confirm_mode"`
-	BaseScore    int    `json:"base_score"`
-	ExtraMinutes int    `json:"extra_minutes"`
-	ExtraStars   int    `json:"extra_stars"`
-	ExtraCap     int    `json:"extra_cap"`
-	DateMode     string `json:"date_mode"`
-	Weekdays     string `json:"weekdays"`
-	WeeklyQuota  int    `json:"weekly_quota"`
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	Icon          string `json:"icon"`
+	Category      string `json:"category"`
+	GoalType      string `json:"goal_type"`
+	GoalValue     int    `json:"goal_value"`
+	EvidenceType  string `json:"evidence_type"`
+	ConfirmMode   string `json:"confirm_mode"`
+	BaseScore     int    `json:"base_score"`
+	ExtraMinutes  int    `json:"extra_minutes"`
+	ExtraStars    int    `json:"extra_stars"`
+	ExtraCap      int    `json:"extra_cap"`
+	DateMode      string `json:"date_mode"`
+	Weekdays      string `json:"weekdays"`
+	WeeklyQuota   int    `json:"weekly_quota"`
 	EvidenceSteps string `json:"evidence_steps"` // JSON [{kind,label,required}]（旧单证据自动归一）
-	AnalysisMode string `json:"analysis_mode"`  // judge / score
-	ReviewPrompt string `json:"review_prompt"`
+	AnalysisMode  string `json:"analysis_mode"`  // judge / score
+	ReviewPrompt  string `json:"review_prompt"`
 }
 
 // Materialize 物化指定日期（遍历所有孩子：模板×指派 → daily_task(kid_id)）
@@ -96,12 +98,7 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 		if !hit {
 			continue
 		}
-		snap := Snapshot{ID: t.ID, Name: t.Name, Icon: t.Icon, Category: t.Category,
-			GoalType: t.GoalType, GoalValue: t.GoalValue, EvidenceType: t.EvidenceType,
-			ConfirmMode: t.ConfirmMode, BaseScore: t.BaseScore,
-			ExtraMinutes: t.ExtraMinutes, ExtraStars: t.ExtraStars, ExtraCap: t.ExtraCap,
-			DateMode: sch.DateMode, Weekdays: sch.Weekdays, WeeklyQuota: sch.WeeklyQuota,
-			EvidenceSteps: NormalizeSteps(t.EvidenceSteps, t.EvidenceType), AnalysisMode: t.AnalysisMode, ReviewPrompt: t.ReviewPrompt}
+		snap := TemplateSnapshot(t, *sch)
 		snapJSON, _ := json.Marshal(snap)
 		var quotaDone int64
 		db.Model(&store.DailyTask{}).
@@ -192,19 +189,139 @@ func splitWeekdays(s string) []int {
 	return out
 }
 
+type EvidenceStep struct {
+	Kind     string `json:"kind"`
+	Label    string `json:"label"`
+	Required bool   `json:"required"`
+}
 
-// NormalizeSteps 步骤归一化：显式 steps 优先；空则从旧 evidence_type 转单步（向后兼容）
-func NormalizeSteps(steps, evidenceType string) string {
-	if s := strings.TrimSpace(steps); s != "" && s != "[]" {
-		return s
-	}
-	switch evidenceType {
+func defaultStepLabel(kind string) string {
+	switch kind {
 	case "photo":
-		return `[{"kind":"photo","label":"拍下完成情况","required":true}]`
+		return "拍下完成情况"
 	case "audio":
-		return `[{"kind":"audio","label":"说说完成情况","required":true}]`
+		return "说说完成情况"
 	case "video":
-		return `[{"kind":"video","label":"录下完成情况","required":true}]`
+		return "录下完成情况"
 	}
-	return "[]"
+	return ""
+}
+
+// ParseSteps 校验配置并补齐提示；required 缺省为必填，显式 false 不变。
+func ParseSteps(raw string) ([]EvidenceStep, error) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "[") {
+		return nil, fmt.Errorf("evidence_steps 必须是 JSON 数组")
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+		return nil, fmt.Errorf("evidence_steps: %w", err)
+	}
+	steps := make([]EvidenceStep, 0, len(rows))
+	for i, row := range rows {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(row, &fields); err != nil || fields == nil {
+			return nil, fmt.Errorf("evidence_steps[%d] 必须是对象", i)
+		}
+		var step EvidenceStep
+		if err := json.Unmarshal(fields["kind"], &step.Kind); err != nil || defaultStepLabel(step.Kind) == "" {
+			return nil, fmt.Errorf("evidence_steps[%d].kind 必须为 photo/audio/video", i)
+		}
+		if label, ok := fields["label"]; ok {
+			if string(label) == "null" || json.Unmarshal(label, &step.Label) != nil {
+				return nil, fmt.Errorf("evidence_steps[%d].label 必须是字符串", i)
+			}
+		}
+		if strings.TrimSpace(step.Label) == "" {
+			step.Label = defaultStepLabel(step.Kind)
+		}
+		step.Required = true
+		if required, ok := fields["required"]; ok {
+			if string(required) == "null" || json.Unmarshal(required, &step.Required) != nil {
+				return nil, fmt.Errorf("evidence_steps[%d].required 必须是布尔值", i)
+			}
+		}
+		steps = append(steps, step)
+	}
+	return steps, nil
+}
+
+// NormalizeSteps 非空显式配置（包括 []）优先；仅旧空字段从逗号组合归一。
+// 非法存量配置保留原文，提交时明确报错，避免悄悄免除材料要求。
+func NormalizeSteps(steps, evidenceType string) string {
+	if raw := strings.TrimSpace(steps); raw != "" {
+		parsed, err := ParseSteps(raw)
+		if err != nil {
+			return raw
+		}
+		b, _ := json.Marshal(parsed)
+		return string(b)
+	}
+	out := make([]EvidenceStep, 0)
+	for _, kind := range strings.Split(evidenceType, ",") {
+		kind = strings.TrimSpace(kind)
+		if label := defaultStepLabel(kind); label != "" {
+			out = append(out, EvidenceStep{Kind: kind, Label: label, Required: true})
+		}
+	}
+	b, _ := json.Marshal(out)
+	return string(b)
+}
+
+func TemplateSnapshot(t store.TaskTemplate, sch store.TaskSchedule) Snapshot {
+	return Snapshot{ID: t.ID, Name: t.Name, Icon: t.Icon, Category: t.Category,
+		GoalType: t.GoalType, GoalValue: t.GoalValue, EvidenceType: t.EvidenceType,
+		ConfirmMode: t.ConfirmMode, BaseScore: t.BaseScore,
+		ExtraMinutes: t.ExtraMinutes, ExtraStars: t.ExtraStars, ExtraCap: t.ExtraCap,
+		DateMode: sch.DateMode, Weekdays: sch.Weekdays, WeeklyQuota: sch.WeeklyQuota,
+		EvidenceSteps: NormalizeSteps(t.EvidenceSteps, t.EvidenceType),
+		AnalysisMode:  t.AnalysisMode, ReviewPrompt: t.ReviewPrompt}
+}
+
+// AchievedDuration 仅使用同一实例已有流水中的真实秒数（包含驳回记录）。
+func AchievedDuration(db *store.DB, dailyTaskID int64, snap Snapshot) (int, error) {
+	if snap.GoalType != "duration" || snap.GoalValue <= 0 {
+		return 0, nil
+	}
+	var duration int
+	if err := db.Model(&store.TaskCompletion{}).Select("COALESCE(MAX(duration_sec), 0)").
+		Where("daily_task_id=?", dailyTaskID).Scan(&duration).Error; err != nil {
+		return 0, err
+	}
+	if duration/60 < snap.GoalValue {
+		return 0, nil
+	}
+	return duration, nil
+}
+
+// RefreshPendingTasks 必须在事务中调用，与提交共用实例行锁；不删除历史 ID。
+func RefreshPendingTasks(db *store.DB, t store.TaskTemplate, sch store.TaskSchedule, date string) error {
+	var tasks []store.DailyTask
+	if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("template_id=? AND date=? AND status='pending'", t.ID, date).Order("id").Find(&tasks).Error; err != nil {
+		return err
+	}
+	for _, dt := range tasks {
+		var old Snapshot
+		if err := json.Unmarshal([]byte(dt.Snapshot), &old); err != nil {
+			return fmt.Errorf("task %d snapshot: %w", dt.ID, err)
+		}
+		duration, err := AchievedDuration(db, dt.ID, old)
+		if err != nil {
+			return err
+		}
+		snap := TemplateSnapshot(t, sch)
+		if duration > 0 {
+			snap.GoalType, snap.GoalValue = old.GoalType, old.GoalValue
+		}
+		b, err := json.Marshal(snap)
+		if err != nil {
+			return err
+		}
+		if err := db.Model(&store.DailyTask{}).Where("id=? AND status='pending'", dt.ID).
+			Update("snapshot", string(b)).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }

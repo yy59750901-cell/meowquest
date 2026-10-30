@@ -1,12 +1,15 @@
 package api
 
 import (
-	"strings"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"meowquest/backend/internal/engine"
 	"meowquest/backend/internal/store"
@@ -27,90 +30,119 @@ func (s *Server) submitTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	var dt store.DailyTask
-	if err := s.DB.First(&dt, "id=?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+	if req.DurationSec < 0 || req.ExtraSec < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "计时时长不能为负数"})
 		return
 	}
-	if dt.Status != "pending" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "task status " + dt.Status})
-		return
-	}
-	var tpl store.TaskTemplate
-	if err := s.DB.First(&tpl, dt.TemplateID).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
 	ev := "[]"
 	if len(req.Evidence) > 0 {
 		ev = string(req.Evidence)
 	}
-
-	// 证据步骤校验：必须步骤缺证据 → 引导孩子补齐
-	if missing := missingRequiredSteps(dt.Snapshot, ev); missing != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "还差：" + missing})
-		return
-	}
-	comp := store.TaskCompletion{DailyTaskID: dt.ID, KidID: dt.KidID, Evidence: ev, DurationSec: req.DurationSec}
-	if err := s.DB.Create(&comp).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	var snap engine.Snapshot
-	json.Unmarshal([]byte(dt.Snapshot), &snap)
-
-	// 自动确认（a）
-	if confirmModeContains(tpl.ConfirmMode, 'a') {
-		extraBase := 0
-		if snap.ExtraMinutes > 0 && req.ExtraSec >= snap.ExtraMinutes*60 {
-			n := req.ExtraSec / (snap.ExtraMinutes * 60) * snap.ExtraStars
-			if snap.ExtraCap > 0 && n > snap.ExtraCap {
-				n = snap.ExtraCap
+	status := http.StatusInternalServerError
+	var result gin.H
+	// 行锁覆盖校验、流水和状态转换，编辑不能刷新正在提交的快照。
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		db := &store.DB{DB: tx}
+		var dt store.DailyTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id=? AND kid_id=?", id, kidOf(c)).First(&dt).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				status = http.StatusNotFound
 			}
-			extraBase = n
+			return err
 		}
-		now := time.Now()
-		s.DB.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).
-			Updates(map[string]any{"confirm_status": "auto", "confirmed_at": &now})
-		if err := engine.Settle(s.DB, dt.ID, extraBase); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+		if dt.Status != "pending" {
+			status = http.StatusBadRequest
+			return fmt.Errorf("task status %s", dt.Status)
 		}
-		c.JSON(http.StatusOK, gin.H{"settled": true})
-		return
-	}
-	// AI 验收（b）：判定 → 通过进家长终审队列；不过退回重做（无限重试）
-	if confirmModeContains(tpl.ConfirmMode, 'b') {
-		v, rerr := s.runReview(dt, EvidenceRow{Evidence: ev, DurationSec: req.DurationSec})
-		if rerr != nil {
-			// AI 走神：降级为普通家长确认（不让孩子的努力卡在机器故障上）
-			s.DB.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "submitted")
-			c.JSON(http.StatusOK, gin.H{"waiting": "parent_confirm", "ai": "unavailable"})
-			return
+		var snap engine.Snapshot
+		if err := json.Unmarshal([]byte(dt.Snapshot), &snap); err != nil {
+			return err
 		}
-		resultJSON, _ := json.Marshal(v)
-		if v.Pass {
-			s.DB.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).
-				Update("review_result", string(resultJSON))
-			s.DB.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "submitted")
-			s.DB.AddEvent(dt.KidID, "ai_review", map[string]any{"task": snap.Name, "pass": true, "score": v.Score})
-			c.JSON(http.StatusOK, gin.H{"waiting": "parent_confirm", "ai_pass": true, "ai_reason": v.Reason,
-				"ai_score": v.Score, "kid_feedback": v.KidFeedback})
-		} else {
-			// 退回重做：completion 标记 rejected，任务回 pending
+		missing, err := missingRequiredSteps(dt.Snapshot, ev)
+		if err != nil {
+			status = http.StatusBadRequest
+			return err
+		}
+		if missing != "" {
+			status = http.StatusBadRequest
+			return fmt.Errorf("还差：%s", missing)
+		}
+		duration, err := engine.AchievedDuration(db, dt.ID, snap)
+		if err != nil {
+			return err
+		}
+		if req.DurationSec > duration {
+			duration = req.DurationSec
+		}
+		comp := store.TaskCompletion{DailyTaskID: dt.ID, KidID: dt.KidID, Evidence: ev, DurationSec: duration}
+		if err := tx.Create(&comp).Error; err != nil {
+			return err
+		}
+		mode := snap.ConfirmMode
+		if mode == "" { // 仅缺失字段的旧快照从模板兼容。
+			var tpl store.TaskTemplate
+			if err := tx.First(&tpl, dt.TemplateID).Error; err != nil {
+				return err
+			}
+			mode = tpl.ConfirmMode
+		}
+		if confirmModeContains(mode, 'a') {
+			extraBase := 0
+			if snap.ExtraMinutes > 0 && req.ExtraSec >= snap.ExtraMinutes*60 {
+				extraBase = req.ExtraSec / (snap.ExtraMinutes * 60) * snap.ExtraStars
+				if snap.ExtraCap > 0 && extraBase > snap.ExtraCap {
+					extraBase = snap.ExtraCap
+				}
+			}
 			now := time.Now()
-			s.DB.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).
-				Updates(map[string]any{"review_result": string(resultJSON), "confirm_status": "rejected", "confirmed_at": &now, "reject_reason": "AI：" + v.Reason})
-			s.DB.AddEvent(dt.KidID, "ai_review", map[string]any{"task": snap.Name, "pass": false})
-			c.JSON(http.StatusOK, gin.H{"redo": true, "ai_pass": false, "ai_reason": v.Reason, "kid_feedback": v.KidFeedback})
+			if err := tx.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).
+				Updates(map[string]any{"confirm_status": "auto", "confirmed_at": &now}).Error; err != nil {
+				return err
+			}
+			if err := engine.Settle(db, dt.ID, extraBase); err != nil {
+				return err
+			}
+			result = gin.H{"settled": true}
+			return nil
 		}
+		if confirmModeContains(mode, 'b') {
+			reviewer := *s
+			reviewer.DB = db
+			v, rerr := reviewer.runReview(dt, EvidenceRow{Evidence: ev, DurationSec: duration})
+			if rerr != nil {
+				result = gin.H{"waiting": "parent_confirm", "ai": "unavailable"}
+			} else {
+				resultJSON, err := json.Marshal(v)
+				if err != nil {
+					return err
+				}
+				cols := map[string]any{"review_result": string(resultJSON)}
+				if !v.Pass {
+					now := time.Now()
+					cols["confirm_status"], cols["confirmed_at"], cols["reject_reason"] = "rejected", &now, "AI："+v.Reason
+				}
+				if err := tx.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).Updates(cols).Error; err != nil {
+					return err
+				}
+				db.AddEvent(dt.KidID, "ai_review", map[string]any{"task": snap.Name, "pass": v.Pass, "score": v.Score})
+				if !v.Pass {
+					result = gin.H{"redo": true, "ai_pass": false, "ai_reason": v.Reason, "kid_feedback": v.KidFeedback}
+					return nil
+				}
+				result = gin.H{"waiting": "parent_confirm", "ai_pass": true, "ai_reason": v.Reason,
+					"ai_score": v.Score, "kid_feedback": v.KidFeedback}
+			}
+		} else {
+			result = gin.H{"waiting": "parent_confirm"}
+		}
+		return tx.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "submitted").Error
+	})
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	// 家长确认（c）→ 待确认
-	s.DB.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "submitted")
-	c.JSON(http.StatusOK, gin.H{"waiting": "parent_confirm"})
+	c.JSON(http.StatusOK, result)
 }
 
 func confirmModeContains(mode string, ch byte) bool {
@@ -182,34 +214,52 @@ func (s *Server) confirmTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	var dt store.DailyTask
-	if err := s.DB.Raw(`SELECT d.* FROM daily_task d JOIN kid k ON k.id=d.kid_id
-		WHERE d.id=? AND k.family_id=?`, id, famOf(c)).Scan(&dt).Error; err != nil || dt.ID == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-		return
-	}
-	if dt.Status != "submitted" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "task status " + dt.Status})
+	status := http.StatusInternalServerError
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		db := &store.DB{DB: tx}
+		var dt store.DailyTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id=? AND kid_id IN (SELECT id FROM kid WHERE family_id=?)", id, famOf(c)).First(&dt).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				status = http.StatusNotFound
+			}
+			return err
+		}
+		if dt.Status != "submitted" {
+			status = http.StatusBadRequest
+			return fmt.Errorf("task status %s", dt.Status)
+		}
+		now := time.Now()
+		confirmStatus := "rejected"
+		if req.Approve {
+			confirmStatus = "approved"
+		}
+		cols := map[string]any{"confirm_status": confirmStatus, "confirmed_at": &now}
+		if !req.Approve {
+			cols["reject_reason"] = req.Reason
+		}
+		if err := tx.Model(&store.TaskCompletion{}).Where("daily_task_id=? AND confirm_status='pending'", dt.ID).
+			Updates(cols).Error; err != nil {
+			return err
+		}
+		if req.Approve {
+			return engine.Settle(db, dt.ID, 0)
+		}
+		if err := tx.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "pending").Error; err != nil {
+			return err
+		}
+		db.AddEvent(dt.KidID, "task_rejected", map[string]any{"task_id": dt.ID, "reason": req.Reason})
+		return nil
+	})
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	if req.Approve {
-		now := time.Now()
-		s.DB.Model(&store.TaskCompletion{}).Where("daily_task_id=? AND confirm_status='pending'", dt.ID).
-			Updates(map[string]any{"confirm_status": "approved", "confirmed_at": &now})
-		if err := engine.Settle(s.DB, dt.ID, 0); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
 		c.JSON(http.StatusOK, gin.H{"settled": true})
-		return
+	} else {
+		c.JSON(http.StatusOK, gin.H{"rejected": true})
 	}
-	// 驳回：退回未完成，可重新提交（不限次数）
-	now := time.Now()
-	s.DB.Model(&store.TaskCompletion{}).Where("daily_task_id=? AND confirm_status='pending'", dt.ID).
-		Updates(map[string]any{"confirm_status": "rejected", "confirmed_at": &now, "reject_reason": req.Reason})
-	s.DB.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "pending")
-	s.DB.AddEvent(dt.KidID, "task_rejected", map[string]any{"task_id": dt.ID, "reason": req.Reason})
-	c.JSON(http.StatusOK, gin.H{"rejected": true})
 }
 
 // GET /api/admin/ledger 家庭星星流水（join 孩子名）
@@ -226,16 +276,16 @@ func (s *Server) ledger(c *gin.Context) {
 }
 
 type ledgerItem struct {
-	ID          int64     `json:"id"`
-	KidName     string    `json:"kid_name"`
-	Date        string    `json:"date"`
-	DailyTaskID int64     `json:"daily_task_id"`
-	Source      string    `json:"source"`
-	Base        int       `json:"base"`
-	DateMultiplier float64 `json:"date_multiplier"`
-	StreakMultiplier float64 `json:"streak_multiplier"`
-	Final       int       `json:"final"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID               int64     `json:"id"`
+	KidName          string    `json:"kid_name"`
+	Date             string    `json:"date"`
+	DailyTaskID      int64     `json:"daily_task_id"`
+	Source           string    `json:"source"`
+	Base             int       `json:"base"`
+	DateMultiplier   float64   `json:"date_multiplier"`
+	StreakMultiplier float64   `json:"streak_multiplier"`
+	Final            int       `json:"final"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // GET /api/admin/ledger/:kid_id 单孩子流水
@@ -248,38 +298,45 @@ func (s *Server) ledgerKid(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
-
 // missingRequiredSteps 必须步骤缺证据检查（返回缺失提示语，空=齐全）
-func missingRequiredSteps(snapshot, evidenceJSON string) string {
-	var snap struct {
-		EvidenceSteps string `json:"evidence_steps"`
+func missingRequiredSteps(snapshot, evidenceJSON string) (string, error) {
+	var snap engine.Snapshot
+	if err := json.Unmarshal([]byte(snapshot), &snap); err != nil {
+		return "", fmt.Errorf("任务快照无效: %w", err)
 	}
-	json.Unmarshal([]byte(snapshot), &snap)
-	var steps []struct {
-		Kind     string `json:"kind"`
-		Label    string `json:"label"`
-		Required bool   `json:"required"`
+	steps, err := engine.ParseSteps(engine.NormalizeSteps(snap.EvidenceSteps, snap.EvidenceType))
+	if err != nil {
+		return "", err
 	}
-	json.Unmarshal([]byte(orDefault(snap.EvidenceSteps, "[]")), &steps)
-	if len(steps) == 0 {
-		return "" // 旧单证据任务不校验
+	var evList []*struct {
+		Type string `json:"type"`
+		Path string `json:"path"`
+	}
+	if !strings.HasPrefix(strings.TrimSpace(evidenceJSON), "[") {
+		return "", fmt.Errorf("evidence 必须是 JSON 数组")
+	}
+	if err := json.Unmarshal([]byte(evidenceJSON), &evList); err != nil {
+		return "", fmt.Errorf("evidence: %w", err)
 	}
 	got := map[string]int{}
-	var evList []struct {
-		Type string `json:"type"`
-	}
-	json.Unmarshal([]byte(orDefault(evidenceJSON, "[]")), &evList)
 	for _, e := range evList {
-		got[e.Type]++
+		if e == nil {
+			return "", fmt.Errorf("evidence 数组元素必须是对象")
+		}
+		if strings.TrimSpace(e.Path) != "" {
+			got[e.Type]++
+		}
 	}
 	var missing []string
 	for _, st := range steps {
-		if st.Required && got[st.Kind] == 0 {
+		if !st.Required {
+			continue
+		}
+		if got[st.Kind] == 0 {
 			missing = append(missing, st.Label)
+		} else {
+			got[st.Kind]--
 		}
 	}
-	if len(missing) == 0 {
-		return ""
-	}
-	return strings.Join(missing, "、")
+	return strings.Join(missing, "、"), nil
 }

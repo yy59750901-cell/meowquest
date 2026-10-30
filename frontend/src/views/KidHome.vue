@@ -7,6 +7,7 @@ import PixelItem from '../components/PixelItem.vue'
 import GardenBackdrop from '../components/GardenBackdrop.vue'
 import { decorArt, getSceneLighting, isWallpaper, wallStyle } from '../scene-art.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
+import { evidenceSteps } from '../task-evidence.js'
 
 const API = '/api'
 
@@ -110,7 +111,30 @@ async function jpost(url, body) {
   return { ok: r.ok, data: await r.json().catch(() => ({})) }
 }
 
-const hadDuration = ref({}) // {taskID:bool} 计时任务曾达标（AI 退回后免重新计时）
+const hadDuration = ref({}) // AI / 家长退回只补材料，同一任务不重计时
+const achievedDuration = ref({}) // 同实例历史真实达标秒数
+let tasksLoading = null
+function applyToday(t) {
+  if (!t || !Array.isArray(t.tasks)) return false
+  try {
+    const tasks = t.tasks.map(x => ({ ...x, snapshot: typeof x.snapshot === 'string' ? JSON.parse(x.snapshot) : x.snapshot }))
+    today.value = { ...t, tasks }
+    hadDuration.value = t.had_duration || {}
+    achievedDuration.value = t.achieved_duration || {}
+    if (timerTask.value && (hadDuration.value[timerTask.value.id] || !tasks.some(x => x.id === timerTask.value.id && x.status === 'pending'))) {
+      timerTask.value = null
+      clearTimer()
+    }
+    return true
+  } catch { return false }
+}
+async function refreshTasks() {
+  if (tasksLoading) return tasksLoading
+  tasksLoading = (async () => {
+    try { return applyToday(await jget('/tasks/today')) } catch { return false }
+  })()
+  try { return await tasksLoading } finally { tasksLoading = null }
+}
 
 // ===== 世界视口：固定逻辑世界 + 相机（窄屏看局部可拖，跟猫为默认焦点） =====
 const WORLD_W = 1280, WORLD_H = 720
@@ -121,7 +145,10 @@ const sceneLighting = ref(getSceneLighting())
 let lightingTimer = null
 function syncSceneLighting() { sceneLighting.value = getSceneLighting() }
 function onDocumentVisibility() {
-  if (!document.hidden) syncSceneLighting()
+  if (!document.hidden) {
+    syncSceneLighting()
+    if (adopted.value) refreshTasks()
+  }
 }
 const activeWallpaper = computed(() => sceneItems.value.filter(it => isWallpaper(it.item_key)).at(-1)?.item_key || '')
 const placedDecor = computed(() => sceneItems.value.filter(it => !isWallpaper(it.item_key)))
@@ -182,9 +209,7 @@ async function loadAll() {
   ])
   if (sp) speciesList.value = sp.species || []
   if (p && p.pet) { adopted.value = true; pet.value = p.pet; species.value = p.pet.species }
-  if (t) today.value = t
-  hadDuration.value = t?.had_duration || {}
-  if (t && t.tasks) today.value.tasks = t.tasks.map(x => ({ ...x, snapshot: typeof x.snapshot === 'string' ? JSON.parse(x.snapshot) : x.snapshot }))
+  applyToday(t)
   if (w) wishes.value = w.wishes || []
   if (s) shopItems.value = s.items || []
   if (sc) sceneItems.value = sc.items || []
@@ -355,6 +380,7 @@ function openSheet(name) {
   sheet.value = sheet.value === name ? '' : name
   hudOpen.value = false
   toolsOpen.value = false
+  if (sheet.value === 'task') refreshTasks()
 }
 function toggleCompanion() {
   toolsOpen.value = !toolsOpen.value
@@ -687,7 +713,7 @@ async function submitTask(t, body = {}) {
   submitting.value = t.id
   const snap = t.snapshot
   const payload = {
-    duration_sec: body.duration_sec ?? (snap.goal_type === 'duration' ? snap.goal_value : 0) * 60,
+    duration_sec: body.duration_sec ?? achievedDuration.value[t.id] ?? 0,
     extra_sec: body.duration_sec || 0,
     evidence: body.evidence || [],
   }
@@ -761,10 +787,25 @@ function restoreTimer() {
     timerStartAt.value = saved.startAt
   } catch { clearTimer() }
 }
-function startTask(t) {
+const startingTask = ref(0)
+async function startTask(t) {
+  if (startingTask.value || submitting.value) return
+  startingTask.value = t.id
+  try {
+    // 点击前复核最新状态：不能因旧页面、请求失败或家长编辑误启计时。
+    if (!await refreshTasks()) return showToast('暂时无法更新任务，请稍后再试')
+    t = today.value.tasks.find(x => x.id === t.id)
+    if (!t || t.status !== 'pending') return showToast('任务状态已更新，请查看任务列表')
+    startCurrentTask(t)
+  } finally { startingTask.value = 0 }
+}
+function startCurrentTask(t) {
   const snap = t.snapshot
+  let steps
+  try { steps = parseSteps(snap) }
+  catch { return showToast('提交步骤配置有误，请让家长检查') }
   if (snap.goal_type === 'duration' && snap.goal_value > 0) {
-    // 计时曾达标（材料被 AI 退回重做）→ 免重新计时，直接补材料
+    // 材料被 AI / 家长退回 → 沿用已达标计时，直接补材料
     if (!hadDuration.value[t.id]) {
       timerTask.value = t
       timerStartAt.value = Date.now()
@@ -772,10 +813,9 @@ function startTask(t) {
       return
     }
   }
-  // 新流程：配置了提交步骤 → 向导（逐步引导拍照/录音）
-  const steps = parseSteps(snap)
+  // 配置了提交步骤 → 向导（逐步引导拍照/录音）
   if (steps.length > 0) {
-    openWizard(t, steps)
+    openWizard(t, steps, achievedDuration.value[t.id] || 0)
     return
   }
   const ev = snap.evidence_type || ''
@@ -789,12 +829,7 @@ function startTask(t) {
 
 // ===== 提交向导（多步骤证据） =====
 const wizard = ref(null) // { task, steps, done: {} }
-function parseSteps(snap) {
-  try {
-    const arr = typeof snap.evidence_steps === 'string' ? JSON.parse(snap.evidence_steps) : (snap.evidence_steps || [])
-    return Array.isArray(arr) && arr.length ? arr : []
-  } catch (e) { return [] }
-}
+function parseSteps(snap) { return evidenceSteps(snap.evidence_steps, snap.evidence_type || '') }
 function openWizard(t, steps, durationSec) {
   wizard.value = { task: t, steps, done: {}, duration: durationSec || 0 } // done[i] = [{type,path},...]（每步可多文件）
   say('跟着提示一步步来哦～')
@@ -802,12 +837,14 @@ function openWizard(t, steps, durationSec) {
 function wizardDoneCount(w) {
   return w.steps.filter((st) => w.done[st.kind + '_' + w.steps.indexOf(st)]).length
 }
+// iPad 文件选择器对 audio/* 的匹配不完整，补齐 m4a 类型与音频后缀。
+const AUDIO_ACCEPT = 'audio/*,audio/mp4,audio/x-m4a,audio/mpeg,audio/wav,audio/x-wav,audio/aac,audio/ogg,.m4a,.mp3,.wav,.aac,.ogg,.webm'
 const wizardInput = ref(null)
 let wizardStepIdx = -1
 function wizardPick(st, idx) {
   wizardStepIdx = idx
   if (wizardInput.value) {
-    wizardInput.value.accept = st.kind === 'photo' ? 'image/*' : 'audio/*'
+    wizardInput.value.accept = st.kind === 'photo' ? 'image/*' : st.kind === 'video' ? 'video/*' : AUDIO_ACCEPT
     wizardInput.value.multiple = true // 支持多张（如多页口算）
     wizardInput.value.click()
   }
@@ -875,9 +912,10 @@ const photoPreview = ref(null)
 
 async function wizardSubmit() {
   const w = wizard.value
+  if (!w || !wizardReady(w)) return
   const evs = w.steps.map((st, i) => w.done[i] || []).flat()
   const t = w.task
-  const dur = w.duration || (t.snapshot.goal_type === 'duration' && t.snapshot.goal_value > 0 ? t.snapshot.goal_value * 60 : 0)
+  const dur = w.duration || achievedDuration.value[t.id] || 0
   wizard.value = null
   await submitTask(t, { evidence: evs, duration_sec: dur })
 }
@@ -921,11 +959,13 @@ async function onEvidenceFile(e) {
   const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
   const t = evidenceTask
   evidenceTask = null
-  const dur = timerSec || (t.snapshot.goal_type === 'duration' ? t.snapshot.goal_value * 60 : 0)
+  const dur = timerSec || achievedDuration.value[t.id] || 0
   timerSec = 0
   await submitTask(t, { evidence: [{ type, path: d.path }], duration_sec: dur })
 }
-function taskBtnLabel(snap) {
+function taskBtnLabel(t) {
+  const snap = t.snapshot
+  if (hadDuration.value[t.id]) return '补交材料'
   if (snap.goal_type === 'duration' && snap.goal_value > 0) return '计时开始'
   const ev = snap.evidence_type || ''
   if (ev.includes('photo')) return '拍照提交'
@@ -1153,7 +1193,10 @@ onMounted(async () => {
   document.addEventListener('pointerdown', dismissStatusOutside)
   document.addEventListener('visibilitychange', onDocumentVisibility)
   syncSceneLighting()
-  lightingTimer = setInterval(syncSceneLighting, 60000)
+  lightingTimer = setInterval(() => {
+    syncSceneLighting()
+    if (!document.hidden && adopted.value && today.value?.tasks?.some(t => t.status === 'submitted')) refreshTasks()
+  }, 15000)
   await loadAll()
   await nextTick()
   if (adopted.value) {
@@ -1330,7 +1373,7 @@ onBeforeUnmount(() => {
           <span v-if="t.status === 'approved'" class="st ok">✓</span>
           <span v-else-if="t.status === 'submitted'" class="st wait-t">等妈妈…</span>
           <span v-else-if="t.status === 'skipped'" class="st skip">请假</span>
-          <button v-else @click="startTask(t)">{{ taskBtnLabel(t.snapshot) }}</button>
+          <button v-else :disabled="!!startingTask" @click="startTask(t)">{{ taskBtnLabel(t) }}</button>
         </div>
         <div v-if="!today.tasks.length" class="empty">今天没有任务，和猫玩吧～</div>
       </div>
@@ -1409,19 +1452,21 @@ onBeforeUnmount(() => {
           <a @click="wizard = null">✕</a>
         </div>
         <div class="wizard-body">
+          <p v-if="wizard.duration > 0" class="duration-kept">计时已达标，补交材料就好，不用重新计时。</p>
           <div v-for="(st, i) in wizard.steps" :key="i" class="wstep" :class="{ done: wizardReady(wizard) && wizard.done[i] }">
             <div class="wstep-head">
-              <b>{{ st.kind === 'photo' ? '📷' : '🎙' }} {{ st.label }}</b>
-              <small v-if="!st.required">可选</small>
+              <b>{{ st.kind === 'photo' ? '📷' : st.kind === 'video' ? '🎬' : '🎙' }} {{ st.label }}</b>
+              <small>{{ st.required ? '必须' : '可选' }}</small>
               <em v-if="wizard.done[i] && wizard.done[i].length">✓ {{ wizard.done[i].length }} 个</em>
             </div>
             <button class="pbtn" @click="wizardPick(st, i)">
-              {{ wizard.done[i] && wizard.done[i].length ? '再传一张 / 重新选' : st.kind === 'photo' ? '拍照 / 相册（可多张）' : '录音 / 音频文件' }}
+              {{ wizard.done[i] && wizard.done[i].length ? '继续上传 / 重新选' : st.kind === 'photo' ? '拍照 / 相册（可多张）' : st.kind === 'video' ? '录像 / 视频文件' : '录音 / 音频文件' }}
             </button>
             <div v-if="wizard.done[i] && wizard.done[i].length" class="wprev">
               <div v-for="(f, fi) in wizard.done[i]" :key="fi" class="wprev-item">
                 <img v-if="f.type === 'photo'" :src="f.path" @click="previewPhoto(f.path)" />
                 <audio v-else-if="f.type === 'audio'" :src="f.path" controls preload="none" />
+                <video v-else-if="f.type === 'video'" :src="f.path" controls preload="metadata" style="max-width: 100%; width: 240px" />
                 <a class="wprev-del" @click="wizardRemoveFile(i, fi)">✕</a>
               </div>
             </div>
@@ -1470,7 +1515,7 @@ onBeforeUnmount(() => {
       @done="onTimerDone" @giveup="onTimerGiveup" />
 
     <!-- 拍照/录音（调起相机或语音备忘录） -->
-    <input ref="evidenceInput" type="file" accept="image/*,audio/*,video/*" capture="environment" style="display:none" @change="onEvidenceFile" />
+    <input ref="evidenceInput" type="file" :accept="'image/*,video/*,' + AUDIO_ACCEPT" capture="environment" style="display:none" @change="onEvidenceFile" />
 
     <!-- 许愿输入框 -->
     <div v-if="wishModal" class="modal-mask" @click.self="wishModal = false">
@@ -1695,6 +1740,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .chat-input .rec-btn.uploading { background: #FAEEDA; }
 @keyframes pulse { 50% { opacity: .2; } }
 .chat-input button:disabled { opacity: .55; cursor: default; }
+.duration-kept { margin: 0 0 12px; padding: 10px; color: #4C6B39; background: #EDF3E8; border-radius: 8px; font-size: 13px; line-height: 1.5; }
 .wstep { background: #fff; border: 1px solid #E4D6C4; border-radius: 12px; padding: 12px; margin-bottom: 10px; }
 .wstep.done { background: #EDF3E8; border-color: #D4E0CC; }
 .wstep-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
