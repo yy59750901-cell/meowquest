@@ -285,6 +285,16 @@ func (s *Server) confirmTask(c *gin.Context) {
 			Updates(cols).Error; err != nil {
 			return err
 		}
+		// 猫的留言与审核同事务：审核成功但留言丢了，孩子就永远看不到反馈。
+		// 只在家长确认后写，避免"AI 说很棒、家长却驳回"的矛盾。
+		verdict := verdictOf(latest.ReviewResult)
+		kind, content, score, highlights := kidMessageApproved, kidApprovedContent(verdict), verdict.Score, verdict.Highlights
+		if !req.Approve {
+			kind, content, score, highlights = kidMessageRejected, kidRejectedContent(req.Reason), 0, nil
+		}
+		if err := writeKidMessage(tx, dt.KidID, latest.ID, kind, snapshotName(dt.Snapshot), content, score, highlights); err != nil {
+			return err
+		}
 		if req.Approve {
 			return engine.Settle(db, dt.ID, 0)
 		}

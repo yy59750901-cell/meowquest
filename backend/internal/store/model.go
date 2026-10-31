@@ -252,6 +252,23 @@ type ChatMessage struct {
 
 func (ChatMessage) TableName() string { return "chat_message" }
 
+// KidMessage 猫给孩子的留言。只在家长审核后写入：AI 评价先经过家长确认才给孩子看，
+// 避免"AI 说很棒、家长却驳回"的矛盾。孩子端可回看，不受"只看今天"限制。
+type KidMessage struct {
+	ID           int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID        int64      `gorm:"index:idx_kid_message_unread,priority:1" json:"kid_id"`
+	CompletionID int64      `gorm:"column:completion_id;index" json:"completion_id"`
+	Kind         string     `gorm:"size:16" json:"kind"` // approved / rejected
+	TaskName     string     `gorm:"size:64" json:"task_name"`
+	Score        int        `json:"score"`
+	Content      string     `json:"content"`
+	Highlights   []string   `gorm:"serializer:json" json:"highlights,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	ReadAt       *time.Time `gorm:"index:idx_kid_message_unread,priority:2" json:"read_at"`
+}
+
+func (KidMessage) TableName() string { return "kid_message" }
+
 type PetEvent struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	KidID     int64     `gorm:"index" json:"kid_id"`

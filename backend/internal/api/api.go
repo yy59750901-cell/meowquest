@@ -53,6 +53,9 @@ func (s *Server) Router() *gin.Engine {
 		api.POST("/chat", s.kid, s.chat)
 		api.POST("/asr", s.kid, s.asr)
 		api.GET("/chat/history", s.kid, s.chatHistory)
+		// 猫的信箱：家长审核后给孩子的话，可回看
+		api.GET("/kid/messages", s.kid, s.kidMessages)
+		api.POST("/kid/messages/read", s.kid, s.readKidMessages)
 
 		// 商店与场景
 		api.GET("/shop", s.kid, s.shopList)

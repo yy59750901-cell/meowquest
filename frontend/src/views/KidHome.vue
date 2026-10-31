@@ -156,7 +156,10 @@ function syncSceneLighting() { sceneLighting.value = getSceneLighting() }
 function onDocumentVisibility() {
   if (!document.hidden) {
     syncSceneLighting()
-    if (adopted.value) refreshTasks()
+    if (adopted.value) {
+      refreshTasks()
+      syncMail()
+    }
   }
 }
 const activeWallpaper = computed(() => sceneItems.value.filter(it => isWallpaper(it.item_key)).at(-1)?.item_key || '')
@@ -228,6 +231,45 @@ async function loadAll() {
 async function refreshPet() {
   const p = await jget('/pet')
   if (p && p.pet) pet.value = p.pet
+}
+
+// ===== 猫的信箱 =====
+// AI 评价在家长确认后才落到这里，孩子端可回看，不受"只看今天"限制。
+const mailOpen = ref(false)
+const messages = ref([])
+const unread = ref(0)
+let mailAnnounced = false // 每次进页面只主动播报一次，之后只留红点
+
+async function refreshMessages() {
+  const d = await jget('/kid/messages')
+  if (!d) return 0
+  messages.value = d.items || []
+  unread.value = d.unread || 0
+  return unread.value
+}
+
+// 进页面（或切回前台）时把最新一条未读念出来；关掉页面也不怕，红点还在。
+async function syncMail() {
+  if (!adopted.value || document.hidden) return
+  const before = unread.value
+  const n = await refreshMessages()
+  if (n <= before || mailAnnounced) return
+  const latest = (messages.value || []).find(m => !m.read_at)
+  if (latest?.content) {
+    mailAnnounced = true
+    say(latest.content)
+  }
+}
+
+async function openMailbox() {
+  mailOpen.value = true
+  if (unread.value === 0) await refreshMessages()
+  if (unread.value > 0) {
+    const d = await jpost('/kid/messages/read', {})
+    if (d?.ok) unread.value = d.data?.unread ?? 0
+    // 同步本地已读状态，避免关掉再打开还显示未读。
+    messages.value = messages.value.map(m => ({ ...m, read_at: m.read_at || new Date().toISOString() }))
+  }
 }
 
 // ===== 领养 =====
@@ -1206,12 +1248,17 @@ onMounted(async () => {
   syncSceneLighting()
   lightingTimer = setInterval(() => {
     syncSceneLighting()
-    if (!document.hidden && adopted.value && today.value?.tasks?.some(t => t.status === 'submitted')) refreshTasks()
+    if (!document.hidden && adopted.value) {
+      // 有任务在等 AI 就刷新任务；信箱独立拉取，家长确认后孩子不用刷新也能收到。
+      if (today.value?.tasks?.some(t => t.status === 'submitted')) refreshTasks()
+      syncMail()
+    }
   }, 15000)
   await loadAll()
   await nextTick()
   if (adopted.value) {
     initCat()
+    syncMail()
   } else {
     // 换设备/换人回来：记住过家庭码则免输码直达"你是谁"
     const code = localStorage.getItem('familyCode')
@@ -1348,6 +1395,16 @@ onBeforeUnmount(() => {
     <div v-show="dropActive" ref="dropEl" class="drop-retrieve">松手拖到这里 → 收回物品栏</div>
     </div><!-- /scene-viewport -->
     <div class="room-tools" v-show="!sheet">
+      <button class="mailbox-btn" :class="{ has: unread > 0 }" @click="openMailbox"
+        :aria-label="unread > 0 ? '猫的信箱，' + unread + ' 条未读' : '猫的信箱'">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 6.5h18v11H3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          <path d="M3 6.5 12 13l9-6.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          <path d="M3 17.5 9.5 11M21 17.5 14.5 11" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".55" />
+        </svg>
+        <span>信箱</span>
+        <i v-if="unread > 0" class="mail-dot">{{ unread > 99 ? '99+' : unread }}</i>
+      </button>
       <button class="mobile-companion" :class="{ on: toolsOpen }" :aria-expanded="toolsOpen" @click="toggleCompanion"><svg class="ui-icon"><use href="#room-paw" /></svg>陪伴</button>
       <span class="camera-hint">{{ camMode === 'free' ? '自由视角' : '拖动画面，逛逛小屋' }}</span>
       <button class="camera-reset" :class="{ free: camMode === 'free' }" @click="resetCam" aria-label="视角回到小猫"><svg class="ui-icon"><use href="#room-target" /></svg>回猫</button>
@@ -1511,6 +1568,31 @@ onBeforeUnmount(() => {
           <input v-model="chatInput" maxlength="200" :placeholder="recState === 'recording' ? '松开结束，在听呢…' : recState === 'uploading' ? '猫在听写…' : '跟它说点什么（按住🎤说话）'"
             @keyup.enter="sendChat" :disabled="chatStreaming" />
           <button @click="sendChat" :disabled="chatStreaming || !chatInput.trim()">喵！</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 猫的信箱：家长确认后给孩子的话，按时间倒序，可回看 -->
+    <div v-if="mailOpen" class="chat-mask">
+      <div class="chat-box mail-box">
+        <div class="chat-head">
+          <b>🐱 猫的信箱</b>
+          <span class="chat-left">{{ unread > 0 ? unread + ' 条未读' : '都看完啦' }}</span>
+          <a @click="mailOpen = false">✕</a>
+        </div>
+        <div class="chat-body">
+          <p v-if="!messages.length" class="mail-empty">还没有猫的留言。<br />完成任务、妈妈确认后，猫会给你写信喵～</p>
+          <article v-for="m in messages" :key="m.id" class="mail-card" :class="{ unread: !m.read_at }">
+            <div class="mail-head">
+              <b>{{ m.task_name || '任务' }}</b>
+              <span class="mail-kind" :class="m.kind">{{ m.kind === 'rejected' ? '待补交' : (m.score ? m.score + ' / 5 ★' : '通过') }}</span>
+              <span class="mail-time">{{ new Date(m.created_at).toLocaleString('zh-CN') }}</span>
+            </div>
+            <p class="mail-content">{{ m.content }}</p>
+            <ul v-if="m.highlights && m.highlights.length" class="mail-highlights">
+              <li v-for="(h, i) in m.highlights" :key="i">{{ h }}</li>
+            </ul>
+          </article>
         </div>
       </div>
     </div>
@@ -1681,6 +1763,23 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .action-copy small { margin-top: 2px; white-space: nowrap; }
 .room-tools { position: absolute; right: 320px; bottom: 38px; z-index: 18; display: flex; align-items: center; gap: 10px; }
 .mobile-companion { display: none; }
+.mailbox-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.mailbox-btn svg { flex-shrink: 0; width: 18px; height: 18px; }
+.mailbox-btn.has { background: #EEEBF7; color: #75609D; border-color: #CFC2E3; }
+.mail-dot { position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 5px; display: flex; align-items: center; justify-content: center; background: #E24B4A; color: #fff; font-size: 11px; font-weight: 600; font-style: normal; line-height: 1; border-radius: 9px; border: 2px solid #FFFCF6; }
+.mail-box .chat-body { display: block; padding: 12px; }
+.mail-empty { padding: 28px 12px; text-align: center; font-size: 13px; color: #88786A; line-height: 1.8; }
+.mail-card { background: #fff; border: 1px solid #E4D6C4; border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+.mail-card.unread { background: #F5F2FF; border-color: #DCD2EB; }
+.mail-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.mail-head b { font-size: 13px; }
+.mail-kind { flex-shrink: 0; font-size: 11px; color: #88786A; }
+.mail-kind.rejected { color: #A32D2D; }
+.mail-time { margin-left: auto; flex-shrink: 0; font-size: 11px; color: #A79B8D; }
+.mail-content { margin: 0; font-size: 13px; line-height: 1.65; color: #5D493B; overflow-wrap: anywhere; }
+.mail-highlights { margin: 8px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.mail-highlights li { font-size: 12px; color: #88786A; display: flex; gap: 6px; align-items: baseline; }
+.mail-highlights li::before { content: '●'; flex-shrink: 0; color: #7F77DD; font-size: 10px; }
 .camera-reset { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .camera-reset svg, .mobile-companion svg { flex-shrink: 0; width: 18px; height: 18px; }
 .camera-reset.free, .camera-reset.on { background: #EEEBF7; color: #75609D; border-color: #CFC2E3; }

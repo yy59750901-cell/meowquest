@@ -72,7 +72,8 @@ func taskIntegrationDB(t *testing.T) *store.DB {
 	t.Cleanup(func() { sqlDB.Close() })
 	if err := gdb.AutoMigrate(&store.Family{}, &store.Kid{}, &store.TaskTemplate{}, &store.TaskSchedule{},
 		&store.TaskAssign{}, &store.DailyTask{}, &store.TaskCompletion{}, &store.AIReviewJob{}, &store.LeaveRecord{},
-		&store.RewardPolicy{}, &store.Holiday{}, &store.Pet{}, &store.PetEvent{}, &store.SettlementLedger{}); err != nil {
+		&store.RewardPolicy{}, &store.Holiday{}, &store.Pet{}, &store.PetEvent{}, &store.SettlementLedger{},
+		&store.KidMessage{}); err != nil {
 		t.Fatal(err)
 	}
 	return &store.DB{DB: gdb}
