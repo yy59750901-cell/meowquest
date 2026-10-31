@@ -160,6 +160,10 @@ function onDocumentVisibility() {
       refreshTasks()
       syncMail()
     }
+  } else if (taskRec.value && taskRec.value.state === 'recording') {
+    // iOS Safari 切后台/锁屏会中断录音，自动收尾并保留已录部分，别让孩子白录一场。
+    stopTaskRec()
+    showToast('录音停啦，回来可以试听或重录～')
   }
 }
 const activeWallpaper = computed(() => sceneItems.value.filter(it => isWallpaper(it.item_key)).at(-1)?.item_key || '')
@@ -963,13 +967,141 @@ function previewPhoto(url) {
 }
 const photoPreview = ref(null)
 
+// ===== 任务录音：点一下开始、再点一下结束，可试听/重录（一步只录一段）=====
+// 与聊天的长按录音分开：这里产出的是"证据文件"，只上传不转写（转写留给 AI 审核阶段）。
+const taskRec = ref(null) // { idx, state: recording|preview|uploading, seconds, url, ext }
+// Safari 只认 audio/mp4，Chrome 认 webm；按 mime 反推后缀，两个都在后端白名单与 ASR 支持列表里。
+const REC_MIME_CANDIDATES = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
+const TASK_REC_HINT_SEC = 600 // 录满 10 分钟提醒一次，不强制停止（20MB 够录很久）
+let taskRecMR = null, taskRecChunks = [], taskRecStream = null, taskRecBlob = null
+let taskRecTimer = 0, taskRecStartedAt = 0, taskRecHinted = false
+
+function taskRecMime() {
+  if (typeof MediaRecorder === 'undefined') return ''
+  return REC_MIME_CANDIDATES.find((m) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) || ''
+}
+function taskRecExt(mime) {
+  if (String(mime).includes('webm')) return 'webm'
+  if (String(mime).includes('ogg')) return 'ogg'
+  return 'm4a'
+}
+function fmtSec(s) {
+  const m = Math.floor((s || 0) / 60), r = (s || 0) % 60
+  return m + ':' + String(r).padStart(2, '0')
+}
+function taskRecReleaseStream() {
+  taskRecStream?.getTracks().forEach((t) => t.stop())
+  taskRecStream = null
+}
+function taskRecReset() {
+  if (taskRecTimer) { clearInterval(taskRecTimer); taskRecTimer = 0 }
+  if (taskRec.value && taskRec.value.url) URL.revokeObjectURL(taskRec.value.url)
+  taskRec.value = null
+  taskRecBlob = null
+  taskRecChunks = []
+}
+function closeWizard() {
+  taskRecReleaseStream()
+  taskRecReset()
+  wizard.value = null
+}
+
+async function toggleTaskRec(idx) {
+  const cur = taskRec.value
+  if (cur && cur.state === 'uploading') return
+  if (cur && cur.state === 'recording') { stopTaskRec(); return }
+  if (cur && cur.state === 'preview') { taskRecReset(); return } // 预览态点主按钮=丢弃重来
+  await startTaskRec(idx)
+}
+
+async function startTaskRec(idx) {
+  taskRecReset()
+  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    return showToast('这个浏览器录不了音，用旁边的「录音 / 音频文件」上传吧')
+  }
+  let stream
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+  } catch (e) {
+    return showToast('麦克风没开权限，去设置里打开，或者用「录音 / 音频文件」上传～')
+  }
+  taskRecStream = stream
+  taskRecChunks = []
+  taskRecStartedAt = Date.now()
+  taskRecHinted = false
+  const mime = taskRecMime()
+  try {
+    taskRecMR = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
+  } catch (e) {
+    taskRecMR = new MediaRecorder(stream)
+  }
+  taskRecMR.ondataavailable = (e) => { if (e.data && e.data.size) taskRecChunks.push(e.data) }
+  taskRecMR.onstop = onTaskRecStopped
+  taskRecMR.start()
+  taskRec.value = { idx, state: 'recording', seconds: 0, url: '', ext: taskRecExt(mime) }
+  taskRecTimer = setInterval(() => {
+    if (!taskRec.value || taskRec.value.state !== 'recording') return
+    taskRec.value.seconds = Math.round((Date.now() - taskRecStartedAt) / 1000)
+    if (!taskRecHinted && taskRec.value.seconds >= TASK_REC_HINT_SEC) {
+      taskRecHinted = true
+      showToast('已经录了 10 分钟啦，够用就可以停了～')
+    }
+  }, 500)
+}
+
+function stopTaskRec() {
+  if (!taskRec.value || taskRec.value.state !== 'recording') return
+  if (taskRecTimer) { clearInterval(taskRecTimer); taskRecTimer = 0 }
+  try { taskRecMR.stop() } catch (e) { taskRecReset() }
+}
+
+function onTaskRecStopped() {
+  taskRecReleaseStream()
+  const mime = taskRecMR?.mimeType || taskRecChunks[0]?.type || 'audio/mp4'
+  const blob = new Blob(taskRecChunks, { type: mime })
+  taskRecChunks = []
+  if (!taskRec.value) return
+  if (blob.size < 2000) { // 太短（<~0.1s）当作误触
+    showToast('录得太短啦，再来一次～')
+    taskRecReset()
+    return
+  }
+  taskRecBlob = blob
+  taskRec.value = { ...taskRec.value, state: 'preview', url: URL.createObjectURL(blob), ext: taskRecExt(mime) }
+}
+
+async function confirmTaskRec() {
+  const cur = taskRec.value
+  const w = wizard.value
+  if (!cur || cur.state !== 'preview' || !taskRecBlob || !w) return
+  taskRec.value = { ...cur, state: 'uploading' }
+  const fd = new FormData()
+  fd.append('file', taskRecBlob, 'task-rec.' + (cur.ext || 'm4a'))
+  showToast('上传中…')
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: fd })
+    const d = await r.json()
+    if (!d.path) throw new Error('no path')
+    if (!w.done[cur.idx]) w.done[cur.idx] = []
+    w.done[cur.idx].push({ type: 'audio', path: d.path })
+    wizard.value = { ...w, done: { ...w.done } }
+    showToast('录好啦，交给猫听～')
+  } catch (e) {
+    showToast('上传失败，再试一次？')
+    taskRec.value = { ...cur, state: 'preview' }
+    return
+  }
+  taskRecReset()
+}
+
 async function wizardSubmit() {
   const w = wizard.value
   if (!w || !wizardReady(w)) return
+  if (taskRec.value && taskRec.value.state === 'recording') { showToast('先点「停止」结束录音～'); return }
   const evs = w.steps.map((st, i) => w.done[i] || []).flat()
   const t = w.task
   const dur = w.duration || achievedDuration.value[t.id] || 0
-  wizard.value = null
+  closeWizard()
   await submitTask(t, { evidence: evs, duration_sec: dur })
 }
 async function onTimerDone(sec) {
@@ -1512,7 +1644,7 @@ onBeforeUnmount(() => {
         <div class="chat-head">
           <b>{{ wizard.task.snapshot.icon }} {{ wizard.task.snapshot.name }}</b>
           <span class="chat-left">{{ wizard.steps.length }} 步</span>
-          <a @click="wizard = null">✕</a>
+          <a @click="closeWizard()">✕</a>
         </div>
         <div class="wizard-body">
           <p v-if="wizard.duration > 0" class="duration-kept">计时已达标，补交材料就好，不用重新计时。</p>
@@ -1522,9 +1654,29 @@ onBeforeUnmount(() => {
               <small>{{ st.required ? '必须' : '可选' }}</small>
               <em v-if="wizard.done[i] && wizard.done[i].length">✓ {{ wizard.done[i].length }} 个</em>
             </div>
-            <button class="pbtn" @click="wizardPick(st, i)">
-              {{ wizard.done[i] && wizard.done[i].length ? '继续上传 / 重新选' : st.kind === 'photo' ? '拍照 / 相册（可多张）' : st.kind === 'video' ? '录像 / 视频文件' : '录音 / 音频文件' }}
-            </button>
+            <div class="wstep-row">
+              <button class="pbtn" @click="wizardPick(st, i)">
+                {{ wizard.done[i] && wizard.done[i].length ? '继续上传 / 重新选' : st.kind === 'photo' ? '拍照 / 相册（可多张）' : st.kind === 'video' ? '录像 / 视频文件' : '录音 / 音频文件' }}
+              </button>
+              <button v-if="st.kind === 'audio'" class="trec-btn" :class="{ on: taskRec && taskRec.idx === i && taskRec.state === 'recording' }"
+                :disabled="(taskRec && taskRec.idx !== i) || (wizard.done[i] && wizard.done[i].length) || (taskRec && taskRec.state === 'uploading')"
+                @click="toggleTaskRec(i)">
+                <span class="trec-icon" :class="{ stop: taskRec && taskRec.idx === i && taskRec.state === 'recording' }"></span>
+                {{ wizard.done[i] && wizard.done[i].length ? '已录好' : taskRec && taskRec.idx === i && taskRec.state === 'recording' ? '停止' : '直接录' }}
+              </button>
+            </div>
+            <div v-if="taskRec && taskRec.idx === i" class="trec-box">
+              <div class="trec-line">
+                <b>{{ taskRec.state === 'recording' ? '录制中…' : taskRec.state === 'uploading' ? '上传中…' : '听一下' }}</b>
+                <span>{{ fmtSec(taskRec.seconds) }}</span>
+              </div>
+              <div v-if="taskRec.state === 'recording'" class="trec-wave"><i></i><i></i><i></i><i></i><i></i></div>
+              <audio v-if="taskRec.state === 'preview'" class="trec-audio" :src="taskRec.url" controls preload="auto" />
+              <div v-if="taskRec.state === 'preview'" class="trec-btns">
+                <button class="trec-again" @click="taskRecReset()">🔁 重录</button>
+                <button class="trec-use" @click="confirmTaskRec()">✅ 用这段</button>
+              </div>
+            </div>
             <div v-if="wizard.done[i] && wizard.done[i].length" class="wprev">
               <div v-for="(f, fi) in wizard.done[i]" :key="fi" class="wprev-item">
                 <img v-if="f.type === 'photo'" :src="f.path" @click="previewPhoto(f.path)" />
@@ -1652,7 +1804,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .ui-icon { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .camera-hint { font-size: 11px; color: #88786A; white-space: nowrap; }
 /* 美术分层：庭院在视口外；固定世界内仅基础墙地纹理，装饰独立持久化。 */
-.room { position: fixed; inset: 0; overflow: hidden; color: #5D493B; background: #617a4f; cursor: default; }
+.room { position: fixed; inset: 0; overflow: hidden; color: #5D493B; background: #617a4f; cursor: default; touch-action: manipulation; }
 .scene-viewport { position: absolute; top: clamp(112px, 14vh, 152px); bottom: 132px; left: clamp(68px, 7vw, 132px); right: clamp(344px, 25vw, 420px); max-width: 1280px; max-height: 720px; overflow: hidden; z-index: 1; border: 8px solid #8b6547; border-top-color: #c8a778; border-left-color: #b18b61; border-radius: 6px; background: #dbb27b url('/art/wood-floor.png') center bottom / 1280px 320px repeat; image-rendering: pixelated; box-shadow: 0 0 0 4px #e0d1b4, 0 8px 0 4px #74644d, 0 14px 0 4px rgb(48 58 34 / 35%); touch-action: none; }
 .world { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; background: #e9c891; will-change: transform; }
 .cat-wrap { position: absolute; width: 110px; margin-left: -55px; margin-top: -100px; cursor: pointer; z-index: 5; }
@@ -1854,6 +2006,33 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .wstep-head small { font-size: 11px; color: #88786A; }
 .wstep-head em { font-style: normal; margin-left: auto; color: #719462; font-weight: 700; font-size: 13px; }
 .wstep .pbtn { width: 100%; background: #FFF0D5; color: #805A32; }
+.wstep-row { display: flex; gap: 8px; align-items: stretch; }
+.wstep-row .pbtn { flex: 1 1 auto; min-width: 0; }
+/* 任务录音：点一下开始（红点）→ 再点一下结束（红方块） */
+.trec-btn { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; cursor: pointer; padding: 10px 12px; color: #805A32; background: #FFF0D5; border: 1.5px solid #D8BFA1; border-radius: 12px; box-shadow: 0 3px 8px rgba(103, 75, 47, .08); white-space: nowrap; }
+.trec-btn:active { transform: translateY(1px); box-shadow: none; }
+.trec-btn:disabled { opacity: .45; cursor: default; }
+.trec-btn.on { color: #fff; background: #C4544B; border-color: #A6433B; }
+.trec-icon { width: 12px; height: 12px; border-radius: 50%; background: #D9534A; box-shadow: 0 0 0 2px rgba(217, 83, 74, .18); }
+.trec-icon.stop { border-radius: 3px; background: #fff; box-shadow: none; }
+.trec-btn.on .trec-icon { animation: trecPulse .9s ease-in-out infinite; }
+@keyframes trecPulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+.trec-box { margin-top: 8px; padding: 10px 12px; background: #FFF9EE; border: 1px solid #E4D6C4; border-radius: 10px; }
+.trec-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #70543C; }
+.trec-line b { font-weight: 600; }
+.trec-line span { margin-left: auto; font-variant-numeric: tabular-nums; color: #88786A; }
+.trec-wave { display: flex; align-items: flex-end; gap: 3px; height: 22px; margin-top: 8px; }
+.trec-wave i { width: 4px; height: 6px; background: #C4544B; border-radius: 2px; animation: trecWave .9s ease-in-out infinite; }
+.trec-wave i:nth-child(2) { animation-delay: .12s }
+.trec-wave i:nth-child(3) { animation-delay: .24s }
+.trec-wave i:nth-child(4) { animation-delay: .36s }
+.trec-wave i:nth-child(5) { animation-delay: .48s }
+@keyframes trecWave { 0%, 100% { height: 6px } 50% { height: 20px } }
+.trec-audio { width: 100%; height: 36px; margin-top: 8px; }
+.trec-btns { display: flex; gap: 8px; margin-top: 10px; }
+.trec-again, .trec-use { flex: 1 1 0; font-size: 14px; font-weight: 600; cursor: pointer; padding: 9px 10px; border-radius: 10px; white-space: nowrap; }
+.trec-again { color: #70543C; background: #fff; border: 1.5px solid #D8BFA1; }
+.trec-use { color: #fff; background: #5E8C4A; border: 1.5px solid #4E763D; }
 .wizard-foot { flex-shrink: 0; padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid #E6D8C5; }
 .ok-btn { width: 100%; font-size: 16px; font-weight: 800; color: #fff; background: #8370AF; border: 1.5px solid #706098; border-radius: 12px; padding: 12px; cursor: pointer; }
 .ok-btn:disabled { opacity: .4; cursor: default; }
