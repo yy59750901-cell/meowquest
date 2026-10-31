@@ -15,10 +15,13 @@ type Server struct {
 	DB  *store.DB
 	PIN string // 兼容：默认家庭 PIN（存量）
 	LLM *llm.Client
+	// Review 验收判定专用接入方，未显式配置时回落到 LLM（保持旧行为）。
+	Review llm.Provider
 }
 
 func New(db *store.DB, pin string) *Server {
-	return &Server{DB: db, PIN: pin, LLM: llm.NewFromEnv()}
+	client := llm.NewFromEnv()
+	return &Server{DB: db, PIN: pin, LLM: client, Review: llm.ProviderFromEnv("REVIEW", client.ChatProvider())}
 }
 
 func (s *Server) Router() *gin.Engine {

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -19,18 +18,43 @@ type Client struct {
 	BaseURL string // https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1
 	APIKey  string
 	Model   string
+	// Kind 接入方类型（openai/zhipu），决定请求体差异；空值按 openai 兼容处理。
+	Kind            string
+	MaxTokens       int
+	ReasoningEffort string
+	// 转写与对话分开配置，换接入方时互不影响。
+	ASRBaseURL string
+	ASRAPIKey  string
+	ASRModel   string
 }
 
-// NewFromEnv 从环境变量构建（MEOW_LLM_BASE_URL/KEY/MODEL）
+// NewFromEnv 从环境变量构建（MEOW_LLM_* 与 MEOW_ASR_*）
 func NewFromEnv() *Client {
+	apiKey := os.Getenv("MEOW_LLM_API_KEY")
 	return &Client{
-		BaseURL: envOr("MEOW_LLM_BASE_URL", "https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1"),
-		APIKey:  os.Getenv("MEOW_LLM_API_KEY"),
-		Model:   envOr("MEOW_LLM_MODEL", "qwen3.5-flash"),
+		BaseURL:         envOr("MEOW_LLM_BASE_URL", "https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1"),
+		APIKey:          apiKey,
+		Model:           envOr("MEOW_LLM_MODEL", "qwen3.5-flash"),
+		Kind:            envOr("MEOW_LLM_PROVIDER", KindOpenAI),
+		MaxTokens:       envInt("MEOW_LLM_MAX_TOKENS", 300),
+		ReasoningEffort: os.Getenv("MEOW_LLM_REASONING_EFFORT"),
+		ASRBaseURL:      asrBase(),
+		ASRAPIKey:       envOr("MEOW_ASR_API_KEY", apiKey),
+		ASRModel:        envOr("MEOW_ASR_MODEL", defaultASRModel),
 	}
 }
 
 func (c *Client) Enabled() bool { return c.APIKey != "" }
+
+// ChatProvider 把客户端配置暴露成 Provider，供审核等场景复用同一套协议拼装。
+func (c *Client) ChatProvider() Provider {
+	kind := strings.ToLower(strings.TrimSpace(c.Kind))
+	if kind == "" {
+		kind = KindOpenAI
+	}
+	return Provider{Kind: kind, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.Model,
+		MaxTokens: c.MaxTokens, ReasoningEffort: c.ReasoningEffort}
+}
 
 type Msg struct {
 	Role    string `json:"role"`
@@ -42,14 +66,9 @@ func (c *Client) StreamChat(ctx context.Context, messages []Msg, onDelta func(st
 	if !c.Enabled() {
 		return "", errors.New("LLM 未配置（MEOW_LLM_API_KEY）")
 	}
-	body := map[string]any{
-		"model":    c.Model,
-		"messages": messages,
-		"stream":   true,
-		// qwen3.5 默认带思考链（延迟高、浪费 token），陪聊场景关闭
-		"enable_thinking": false,
-		"max_tokens":      300,
-	}
+	// 请求体按接入方拼装（qwen 关闭思考链降低延迟；智谱强制思考）。
+	body := c.ChatProvider().buildBody(nil, 0, true)
+	body["messages"] = messages
 	b, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/chat/completions", bytes.NewReader(b))
 	if err != nil {
@@ -155,72 +174,19 @@ func (c *Client) ChatOnceVision(ctx context.Context, text, imageURL string) (str
 	return out.Choices[0].Message.Content, nil
 }
 
-// LLMVisionMulti 多图综合判定（qwen 兼容：content 数组多 image_url）
+// legacyVisionMaxTokens 兼容旧调用方的输出预算。
+const legacyVisionMaxTokens = 400
+
+// LLMVisionMulti 多图综合判定：文本 + 逐图（URL 或 base64 均可）。
+// 保留旧签名，内部统一走 Provider，新增调用请直接用 Provider.Complete。
 func LLMVisionMulti(ctx context.Context, baseURL, apiKey, model, text string, imageUrls []string) (string, error) {
-	content := []map[string]any{{"type": "text", "text": text}}
+	p := Provider{Kind: KindOpenAI, BaseURL: baseURL, APIKey: apiKey, Model: model}
+	parts := []Part{TextPart(text)}
 	for _, u := range imageUrls {
-		content = append(content, map[string]any{"type": "image_url", "image_url": map[string]string{"url": u}})
+		parts = append(parts, ImagePart(u))
 	}
-	body := map[string]any{
-		"model":           model,
-		"messages":        []map[string]any{{"role": "user", "content": content}},
-		"enable_thinking": false,
-		"max_tokens":      400,
-	}
-	b, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/chat/completions", bytes.NewReader(b))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var failure struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Error   *struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&failure)
-		code, message := failure.Code, failure.Message
-		if failure.Error != nil {
-			code, message = failure.Error.Code, failure.Error.Message
-		}
-		if apiKey != "" {
-			message = strings.ReplaceAll(message, apiKey, "[redacted]")
-		}
-		if len(message) > 1000 {
-			message = message[:1000]
-		}
-		return "", fmt.Errorf("llm http %d %s: %s", resp.StatusCode, code, message)
-	}
-	var out struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	if out.Error != nil {
-		return "", errors.New(out.Error.Message)
-	}
-	if len(out.Choices) == 0 {
-		return "", errors.New("empty response")
-	}
-	return out.Choices[0].Message.Content, nil
+	out, _, err := p.Complete(ctx, parts, legacyVisionMaxTokens)
+	return out, err
 }
 
 func envOr(k, def string) string {

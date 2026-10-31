@@ -256,7 +256,8 @@ func TestAIAllTwentyPhotosAndFullRecordingCacheSurvivesRetry(t *testing.T) {
 				return
 			}
 			for i, content := range body.Messages[0].Content[1:] {
-				if content.ImageURL.URL != fmt.Sprintf("/uploads/%02d.jpg", i) {
+				// 图片改走 768px 中等尺寸：原图太大，接入方反向下载会超时。
+				if content.ImageURL.URL != reviewImageURL(fmt.Sprintf("/uploads/%02d.jpg", i)) {
 					t.Errorf("图片原顺序丢失: %d %+v", i, content)
 				}
 			}

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -23,11 +24,16 @@ import (
 
 const (
 	thumbnailEdge          = 480
+	reviewImageEdge        = 768
 	thumbnailMaxPixels     = 20_000_000
 	thumbnailMaxSide       = 16384
 	thumbnailMaxBytes      = 20 * 1024 * 1024
 	thumbnailMaxCacheBytes = 1024 * 1024
+	reviewMaxCacheBytes    = 2 * 1024 * 1024
 	thumbnailSuffix        = ".thumb.jpg"
+	reviewImageSuffix      = ".review.jpg"
+	thumbnailQuality       = 82
+	reviewImageQuality     = 85
 	thumbnailCacheHeader   = "public, max-age=31536000, immutable"
 )
 
@@ -36,10 +42,28 @@ var (
 	errThumbnailUnsupported = errors.New("不支持此图片格式（HEIC/WebP 暂不支持），请回退原图或转换为 JPEG/PNG")
 	errThumbnailInvalid     = errors.New("图片损坏或无法解码，请回退原图")
 	errThumbnailTooLarge    = errors.New("图片超过预览大小上限，请回退原图")
+	errThumbnailBadSize     = errors.New("不支持的预览尺寸")
 	// 上传和存量请求共用解码配额，不让展开列表触发多个大图同时解码。
-	thumbnailSlots     = make(chan struct{}, 1)
-	evidenceThumbnails = thumbnailCache{flights: make(map[string]*thumbnailFlight)}
+	thumbnailSlots = make(chan struct{}, 1)
+	// AI 验收一次要取十几张图，给两个配额避免串行拖慢整轮审核。
+	reviewImageSlots     = make(chan struct{}, 2)
+	evidenceThumbnails   = thumbnailCache{flights: make(map[string]*thumbnailFlight), slots: thumbnailSlots}
+	evidenceReviewImages = thumbnailCache{flights: make(map[string]*thumbnailFlight), slots: reviewImageSlots}
+	// 两个尺寸各自独立：缓存文件、单飞表和解码配额都不共享，互不干扰。
+	previewVariant = &thumbnailVariant{edge: thumbnailEdge, suffix: thumbnailSuffix,
+		quality: thumbnailQuality, maxCacheBytes: thumbnailMaxCacheBytes, cache: &evidenceThumbnails}
+	reviewVariant = &thumbnailVariant{edge: reviewImageEdge, suffix: reviewImageSuffix,
+		quality: reviewImageQuality, maxCacheBytes: reviewMaxCacheBytes, cache: &evidenceReviewImages}
 )
+
+// thumbnailVariant 把同一套安全基座复用到不同尺寸，避免每加一档就复制一遍路径校验逻辑。
+type thumbnailVariant struct {
+	edge          int
+	suffix        string
+	quality       int
+	maxCacheBytes int64
+	cache         *thumbnailCache
+}
 
 type thumbnailFlight struct {
 	done chan struct{}
@@ -49,10 +73,32 @@ type thumbnailFlight struct {
 type thumbnailCache struct {
 	mu      sync.Mutex
 	flights map[string]*thumbnailFlight
+	slots   chan struct{}
 }
 
 func thumbnailURL(mediaPath string) string {
 	return "/api/media/thumbnail?path=" + url.QueryEscape(mediaPath)
+}
+
+// reviewImageURL 供 AI 验收使用的中等尺寸图。原图动辄几 MB，接入方反向下载会超时，
+// 而家长预览用的 480px 又可能看不清书页小字，因此单独留一档给模型看。
+func reviewImageURL(mediaPath string) string {
+	return "/api/media/thumbnail?path=" + url.QueryEscape(mediaPath) + "&size=" + strconv.Itoa(reviewImageEdge)
+}
+
+// thumbnailVariantOf 尺寸走白名单，绝不把 query 里的数字当缩放参数用。
+func thumbnailVariantOf(values []string) (*thumbnailVariant, error) {
+	// 与 path 一致：重复参数一律拒绝，避免不同中间件取到不同的值。
+	if len(values) > 1 {
+		return nil, errThumbnailBadSize
+	}
+	if len(values) == 0 || values[0] == "" || values[0] == strconv.Itoa(thumbnailEdge) {
+		return previewVariant, nil
+	}
+	if values[0] == strconv.Itoa(reviewImageEdge) {
+		return reviewVariant, nil
+	}
+	return nil, errThumbnailBadSize
 }
 
 // GET /api/media/thumbnail?path=/uploads/…，沿用公开 uploads 的授权语义。
@@ -61,12 +107,18 @@ func (s *Server) mediaThumbnail(c *gin.Context) {
 }
 
 func serveMediaThumbnail(c *gin.Context, dir string) {
-	values := c.Request.URL.Query()["path"]
+	query := c.Request.URL.Query()
+	values := query["path"]
 	if len(values) != 1 {
 		writeThumbnailError(c, errThumbnailNotFound)
 		return
 	}
-	f, err := evidenceThumbnails.open(c.Request.Context(), dir, values[0])
+	variant, err := thumbnailVariantOf(query["size"])
+	if err != nil {
+		writeThumbnailError(c, err)
+		return
+	}
+	f, err := variant.open(c.Request.Context(), dir, values[0])
 	if err != nil {
 		writeThumbnailError(c, err)
 		return
@@ -93,6 +145,8 @@ func thumbnailErrorResponse(err error) (int, string, string) {
 		return http.StatusUnsupportedMediaType, "thumbnail_invalid_image", errThumbnailInvalid.Error()
 	case errors.Is(err, errThumbnailTooLarge):
 		return http.StatusUnsupportedMediaType, "thumbnail_too_large", errThumbnailTooLarge.Error()
+	case errors.Is(err, errThumbnailBadSize):
+		return http.StatusBadRequest, "thumbnail_bad_size", errThumbnailBadSize.Error()
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return http.StatusRequestTimeout, "thumbnail_timeout", "预览请求已取消或超时，请重试"
 	default:
@@ -119,7 +173,7 @@ func thumbnailRelativePath(mediaPath string) (string, error) {
 			return "", errThumbnailNotFound
 		}
 	}
-	if strings.HasSuffix(strings.ToLower(rel), thumbnailSuffix) {
+	if isThumbnailCacheName(rel) {
 		return "", errThumbnailNotFound
 	}
 	switch strings.ToLower(path.Ext(rel)) {
@@ -131,6 +185,12 @@ func thumbnailRelativePath(mediaPath string) (string, error) {
 }
 
 // 所有读取、临时文件和重命名均基于受限根目录；固定父目录句柄避免检查后被换成链接。
+// isThumbnailCacheName 任一尺寸的缓存文件都不能再作为源图，防止自引用和缓存套缓存。
+func isThumbnailCacheName(rel string) bool {
+	low := strings.ToLower(rel)
+	return strings.HasSuffix(low, thumbnailSuffix) || strings.HasSuffix(low, reviewImageSuffix)
+}
+
 func thumbnailDirectory(dir, rel string) (*os.Root, error) {
 	info, err := os.Lstat(dir)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -190,18 +250,18 @@ func thumbnailOpenRegular(root *os.Root, name string) (*os.File, error) {
 	return f, nil
 }
 
-func openThumbnailCache(root *os.Root, name string) (*os.File, error) {
-	f, err := thumbnailOpenRegular(root, name+thumbnailSuffix)
+func openThumbnailCache(root *os.Root, name string, v *thumbnailVariant) (*os.File, error) {
+	f, err := thumbnailOpenRegular(root, name+v.suffix)
 	if err != nil {
 		return nil, err
 	}
 	info, err := f.Stat()
-	if err != nil || info.Size() < 1 || info.Size() > thumbnailMaxCacheBytes {
+	if err != nil || info.Size() < 1 || info.Size() > v.maxCacheBytes {
 		f.Close()
 		return nil, errThumbnailInvalid
 	}
-	cfg, err := jpeg.DecodeConfig(io.LimitReader(f, thumbnailMaxCacheBytes))
-	if err != nil || cfg.Width < 1 || cfg.Height < 1 || cfg.Width > thumbnailEdge || cfg.Height > thumbnailEdge {
+	cfg, err := jpeg.DecodeConfig(io.LimitReader(f, v.maxCacheBytes))
+	if err != nil || cfg.Width < 1 || cfg.Height < 1 || cfg.Width > v.edge || cfg.Height > v.edge {
 		f.Close()
 		return nil, errThumbnailInvalid
 	}
@@ -212,7 +272,7 @@ func openThumbnailCache(root *os.Root, name string) (*os.File, error) {
 	return f, nil
 }
 
-func (cache *thumbnailCache) open(ctx context.Context, dir, mediaPath string) (*os.File, error) {
+func (v *thumbnailVariant) open(ctx context.Context, dir, mediaPath string) (*os.File, error) {
 	rel, err := thumbnailRelativePath(mediaPath)
 	if err != nil {
 		return nil, err
@@ -228,7 +288,7 @@ func (cache *thumbnailCache) open(ctx context.Context, dir, mediaPath string) (*
 		return nil, errThumbnailNotFound
 	}
 	source.Close()
-	f, err := openThumbnailCache(root, name)
+	f, err := openThumbnailCache(root, name, v)
 	if err == nil || !os.IsNotExist(err) {
 		return f, err
 	}
@@ -236,13 +296,14 @@ func (cache *thumbnailCache) open(ctx context.Context, dir, mediaPath string) (*
 	if err != nil {
 		return nil, err
 	}
-	err = cache.do(ctx, filepath.Join(absDir, filepath.FromSlash(rel)), func() error {
-		return generateThumbnail(root, name)
+	// 同一张图的不同尺寸互不命中，key 必须带上尺寸后缀。
+	err = v.cache.do(ctx, filepath.Join(absDir, filepath.FromSlash(rel))+v.suffix, func() error {
+		return generateVariant(root, name, v)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return openThumbnailCache(root, name)
+	return openThumbnailCache(root, name, v)
 }
 
 func (cache *thumbnailCache) do(ctx context.Context, key string, generate func() error) error {
@@ -263,13 +324,13 @@ func (cache *thumbnailCache) do(ctx context.Context, key string, generate func()
 	select {
 	case <-ctx.Done():
 		call.err = ctx.Err()
-	case thumbnailSlots <- struct{}{}:
+	case cache.slots <- struct{}{}:
 		if err := ctx.Err(); err != nil {
 			call.err = err
 		} else {
 			call.err = generate()
 		}
-		<-thumbnailSlots
+		<-cache.slots
 	}
 	cache.mu.Lock()
 	delete(cache.flights, key)
@@ -279,8 +340,12 @@ func (cache *thumbnailCache) do(ctx context.Context, key string, generate func()
 }
 
 func generateThumbnail(root *os.Root, name string) error {
+	return generateVariant(root, name, previewVariant)
+}
+
+func generateVariant(root *os.Root, name string, v *thumbnailVariant) error {
 	// 请求可能在首个生成完成后才取得锁，此处再次检查，避免重复解码和重写。
-	if f, err := openThumbnailCache(root, name); err == nil {
+	if f, err := openThumbnailCache(root, name, v); err == nil {
 		f.Close()
 		return nil
 	} else if !os.IsNotExist(err) {
@@ -322,14 +387,14 @@ func generateThumbnail(root *os.Root, name string) error {
 	if bounds.Dx() < 1 || bounds.Dy() < 1 || bounds.Dx() > cfg.Width || bounds.Dy() > cfg.Height {
 		return errThumbnailInvalid
 	}
-	preview := resizeThumbnail(original)
-	tmpName := "." + name + ".thumb-" + rand.Text() + ".tmp"
+	preview := resizeToEdge(original, v.edge)
+	tmpName := "." + name + v.suffix + "-" + rand.Text() + ".tmp"
 	tmp, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
 	defer root.Remove(tmpName)
-	if err := jpeg.Encode(tmp, preview, &jpeg.Options{Quality: 82}); err != nil {
+	if err := jpeg.Encode(tmp, preview, &jpeg.Options{Quality: v.quality}); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -340,19 +405,23 @@ func generateThumbnail(root *os.Root, name string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return root.Rename(tmpName, name+thumbnailSuffix)
+	return root.Rename(tmpName, name+v.suffix)
+}
+
+func resizeThumbnail(src image.Image) *image.RGBA {
+	return resizeToEdge(src, thumbnailEdge)
 }
 
 // 整数盒式采样保留比例、不放大小图，透明像素合成到白底；只额外分配预览大小的内存。
-func resizeThumbnail(src image.Image) *image.RGBA {
+func resizeToEdge(src image.Image, edge int) *image.RGBA {
 	bounds := src.Bounds()
 	sw, sh := bounds.Dx(), bounds.Dy()
 	w, h := sw, sh
-	if sw > thumbnailEdge || sh > thumbnailEdge {
+	if sw > edge || sh > edge {
 		if sw >= sh {
-			w, h = thumbnailEdge, max(1, (sh*thumbnailEdge+sw/2)/sw)
+			w, h = edge, max(1, (sh*edge+sw/2)/sw)
 		} else {
-			w, h = max(1, (sw*thumbnailEdge+sh/2)/sh), thumbnailEdge
+			w, h = max(1, (sw*edge+sh/2)/sh), edge
 		}
 	}
 	dst := image.NewRGBA(image.Rect(0, 0, w, h))

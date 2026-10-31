@@ -28,8 +28,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func thumbnailTestCache() *thumbnailCache {
-	return &thumbnailCache{flights: make(map[string]*thumbnailFlight)}
+// thumbnailTestCache 每个用例独立一套单飞表和解码配额，避免并发用例互相等待。
+func thumbnailTestCache() *thumbnailVariant {
+	return &thumbnailVariant{edge: thumbnailEdge, suffix: thumbnailSuffix, quality: thumbnailQuality,
+		maxCacheBytes: thumbnailMaxCacheBytes,
+		cache:         &thumbnailCache{flights: make(map[string]*thumbnailFlight), slots: thumbnailSlots}}
 }
 
 func thumbnailTestImage(t *testing.T, format string, w, h int) []byte {
@@ -303,7 +306,7 @@ func TestThumbnailSingleFlightAndGlobalLimit(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		ctx := &thumbnailObservedContext{Context: context.Background(), ready: make(chan struct{})}
 		go func() {
-			results <- cache.do(ctx, "same-original", func() error {
+			results <- cache.cache.do(ctx, "same-original", func() error {
 				generated.Add(1)
 				return nil
 			})
@@ -316,7 +319,7 @@ func TestThumbnailSingleFlightAndGlobalLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if generated.Load() != 1 || len(cache.flights) != 0 {
+	if generated.Load() != 1 || len(cache.cache.flights) != 0 {
 		t.Fatalf("未去重或未释放锁：生成 %d 次", generated.Load())
 	}
 	var active, peak atomic.Int32
@@ -328,7 +331,7 @@ func TestThumbnailSingleFlightAndGlobalLimit(t *testing.T) {
 		ctx := &thumbnailObservedContext{Context: context.Background(), ready: make(chan struct{})}
 		go func(i int) {
 			// 不同缓存实例也必须共用全局配额。
-			results <- thumbnailTestCache().do(ctx, fmt.Sprint(i), func() error {
+			results <- thumbnailTestCache().cache.do(ctx, fmt.Sprint(i), func() error {
 				n := active.Add(1)
 				for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
 				}
@@ -359,7 +362,7 @@ func TestThumbnailCanceledWaiterAndRetry(t *testing.T) {
 	cache := thumbnailTestCache()
 	started, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
-		done <- cache.do(context.Background(), "a", func() error {
+		done <- cache.cache.do(context.Background(), "a", func() error {
 			close(started)
 			<-release
 			return errThumbnailInvalid
@@ -368,14 +371,14 @@ func TestThumbnailCanceledWaiterAndRetry(t *testing.T) {
 	thumbnailWait(t, started)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := cache.do(ctx, "a", func() error { t.Error("取消的等待者执行了生成"); return nil }); !errors.Is(err, context.Canceled) {
+	if err := cache.cache.do(ctx, "a", func() error { t.Error("取消的等待者执行了生成"); return nil }); !errors.Is(err, context.Canceled) {
 		t.Fatalf("等待者无法取消：%v", err)
 	}
 	close(release)
 	if err := <-done; !errors.Is(err, errThumbnailInvalid) {
 		t.Fatal(err)
 	}
-	if err := cache.do(context.Background(), "a", func() error { return nil }); err != nil {
+	if err := cache.cache.do(context.Background(), "a", func() error { return nil }); err != nil {
 		t.Fatalf("失败后不能重试：%v", err)
 	}
 }

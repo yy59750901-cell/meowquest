@@ -53,7 +53,7 @@ func (s *Server) uploadEvidenceTo(c *gin.Context, baseDir string) {
 	// 原图已保存，预览失败只返回提示，不改变上传成功或原图路径。
 	switch ext {
 	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic":
-		if preview, err := evidenceThumbnails.open(c.Request.Context(), baseDir, rel); err == nil {
+		if preview, err := previewVariant.open(c.Request.Context(), baseDir, rel); err == nil {
 			preview.Close()
 			result["thumb_url"] = thumbnailURL(rel)
 		} else {

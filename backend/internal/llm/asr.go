@@ -14,12 +14,30 @@ import (
 	"time"
 )
 
+// defaultASRModel 非实时整段音频转写模型。
+const defaultASRModel = "qwen-audio-3.0-asr-flash-filetrans"
+
 // asrBase filetrans 系列走原生 /api/v1。
 func asrBase() string {
 	if v := os.Getenv("MEOW_ASR_BASE_URL"); v != "" {
 		return v
 	}
 	return "https://cn-beijing.maas.qianwenaiapi.com/api/v1"
+}
+
+// asrConfig 转写单独取配置，未显式配置时回落到对话侧，保持旧行为。
+func (c *Client) asrConfig() (baseURL, apiKey, model string) {
+	baseURL, apiKey, model = c.ASRBaseURL, c.ASRAPIKey, c.ASRModel
+	if baseURL == "" {
+		baseURL = asrBase()
+	}
+	if apiKey == "" {
+		apiKey = c.APIKey
+	}
+	if model == "" {
+		model = defaultASRModel
+	}
+	return baseURL, apiKey, model
 }
 
 // TranscriptionState 可持久化的上游任务与结果，避免网络失败或重启后重复提交。
@@ -53,16 +71,17 @@ func (c *Client) TranscribeCached(ctx context.Context, audioURL string, state *T
 		*state = TranscriptionState{}
 	}
 	if state.TaskID == "" {
+		asrURL, asrKey, asrModel := c.asrConfig()
 		body, _ := json.Marshal(map[string]any{
-			"model": "qwen-audio-3.0-asr-flash-filetrans",
+			"model": asrModel,
 			"input": map[string]any{"file_urls": []string{audioURL}},
 		})
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, asrBase()+"/services/audio/asr/transcription", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, asrURL+"/services/audio/asr/transcription", bytes.NewReader(body))
 		if err != nil {
 			return "", err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+		req.Header.Set("Authorization", "Bearer "+asrKey)
 		req.Header.Set("X-DashScope-Async", "enable")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -97,11 +116,12 @@ func (c *Client) TranscribeCached(ctx context.Context, audioURL string, state *T
 				return "", ctx.Err()
 			case <-ticker.C:
 			}
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, asrBase()+"/tasks/"+url.PathEscape(state.TaskID), nil)
+			asrURL, asrKey, _ := c.asrConfig()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, asrURL+"/tasks/"+url.PathEscape(state.TaskID), nil)
 			if err != nil {
 				return "", err
 			}
-			req.Header.Set("Authorization", "Bearer "+c.APIKey)
+			req.Header.Set("Authorization", "Bearer "+asrKey)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				if ctx.Err() != nil {
