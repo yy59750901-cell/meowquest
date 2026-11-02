@@ -264,7 +264,7 @@ func (s *Server) buyItem(c *gin.Context) {
 	}
 	// 事务：扣星 + 入货原子（失败整体回滚，杜绝扣钱不给货）
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
-		res := tx.Model(&store.Pet{}).Where("balance>=?", price).
+		res := tx.Model(&store.Pet{}).Where("kid_id=? AND balance>=?", kidOf(c), price).
 			Update("balance", gorm.Expr("balance-?", price))
 		if res.Error != nil {
 			return res.Error

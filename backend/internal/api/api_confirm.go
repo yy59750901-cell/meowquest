@@ -40,9 +40,26 @@ func (s *Server) submitTask(c *gin.Context) {
 	}
 	status := http.StatusInternalServerError
 	var result gin.H
-	// 行锁覆盖校验、流水和状态转换，编辑不能刷新正在提交的快照。
-	err := s.DB.Transaction(func(tx *gorm.DB) error {
+	// 孩子锁先于实例锁，覆盖校验、流水与状态转换。
+	err := s.DB.TaskTransaction(func(tx *gorm.DB) error {
 		db := &store.DB{DB: tx}
+		var identity store.DailyTask
+		if err := tx.Where("id=? AND kid_id=?", id, kidOf(c)).First(&identity).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				status = http.StatusNotFound
+			}
+			return err
+		}
+		if err := engine.LockKid(db, identity.KidID); err != nil {
+			return err
+		}
+		now, err := engine.LockedNow(db, identity.KidID, s.now)
+		if err != nil {
+			return err
+		}
+		if err := engine.EnsureStreakBaseline(db, identity.KidID, now); err != nil {
+			return err
+		}
 		var dt store.DailyTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id=? AND kid_id=?", id, kidOf(c)).First(&dt).Error; err != nil {
@@ -51,9 +68,24 @@ func (s *Server) submitTask(c *gin.Context) {
 			}
 			return err
 		}
+		if !engine.SubmissionOpen(dt.Date, now) {
+			status = http.StatusBadRequest
+			return fmt.Errorf("已超过任务日提交截止")
+		}
 		if dt.Status != "pending" {
 			status = http.StatusBadRequest
 			return fmt.Errorf("task status %s", dt.Status)
+		}
+		var leave int64
+		if err := tx.Model(&store.LeaveRecord{}).Where("kid_id=? AND date=?", dt.KidID, dt.Date).Count(&leave).Error; err != nil {
+			return err
+		}
+		if leave > 0 {
+			status = http.StatusBadRequest
+			return fmt.Errorf("该任务日已整日请假，不能提交")
+		}
+		if err := engine.FreezeRewardSnapshot(db, &dt); err != nil {
+			return err
 		}
 		var snap engine.Snapshot
 		if err := json.Unmarshal([]byte(dt.Snapshot), &snap); err != nil {
@@ -75,7 +107,7 @@ func (s *Server) submitTask(c *gin.Context) {
 		if req.DurationSec > duration {
 			duration = req.DurationSec
 		}
-		comp := store.TaskCompletion{DailyTaskID: dt.ID, KidID: dt.KidID, Evidence: ev, DurationSec: duration}
+		comp := store.TaskCompletion{DailyTaskID: dt.ID, KidID: dt.KidID, Evidence: ev, DurationSec: duration, ExtraSec: req.ExtraSec, SubmittedAt: now}
 		if err := tx.Create(&comp).Error; err != nil {
 			return err
 		}
@@ -89,26 +121,20 @@ func (s *Server) submitTask(c *gin.Context) {
 		}
 		// 无论新提交的确认模式是否仍为 AI，都取消旧提交尚未完成的审核。
 		if err := tx.Model(&store.AIReviewJob{}).Where("daily_task_id=? AND status IN ('queued','running')", dt.ID).
-			Updates(map[string]any{"status": "canceled", "stage": "canceled", "finished_at": time.Now(), "lease_token": "", "lease_expires_at": nil}).Error; err != nil {
+			Updates(map[string]any{"status": "canceled", "stage": "canceled", "finished_at": now, "lease_token": "", "lease_expires_at": nil}).Error; err != nil {
 			return err
 		}
 		if confirmModeContains(mode, 'a') {
-			extraBase := 0
-			if snap.ExtraMinutes > 0 && req.ExtraSec >= snap.ExtraMinutes*60 {
-				extraBase = req.ExtraSec / (snap.ExtraMinutes * 60) * snap.ExtraStars
-				if snap.ExtraCap > 0 && extraBase > snap.ExtraCap {
-					extraBase = snap.ExtraCap
-				}
-			}
-			now := time.Now()
+			extraBase := engine.ExtraReward(snap, comp.ExtraSec)
 			if err := tx.Model(&store.TaskCompletion{}).Where("id=?", comp.ID).
 				Updates(map[string]any{"confirm_status": "auto", "confirmed_at": &now}).Error; err != nil {
 				return err
 			}
-			if err := engine.Settle(db, dt.ID, extraBase); err != nil {
+			settled, err := engine.SettleWithClock(db, dt.ID, extraBase, s.now)
+			if err != nil {
 				return err
 			}
-			result = gin.H{"settled": true}
+			result = gin.H{"settled": settled, "settlement_pending": !settled}
 			return nil
 		}
 		if confirmModeContains(mode, 'b') {
@@ -129,6 +155,10 @@ func (s *Server) submitTask(c *gin.Context) {
 	if err != nil {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
+	}
+	if _, ok := result["settled"]; !ok {
+		result["settled"] = false
+		result["settlement_pending"] = false
 	}
 	c.JSON(http.StatusOK, result)
 }
@@ -156,26 +186,29 @@ func atoi64(s string) int64 {
 // ===== 家长端：确认队列 =====
 
 type confirmItem struct {
-	ID            int64         `gorm:"column:id" json:"id"` // 兼容旧前端：daily_task_id
-	DailyTaskID   int64         `gorm:"column:daily_task_id" json:"daily_task_id"`
-	CompletionID  int64         `gorm:"column:completion_id" json:"completion_id"`
-	KidName       string        `gorm:"column:kid_name" json:"kid_name"`
-	Date          string        `gorm:"column:date" json:"date"`
-	Snapshot      string        `gorm:"column:snapshot" json:"snapshot"`
-	Duration      int           `gorm:"column:duration_sec" json:"duration_sec"`
-	ReviewResult  string        `gorm:"column:review_result" json:"review_result"`
-	Evidence      string        `gorm:"column:evidence" json:"evidence"`
-	SubmittedAt   time.Time     `gorm:"column:submitted_at" json:"submitted_at"`
-	ConfirmStatus string        `gorm:"column:confirm_status" json:"confirm_status"`
-	ConfirmedAt   *time.Time    `gorm:"column:confirmed_at" json:"confirmed_at"`
-	RejectReason  string        `gorm:"column:reject_reason" json:"reject_reason"`
-	AIReview      *aiReviewView `gorm:"-" json:"ai_review"`
+	ID                 int64         `gorm:"column:id" json:"id"` // 兼容旧前端：daily_task_id
+	DailyTaskID        int64         `gorm:"column:daily_task_id" json:"daily_task_id"`
+	CompletionID       int64         `gorm:"column:completion_id" json:"completion_id"`
+	KidName            string        `gorm:"column:kid_name" json:"kid_name"`
+	Date               string        `gorm:"column:date" json:"date"`
+	Snapshot           string        `gorm:"column:snapshot" json:"snapshot"`
+	Duration           int           `gorm:"column:duration_sec" json:"duration_sec"`
+	ReviewResult       string        `gorm:"column:review_result" json:"review_result"`
+	Evidence           string        `gorm:"column:evidence" json:"evidence"`
+	SubmittedAt        time.Time     `gorm:"column:submitted_at" json:"submitted_at"`
+	ConfirmStatus      string        `gorm:"column:confirm_status" json:"confirm_status"`
+	ConfirmedAt        *time.Time    `gorm:"column:confirmed_at" json:"confirmed_at"`
+	RejectReason       string        `gorm:"column:reject_reason" json:"reject_reason"`
+	AIReview           *aiReviewView `gorm:"-" json:"ai_review"`
+	SettlementStatus   string        `json:"settlement_status"`
+	SettlementWaitDate string        `json:"settlement_wait_date"`
 }
 
 const confirmSelect = `SELECT d.id, d.id AS daily_task_id, p.id AS completion_id,
 	COALESCE(k.name,'') AS kid_name, d.date, COALESCE(j.snapshot,d.snapshot) AS snapshot,
 	p.duration_sec, COALESCE(p.review_result,'') AS review_result, p.evidence, p.submitted_at,
-	p.confirm_status, p.confirmed_at, COALESCE(p.reject_reason,'') AS reject_reason
+	p.confirm_status, p.confirmed_at, COALESCE(p.reject_reason,'') AS reject_reason,
+	COALESCE(d.settlement_status,'') AS settlement_status, COALESCE(d.settlement_wait_date,'') AS settlement_wait_date
 	FROM task_completion p JOIN daily_task d ON d.id=p.daily_task_id
 	JOIN kid k ON k.id=d.kid_id LEFT JOIN ai_review_job j ON j.completion_id=p.id `
 
@@ -215,8 +248,26 @@ func (s *Server) confirmTask(c *gin.Context) {
 		return
 	}
 	status := http.StatusInternalServerError
-	err := s.DB.Transaction(func(tx *gorm.DB) error {
+	settled := false
+	err := s.DB.TaskTransaction(func(tx *gorm.DB) error {
 		db := &store.DB{DB: tx}
+		var identity store.DailyTask
+		if err := tx.Where("id=? AND kid_id IN (SELECT id FROM kid WHERE family_id=?)", id, famOf(c)).First(&identity).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				status = http.StatusNotFound
+			}
+			return err
+		}
+		if err := engine.LockKid(db, identity.KidID); err != nil {
+			return err
+		}
+		now, err := engine.LockedNow(db, identity.KidID, s.now)
+		if err != nil {
+			return err
+		}
+		if err := engine.EnsureStreakBaseline(db, identity.KidID, now); err != nil {
+			return err
+		}
 		var dt store.DailyTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id=? AND kid_id IN (SELECT id FROM kid WHERE family_id=?)", id, famOf(c)).First(&dt).Error; err != nil {
@@ -224,6 +275,10 @@ func (s *Server) confirmTask(c *gin.Context) {
 				status = http.StatusNotFound
 			}
 			return err
+		}
+		if !engine.ReviewOpen(dt.Date, now) {
+			status = http.StatusBadRequest
+			return fmt.Errorf("已超过任务日审核截止")
 		}
 		if dt.Status != "submitted" {
 			status = http.StatusBadRequest
@@ -262,7 +317,6 @@ func (s *Server) confirmTask(c *gin.Context) {
 					return err
 				}
 				job.Status, job.Stage = "canceled", "canceled"
-				now := time.Now()
 				job.FinishedAt = &now
 				if err := tx.Create(&job).Error; err != nil {
 					return err
@@ -272,7 +326,6 @@ func (s *Server) confirmTask(c *gin.Context) {
 		if err := cancelReviewJob(tx, latest.ID); err != nil {
 			return err
 		}
-		now := time.Now()
 		confirmStatus := "rejected"
 		if req.Approve {
 			confirmStatus = "approved"
@@ -296,22 +349,34 @@ func (s *Server) confirmTask(c *gin.Context) {
 			return err
 		}
 		if req.Approve {
-			return engine.Settle(db, dt.ID, 0)
-		}
-		if err := tx.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "pending").Error; err != nil {
+			var snap engine.Snapshot
+			if err := json.Unmarshal([]byte(dt.Snapshot), &snap); err != nil {
+				return err
+			}
+			var err error
+			settled, err = engine.SettleWithClock(db, dt.ID, engine.ExtraReward(snap, latest.ExtraSec), s.now)
 			return err
 		}
-		db.AddEvent(dt.KidID, "task_rejected", map[string]any{"task_id": dt.ID, "reason": req.Reason})
-		return nil
+		nextStatus := "pending"
+		if !engine.SubmissionOpen(dt.Date, now) {
+			nextStatus = "rejected"
+		}
+		if err := tx.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", nextStatus).Error; err != nil {
+			return err
+		}
+		if err := db.AddEvent(dt.KidID, "task_rejected", map[string]any{"task_id": dt.ID, "reason": req.Reason}); err != nil {
+			return err
+		}
+		return engine.ReconcileKidLocked(db, dt.KidID, now)
 	})
 	if err != nil {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	if req.Approve {
-		c.JSON(http.StatusOK, gin.H{"settled": true})
+		c.JSON(http.StatusOK, gin.H{"settled": settled, "settlement_pending": !settled})
 	} else {
-		c.JSON(http.StatusOK, gin.H{"rejected": true})
+		c.JSON(http.StatusOK, gin.H{"rejected": true, "settled": false, "settlement_pending": false})
 	}
 }
 
@@ -343,8 +408,17 @@ type ledgerItem struct {
 
 // GET /api/admin/ledger/:kid_id 单孩子流水
 func (s *Server) ledgerKid(c *gin.Context) {
+	var kid store.Kid
+	if err := s.DB.Where("id=? AND family_id=?", c.Param("kid_id"), famOf(c)).First(&kid).Error; err != nil {
+		status := http.StatusInternalServerError
+		if err == gorm.ErrRecordNotFound {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": "孩子不存在或无访问权限"})
+		return
+	}
 	var items []store.SettlementLedger
-	if err := s.DB.Where("kid_id=?", c.Param("kid_id")).Order("id DESC").Limit(50).Find(&items).Error; err != nil {
+	if err := s.DB.Where("kid_id=? AND kid_id IN (SELECT id FROM kid WHERE family_id=?)", kid.ID, famOf(c)).Order("id DESC").Limit(50).Find(&items).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

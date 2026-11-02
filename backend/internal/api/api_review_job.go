@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"meowquest/backend/internal/engine"
 	"meowquest/backend/internal/llm"
 	"meowquest/backend/internal/store"
 )
@@ -65,7 +66,7 @@ func (s *Server) recoverReviewLeases() error {
 
 func (s *Server) claimReviewJob(timeout time.Duration) (*store.AIReviewJob, error) {
 	var job store.AIReviewJob
-	err := s.DB.Transaction(func(tx *gorm.DB) error {
+	err := s.DB.TaskTransaction(func(tx *gorm.DB) error {
 		res := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("status='queued'").Order("id").Limit(1).Find(&job)
 		if res.Error != nil {
@@ -127,6 +128,7 @@ func (s *Server) executeReviewJob(parent context.Context, job store.AIReviewJob,
 	var eligible int64
 	if err := s.DB.Table("daily_task d").Joins("JOIN task_completion p ON p.daily_task_id=d.id").
 		Where("d.id=? AND p.id=? AND d.status='submitted' AND p.confirm_status='pending'", job.DailyTaskID, job.CompletionID).
+		Where("d.date>? AND d.date<=?", engine.BusinessDate(s.now().In(engine.BusinessLocation).AddDate(0, 0, -2)), engine.BusinessDate(s.now())).
 		Where("NOT EXISTS (SELECT 1 FROM task_completion newer WHERE newer.daily_task_id=d.id AND newer.id>p.id)").Count(&eligible).Error; err != nil {
 		return s.finishReviewJob(job, reviewVerdict{}, err)
 	}
@@ -164,9 +166,24 @@ func (s *Server) executeReviewJob(parent context.Context, job store.AIReviewJob,
 	return s.finishReviewJob(job, v, err)
 }
 
-// finishReviewJob 锁顺序统一为 daily_task → job，CAS 拒绝旧 attempt 和人审后的晚到结果。
+// finishReviewJob 先孩子锁再实例/审核锁，CAS 拒绝旧 attempt 和人审后的晚到结果。
 func (s *Server) finishReviewJob(job store.AIReviewJob, verdict reviewVerdict, reviewErr error) error {
-	return s.DB.Transaction(func(tx *gorm.DB) error {
+	return s.DB.TaskTransaction(func(tx *gorm.DB) error {
+		db := &store.DB{DB: tx}
+		var identity store.DailyTask
+		if err := tx.First(&identity, job.DailyTaskID).Error; err != nil {
+			return err
+		}
+		if err := engine.LockKid(db, identity.KidID); err != nil {
+			return err
+		}
+		now, err := engine.LockedNow(db, identity.KidID, s.now)
+		if err != nil {
+			return err
+		}
+		if err := engine.EnsureStreakBaseline(db, identity.KidID, now); err != nil {
+			return err
+		}
 		var dt store.DailyTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&dt, job.DailyTaskID).Error; err != nil {
 			return err
@@ -179,11 +196,13 @@ func (s *Server) finishReviewJob(job store.AIReviewJob, verdict reviewVerdict, r
 			current.LeaseExpiresAt == nil || !current.LeaseExpiresAt.After(time.Now()) {
 			return errReviewLeaseLost
 		}
+		if !engine.ReviewOpen(dt.Date, now) && dt.Status == "submitted" {
+			return engine.ReconcileKidLocked(db, dt.KidID, now)
+		}
 		var latest store.TaskCompletion
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("daily_task_id=?", dt.ID).Order("id DESC").First(&latest).Error; err != nil {
 			return err
 		}
-		now := time.Now()
 		cols := map[string]any{"lease_token": "", "lease_expires_at": nil, "finished_at": now}
 		if latest.ID != job.CompletionID || latest.ConfirmStatus != "pending" || dt.Status != "submitted" {
 			cols["status"], cols["stage"] = "canceled", "canceled"
@@ -198,7 +217,11 @@ func (s *Server) finishReviewJob(job store.AIReviewJob, verdict reviewVerdict, r
 			compCols := map[string]any{"review_result": string(b)}
 			if !verdict.Pass {
 				compCols["confirm_status"], compCols["confirmed_at"], compCols["reject_reason"] = "rejected", now, "AI："+verdict.Reason
-				if err := tx.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", "pending").Error; err != nil {
+				nextStatus := "pending"
+				if !engine.SubmissionOpen(dt.Date, now) {
+					nextStatus = "rejected"
+				}
+				if err := tx.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("status", nextStatus).Error; err != nil {
 					return err
 				}
 			}
@@ -221,7 +244,7 @@ func (s *Server) finishReviewJob(job store.AIReviewJob, verdict reviewVerdict, r
 		if res.RowsAffected != 1 {
 			return errReviewLeaseLost
 		}
-		return nil
+		return engine.ReconcileKidLocked(db, dt.KidID, now)
 	})
 }
 

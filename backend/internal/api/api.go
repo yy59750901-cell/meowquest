@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"meowquest/backend/internal/engine"
 	"meowquest/backend/internal/llm"
 	"meowquest/backend/internal/store"
 	"meowquest/backend/internal/web"
@@ -17,6 +18,7 @@ type Server struct {
 	LLM *llm.Client
 	// Review 验收判定专用接入方，未显式配置时回落到 LLM（保持旧行为）。
 	Review llm.Provider
+	Now    func() time.Time
 }
 
 func New(db *store.DB, pin string) *Server {
@@ -133,6 +135,13 @@ func (s *Server) admin(c *gin.Context) {
 	}
 	c.Set("familyID", fid)
 	c.Next()
+}
+
+func (s *Server) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
 }
 
 func kidOf(c *gin.Context) int64 { return c.GetInt64("kidID") }
@@ -314,6 +323,14 @@ func (s *Server) adopt(c *gin.Context) {
 // ===== 宠物（per-kid） =====
 
 func (s *Server) pet(c *gin.Context) {
+	if kidOf(c) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no pet"})
+		return
+	}
+	if err := engine.ReconcileKidWithClock(s.DB, kidOf(c), s.now); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	p, err := s.DB.GetPet(kidOf(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -325,7 +342,16 @@ func (s *Server) pet(c *gin.Context) {
 	}
 	var kid store.Kid
 	s.DB.First(&kid, p.KidID)
-	c.JSON(http.StatusOK, gin.H{"pet": p, "kid": kid})
+	var pending, days int64
+	if err := s.DB.Model(&store.DailyTask{}).Where("kid_id=? AND status='approved' AND settlement_status='pending'", p.KidID).Count(&pending).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := s.DB.Model(&store.KidStreakDay{}).Where("kid_id=? AND streak_after IS NULL", p.KidID).Count(&days).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"pet": p, "kid": kid, "streak_pending": days > 0, "pending_reward_count": int(pending)})
 }
 
 func (s *Server) feed(c *gin.Context) {

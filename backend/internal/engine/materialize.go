@@ -9,49 +9,68 @@ import (
 
 	"meowquest/backend/internal/store"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 // Snapshot 物化时的模板快照（结算可追溯，改历史规则不影响已生成任务）
 type Snapshot struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	Icon          string `json:"icon"`
-	Category      string `json:"category"`
-	GoalType      string `json:"goal_type"`
-	GoalValue     int    `json:"goal_value"`
-	EvidenceType  string `json:"evidence_type"`
-	ConfirmMode   string `json:"confirm_mode"`
-	BaseScore     int    `json:"base_score"`
-	ExtraMinutes  int    `json:"extra_minutes"`
-	ExtraStars    int    `json:"extra_stars"`
-	ExtraCap      int    `json:"extra_cap"`
-	DateMode      string `json:"date_mode"`
-	Weekdays      string `json:"weekdays"`
-	WeeklyQuota   int    `json:"weekly_quota"`
-	EvidenceSteps string `json:"evidence_steps"` // JSON [{kind,label,required}]（旧单证据自动归一）
-	AnalysisMode  string `json:"analysis_mode"`  // judge / score
-	ReviewPrompt  string `json:"review_prompt"`
+	StreakEnabled  *int    `json:"streak_enabled"`
+	DateMultiplier float64 `json:"date_multiplier"`
+	ID             int64   `json:"id"`
+	Name           string  `json:"name"`
+	Icon           string  `json:"icon"`
+	Category       string  `json:"category"`
+	GoalType       string  `json:"goal_type"`
+	GoalValue      int     `json:"goal_value"`
+	EvidenceType   string  `json:"evidence_type"`
+	ConfirmMode    string  `json:"confirm_mode"`
+	BaseScore      int     `json:"base_score"`
+	ExtraMinutes   int     `json:"extra_minutes"`
+	ExtraStars     int     `json:"extra_stars"`
+	ExtraCap       int     `json:"extra_cap"`
+	DateMode       string  `json:"date_mode"`
+	Weekdays       string  `json:"weekdays"`
+	WeeklyQuota    int     `json:"weekly_quota"`
+	EvidenceSteps  string  `json:"evidence_steps"` // JSON [{kind,label,required}]（旧单证据自动归一）
+	AnalysisMode   string  `json:"analysis_mode"`  // judge / score
+	ReviewPrompt   string  `json:"review_prompt"`
 }
 
 // Materialize 物化指定日期（遍历所有孩子：模板×指派 → daily_task(kid_id)）
 // 幂等：UNIQUE(date, kid_id, template_id)
 func Materialize(db *store.DB, date time.Time) error {
-	dateStr := date.Format("2006-01-02")
-	weekday := int(date.Weekday())
-	if weekday == 0 {
-		weekday = 7
-	}
-	monday := date.AddDate(0, 0, -(weekday - 1))
-	weekStart := monday.Format("2006-01-02")
-	weekEnd := monday.AddDate(0, 0, 7).Format("2006-01-02")
+	// 显式日期允许预生成未来任务，不推进业务评估时钟。
+	return materializeWithDate(db, func(*store.DB, int64) (time.Time, error) { return date, nil })
+}
 
+func MaterializeCurrent(db *store.DB, clock func() time.Time) error {
+	return materializeWithDate(db, func(child *store.DB, kidID int64) (time.Time, error) { return LockedNow(child, kidID, clock) })
+}
+
+func materializeWithDate(db *store.DB, resolve func(*store.DB, int64) (time.Time, error)) error {
 	var kids []store.Kid
 	if err := db.Find(&kids).Error; err != nil {
 		return err
 	}
 	for _, kid := range kids {
-		if err := materializeKid(db, kid, dateStr, weekday, weekStart, weekEnd); err != nil {
+		if err := db.TaskTransaction(func(tx *gorm.DB) error {
+			child := &store.DB{DB: tx}
+			if err := LockKid(child, kid.ID); err != nil {
+				return err
+			}
+			date, err := resolve(child, kid.ID)
+			if err != nil {
+				return err
+			}
+			date = date.In(BusinessLocation)
+			weekday := int(date.Weekday())
+			if weekday == 0 {
+				weekday = 7
+			}
+			monday := date.AddDate(0, 0, -(weekday - 1))
+			return materializeKid(child, kid, BusinessDate(date), weekday, BusinessDate(monday), BusinessDate(monday.AddDate(0, 0, 7)))
+		}); err != nil {
 			return fmt.Errorf("kid %d: %w", kid.ID, err)
 		}
 	}
@@ -61,7 +80,9 @@ func Materialize(db *store.DB, date time.Time) error {
 func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, weekStart, weekEnd string) error {
 	// 该孩子当日请假
 	var leaveCount int64
-	db.Model(&store.LeaveRecord{}).Where("date=? AND kid_id=?", dateStr, kid.ID).Count(&leaveCount)
+	if err := db.Model(&store.LeaveRecord{}).Where("date=? AND kid_id=?", dateStr, kid.ID).Count(&leaveCount).Error; err != nil {
+		return err
+	}
 	isLeave := leaveCount > 0
 
 	templates, err := db.TemplatesOfKid(kid.ID)
@@ -69,6 +90,10 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 		return err
 	}
 	for _, t := range templates {
+		// 补跑不能把切换后新建的模板反向物化到它尚不存在的业务日。
+		if !t.CreatedAt.IsZero() && dateStr < BusinessDate(t.CreatedAt) {
+			continue
+		}
 		sch := t.Schedule
 		if sch == nil {
 			continue
@@ -83,9 +108,11 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 		switch sch.DateMode {
 		case "weekly_quota":
 			var done int64
-			db.Model(&store.DailyTask{}).
+			if err := db.Model(&store.DailyTask{}).
 				Where("kid_id=? AND template_id=? AND date>=? AND date<? AND status='approved'",
-					kid.ID, t.ID, weekStart, weekEnd).Count(&done)
+					kid.ID, t.ID, weekStart, weekEnd).Count(&done).Error; err != nil {
+				return err
+			}
 			hit = sch.WeeklyQuota > 0 && done < int64(sch.WeeklyQuota)
 		default: // weekday_fixed
 			for _, d := range splitWeekdays(sch.Weekdays) {
@@ -99,11 +126,24 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 			continue
 		}
 		snap := TemplateSnapshot(t, *sch)
-		snapJSON, _ := json.Marshal(snap)
+		day, err := taskDay(dateStr)
+		if err != nil {
+			return err
+		}
+		snap.DateMultiplier, err = dateMultiplier(db, day)
+		if err != nil {
+			return err
+		}
+		snapJSON, err := json.Marshal(snap)
+		if err != nil {
+			return err
+		}
 		var quotaDone int64
-		db.Model(&store.DailyTask{}).
+		if err := db.Model(&store.DailyTask{}).
 			Where("kid_id=? AND template_id=? AND date>=? AND date<? AND status='approved'",
-				kid.ID, t.ID, weekStart, weekEnd).Count(&quotaDone)
+				kid.ID, t.ID, weekStart, weekEnd).Count(&quotaDone).Error; err != nil {
+			return err
+		}
 		status := "pending"
 		if isLeave {
 			status = "skipped"
@@ -115,58 +155,67 @@ func materializeKid(db *store.DB, kid store.Kid, dateStr string, weekday int, we
 			return fmt.Errorf("materialize %s tpl %d: %w", dateStr, t.ID, res.Error)
 		}
 		if isLeave && res.RowsAffected == 0 {
-			db.Model(&store.DailyTask{}).
+			if err := db.Model(&store.DailyTask{}).
 				Where("date=? AND kid_id=? AND template_id=? AND status='pending'", dateStr, kid.ID, t.ID).
-				Update("status", "skipped")
+				Update("status", "skipped").Error; err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-// DateMultiplier 当日倍数（全局策略：周末/节假日）
-func DateMultiplier(db *store.DB, date time.Time) float64 {
-	dateStr := date.Format("2006-01-02")
+// DateMultiplier 日期策略查询错误必须传播。
+func DateMultiplier(db *store.DB, date time.Time) (float64, error) {
+	return dateMultiplier(db, date)
+}
+
+func dateMultiplier(db *store.DB, date time.Time) (float64, error) {
+	date = date.In(BusinessLocation)
 	var rp store.RewardPolicy
-	if err := db.Where("match_type='date' AND match_value=?", dateStr).First(&rp).Error; err == nil && rp.Multiplier > 0 {
-		return rp.Multiplier
+	res := db.Where("match_type='date' AND match_value=?", BusinessDate(date)).Limit(1).Find(&rp)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	if rp.Multiplier > 0 {
+		return rp.Multiplier, nil
 	}
 	typ := ""
-	wd := int(date.Weekday())
-	if wd == 0 || wd == 6 {
+	if date.Weekday() == time.Saturday || date.Weekday() == time.Sunday {
 		typ = "weekend"
 	} else {
 		var n int64
-		db.Model(&store.Holiday{}).Where("date=?", dateStr).Count(&n)
+		if err := db.Model(&store.Holiday{}).Where("date=?", BusinessDate(date)).Count(&n).Error; err != nil {
+			return 0, err
+		}
 		if n > 0 {
 			typ = "holiday"
 		}
 	}
 	if typ != "" {
-		var rp2 store.RewardPolicy
-		if err := db.Where("match_type='date_type' AND match_value=?", typ).First(&rp2).Error; err == nil && rp2.Multiplier > 0 {
-			return rp2.Multiplier
+		var policy store.RewardPolicy
+		if err := db.Where("match_type='date_type' AND match_value=?", typ).Limit(1).Find(&policy).Error; err != nil {
+			return 0, err
+		}
+		if policy.Multiplier > 0 {
+			return policy.Multiplier, nil
 		}
 	}
-	return 1
+	return 1, nil
 }
 
-// StartCron 每日 00:05 物化 + 启动补物化
+// StartCron 启动补扫及每分钟补扫全部孩子，不局限昨日；午夜自动物化。
 func StartCron(db *store.DB) {
-	if err := Materialize(db, time.Now()); err != nil {
-		log.Printf("[materialize] today: %v", err)
+	if err := ReconcileWithClock(db, time.Now); err != nil {
+		log.Printf("[reconcile] startup: %v", err)
 	}
 	go func() {
-		for {
-			now := time.Now()
-			next := time.Date(now.Year(), now.Month(), now.Day(), 0, 5, 0, 0, now.Location())
-			if !next.After(now) {
-				next = next.AddDate(0, 0, 1)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := ReconcileWithClock(db, time.Now); err != nil {
+				log.Printf("[reconcile] cron: %v", err)
 			}
-			time.Sleep(next.Sub(now))
-			if err := Materialize(db, time.Now()); err != nil {
-				log.Printf("[materialize] cron: %v", err)
-			}
-			CloseDay(db)
 		}
 	}()
 }
@@ -269,13 +318,65 @@ func NormalizeSteps(steps, evidenceType string) string {
 }
 
 func TemplateSnapshot(t store.TaskTemplate, sch store.TaskSchedule) Snapshot {
-	return Snapshot{ID: t.ID, Name: t.Name, Icon: t.Icon, Category: t.Category,
+	return Snapshot{StreakEnabled: &t.StreakEnabled, DateMultiplier: 1, ID: t.ID, Name: t.Name, Icon: t.Icon, Category: t.Category,
 		GoalType: t.GoalType, GoalValue: t.GoalValue, EvidenceType: t.EvidenceType,
 		ConfirmMode: t.ConfirmMode, BaseScore: t.BaseScore,
 		ExtraMinutes: t.ExtraMinutes, ExtraStars: t.ExtraStars, ExtraCap: t.ExtraCap,
 		DateMode: sch.DateMode, Weekdays: sch.Weekdays, WeeklyQuota: sch.WeeklyQuota,
 		EvidenceSteps: NormalizeSteps(t.EvidenceSteps, t.EvidenceType),
 		AnalysisMode:  t.AnalysisMode, ReviewPrompt: t.ReviewPrompt}
+}
+
+// FreezeRewardSnapshot 仅补首次提交前的旧快照。已有提交（含驳回）的快照
+// 不补写奖励字段，继续采用明确的legacy默认值。
+func FreezeRewardSnapshot(db *store.DB, dt *store.DailyTask) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(dt.Snapshot), &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return fmt.Errorf("任务快照无效")
+	}
+	_, hasStreak := fields["streak_enabled"]
+	_, hasDate := fields["date_multiplier"]
+	if hasStreak && hasDate {
+		return nil
+	}
+	var submissions int64
+	if err := db.Model(&store.TaskCompletion{}).Where("daily_task_id=?", dt.ID).Count(&submissions).Error; err != nil {
+		return err
+	}
+	if submissions > 0 {
+		return nil
+	}
+	if !hasStreak {
+		var tpl store.TaskTemplate
+		if err := db.First(&tpl, dt.TemplateID).Error; err != nil {
+			return err
+		}
+		fields["streak_enabled"], _ = json.Marshal(tpl.StreakEnabled)
+	}
+	if !hasDate {
+		day, err := taskDay(dt.Date)
+		if err != nil {
+			return err
+		}
+		mul, err := dateMultiplier(db, day)
+		if err != nil {
+			return err
+		}
+		value, err := json.Marshal(mul)
+		if err != nil {
+			return err
+		}
+		fields["date_multiplier"] = value
+	}
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	dt.Snapshot = string(b)
+	return db.Model(&store.DailyTask{}).Where("id=?", dt.ID).Update("snapshot", dt.Snapshot).Error
 }
 
 // AchievedDuration 仅使用同一实例已有流水中的真实秒数（包含驳回记录）。
@@ -295,7 +396,27 @@ func AchievedDuration(db *store.DB, dailyTaskID int64, snap Snapshot) (int, erro
 }
 
 // RefreshPendingTasks 必须在事务中调用，与提交共用实例行锁；不删除历史 ID。
-func RefreshPendingTasks(db *store.DB, t store.TaskTemplate, sch store.TaskSchedule, date string) error {
+func RefreshPendingTasks(db *store.DB, t store.TaskTemplate, sch store.TaskSchedule, clock func() time.Time) error {
+	var kidIDs []int64
+	if err := db.Raw("SELECT kid_id FROM daily_task WHERE template_id=? UNION SELECT kid_id FROM task_assign WHERE template_id=? ORDER BY kid_id", t.ID, t.ID).Scan(&kidIDs).Error; err != nil {
+		return err
+	}
+	for _, id := range kidIDs {
+		if err := LockKid(db, id); err != nil {
+			return err
+		}
+	}
+	now := clock()
+	for _, id := range kidIDs {
+		effective, err := LockedNow(db, id, clock)
+		if err != nil {
+			return err
+		}
+		if effective.After(now) {
+			now = effective
+		}
+	}
+	date := BusinessDate(now)
 	var tasks []store.DailyTask
 	if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("template_id=? AND date=? AND status='pending'", t.ID, date).Order("id").Find(&tasks).Error; err != nil {
@@ -311,6 +432,21 @@ func RefreshPendingTasks(db *store.DB, t store.TaskTemplate, sch store.TaskSched
 			return err
 		}
 		snap := TemplateSnapshot(t, sch)
+		day, err := taskDay(dt.Date)
+		if err != nil {
+			return err
+		}
+		snap.DateMultiplier, err = dateMultiplier(db, day)
+		if err != nil {
+			return err
+		}
+		var submitted int64
+		if err := db.Model(&store.TaskCompletion{}).Where("daily_task_id=?", dt.ID).Count(&submitted).Error; err != nil {
+			return err
+		}
+		if submitted > 0 {
+			snap.StreakEnabled, snap.DateMultiplier = old.StreakEnabled, old.DateMultiplier
+		}
 		if duration > 0 {
 			snap.GoalType, snap.GoalValue = old.GoalType, old.GoalValue
 		}

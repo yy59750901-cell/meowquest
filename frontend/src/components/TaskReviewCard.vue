@@ -10,7 +10,7 @@ const isAI = computed(() => (snap.value.confirm_mode || '').includes('b'))
 const status = computed(() => props.item.ai_review)
 const canRetry = computed(() => !props.history && isAI.value && (!status.value && !result.value || status.value?.status === 'failed'))
 const count = computed(() => { try { const v = typeof props.item.evidence === 'string' ? JSON.parse(props.item.evidence) : props.item.evidence; return Array.isArray(v) ? v.length : 0 } catch { return 0 } })
-const confirmLabel = computed(() => ({ approved: '家长已通过', rejected: props.item.reject_reason?.startsWith('AI：') ? 'AI 退回补交' : '家长已驳回', auto: '自动通过' }[props.item.confirm_status] || '待家长确认'))
+const confirmLabel = computed(() => ({ approved: '家长已通过', rejected: props.item.reject_reason?.startsWith('AI：') ? 'AI 退回补交' : '家长已驳回', auto: '自动通过', expired: '已过审核截止', skipped: '已请假' }[props.item.confirm_status] || '待家长确认'))
 </script>
 
 <template>
@@ -19,6 +19,8 @@ const confirmLabel = computed(() => ({ approved: '家长已通过', rejected: pr
       <span class="review-heading"><b>{{ item.kid_name }} · {{ snap.name }}</b><span class="expand-mark">{{ expanded ? '收起' : '展开' }}</span></span>
       <span class="review-meta">{{ Math.round((item.duration_sec || 0) / 60) }}分钟 · {{ count }}个材料<span v-if="history"> · {{ confirmLabel }}</span></span>
       <span class="review-date">提交于 {{ new Date(item.submitted_at).toLocaleString('zh-CN') }}</span>
+      <span v-if="item.settlement_status === 'pending'" class="settlement-note">审核已通过，奖励待结算</span>
+      <span v-else-if="item.settlement_status === 'settled'" class="review-state">奖励已到账</span>
       <span class="review-state" :class="{ failed: status?.status === 'failed', running: reviewPending(status) }">{{ reviewLabel(status, isAI) }}</span>
     </button>
     <div v-if="expanded" class="review-detail">
@@ -33,10 +35,11 @@ const confirmLabel = computed(() => ({ approved: '家长已通过', rejected: pr
         <button v-if="canRetry" :disabled="busy" class="retry-ai" @click="emit('retry')">{{ busy ? '提交中…' : '重试 AI 分析' }}</button>
       </div>
       <p v-if="!history && reviewPending(status)" class="early-warning">AI 尚未完成。你可以提前审核，但确认后将停止本次 AI 分析，不会再用其结果修改你的决定。</p>
-      <p v-if="history && item.reject_reason" class="history-reason">退回原因：{{ item.reject_reason }}</p>
+      <p v-if="item.settlement_status === 'pending'" class="settlement-detail">等待 {{ item.settlement_wait_date || '相关日期' }} 的连击结果确定后自动发放星星。无需重复审核，孩子也不用重新提交。</p>
+      <p v-if="history && item.reject_reason" class="history-reason">处理说明：{{ item.reject_reason }}</p>
       <p v-if="history && item.confirmed_at" class="history-reason">处理于 {{ new Date(item.confirmed_at).toLocaleString('zh-CN') }}</p>
       <div v-if="!history" class="review-actions">
-        <button class="approve" :disabled="busy" @click="emit('approve')">通过并结算</button><button class="reject" :disabled="busy" @click="emit('reject')">驳回补交</button>
+        <button class="approve" :disabled="busy" @click="emit('approve')">审核通过</button><button class="reject" :disabled="busy" @click="emit('reject')">驳回补交</button>
       </div>
       <EvidenceGallery :evidence="item.evidence" />
       <p v-if="!count" class="history-reason">没有上传材料</p>
@@ -56,6 +59,8 @@ const confirmLabel = computed(() => ({ approved: '家长已通过', rejected: pr
 .review-state { color: #0F6E56; }
 .review-state.failed { color: #A32D2D; }
 .review-state.running { color: #854F0B; }
+.settlement-note { display: block; margin-top: 6px; font-size: 12px; line-height: 1.5; color: #854F0B; }
+.settlement-detail { margin: 10px 0; padding: 10px 12px; border: 1px solid #FAC775; background: #FAEEDA; border-radius: 8px; color: #633806; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .review-detail { padding-top: 8px; }
 .review-report { padding: 10px 12px; background: #E1F5EE; border: 1px solid #9FE1CB; border-radius: 8px; font-size: 13px; overflow-wrap: anywhere; }
 .review-report.failed { background: #FAEEDA; border-color: #FAC775; }

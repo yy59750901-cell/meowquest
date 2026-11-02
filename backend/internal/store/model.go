@@ -44,20 +44,23 @@ type DeviceToken struct {
 func (DeviceToken) TableName() string { return "device_token" }
 
 type Pet struct {
-	ID          int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	KidID       int64      `gorm:"uniqueIndex" json:"kid_id"`
-	Name        string     `gorm:"size:32" json:"name"`
-	Species     string     `gorm:"size:16" json:"species"`
-	Personality string     `gorm:"size:64;default:热情开朗" json:"personality"`
-	Level       int64      `gorm:"default:1" json:"level"`
-	EarnedTotal int64      `json:"earned_total"` // 累计获得（只增不减，驱动等级）
-	Balance     int64      `json:"balance"`      // 余额（消费扣减）
-	Hunger      float64    `gorm:"default:100" json:"hunger"`
-	Mood        float64    `gorm:"default:100" json:"mood"`
-	HungerDecay float64    `gorm:"default:2.0;column:hunger_decay" json:"-"`
-	Streak      int64      `json:"streak"`
-	LastTick    *time.Time `gorm:"column:last_tick" json:"-"`
-	HatchedAt   time.Time  `gorm:"autoCreateTime" json:"hatched_at"`
+	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID             int64      `gorm:"uniqueIndex" json:"kid_id"`
+	Name              string     `gorm:"size:32" json:"name"`
+	Species           string     `gorm:"size:16" json:"species"`
+	Personality       string     `gorm:"size:64;default:热情开朗" json:"personality"`
+	Level             int64      `gorm:"default:1" json:"level"`
+	EarnedTotal       int64      `json:"earned_total"` // 累计获得（只增不减，驱动等级）
+	Balance           int64      `json:"balance"`      // 余额（消费扣减）
+	Hunger            float64    `gorm:"default:100" json:"hunger"`
+	Mood              float64    `gorm:"default:100" json:"mood"`
+	HungerDecay       float64    `gorm:"default:2.0;column:hunger_decay" json:"-"`
+	Streak            int64      `json:"streak"`
+	StreakBaseDate    string     `gorm:"size:10" json:"-"`
+	StreakBaseValue   int64      `json:"-"`
+	StreakEvaluatedNS *int64     `json:"-"`
+	LastTick          *time.Time `gorm:"column:last_tick" json:"-"`
+	HatchedAt         time.Time  `gorm:"autoCreateTime" json:"hatched_at"`
 }
 
 func (Pet) TableName() string { return "pet" }
@@ -138,18 +141,33 @@ type LeaveRecord struct {
 func (LeaveRecord) TableName() string { return "leave_record" }
 
 type DailyTask struct {
-	ID             int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	Date           string    `gorm:"size:10;uniqueIndex:uk_daily" json:"date"`
-	KidID          int64     `gorm:"uniqueIndex:uk_daily" json:"kid_id"`
-	TemplateID     int64     `gorm:"uniqueIndex:uk_daily;column:template_id" json:"template_id"`
-	Snapshot       string    `json:"snapshot"`
-	Status         string    `gorm:"size:16;default:pending" json:"status"` // pending/submitted/approved/rejected/skipped/expired
-	StreakSnapshot int       `gorm:"default:0;column:streak_snapshot" json:"-"`
-	QuotaDone      int       `gorm:"default:0;column:quota_done" json:"quota_done"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID                 int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	Date               string    `gorm:"size:10;uniqueIndex:uk_daily" json:"date"`
+	KidID              int64     `gorm:"uniqueIndex:uk_daily" json:"kid_id"`
+	TemplateID         int64     `gorm:"uniqueIndex:uk_daily;column:template_id" json:"template_id"`
+	Snapshot           string    `json:"snapshot"`
+	Status             string    `gorm:"size:16;default:pending" json:"status"` // pending/submitted/approved/rejected/skipped/expired
+	StreakSnapshot     int       `gorm:"default:0;column:streak_snapshot" json:"-"`
+	SettlementStatus   string    `gorm:"size:16;default:'';index" json:"settlement_status"`
+	SettlementWaitDate string    `gorm:"size:10;default:''" json:"settlement_wait_date"`
+	SettlementExtra    int       `json:"-"`
+	QuotaDone          int       `gorm:"default:0;column:quota_done" json:"quota_done"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 func (DailyTask) TableName() string { return "daily_task" }
+
+// KidStreakDay 是日事实及有序计算结果；CountedAtBaseline记录已从before扣除的信用所属日。
+type KidStreakDay struct {
+	ID                int64  `gorm:"primaryKey;autoIncrement"`
+	KidID             int64  `gorm:"uniqueIndex:uk_kid_streak_day"`
+	Date              string `gorm:"size:10;uniqueIndex:uk_kid_streak_day"`
+	State             string `gorm:"size:16"`
+	StreakAfter       *int64
+	CountedAtBaseline bool
+}
+
+func (KidStreakDay) TableName() string { return "kid_streak_day" }
 
 type TaskCompletion struct {
 	ID            int64      `gorm:"primaryKey;autoIncrement" json:"id"`
@@ -158,6 +176,7 @@ type TaskCompletion struct {
 	DailyTaskID   int64      `gorm:"index;column:daily_task_id" json:"daily_task_id"`
 	Evidence      string     `json:"evidence"`
 	DurationSec   int        `gorm:"column:duration_sec" json:"duration_sec"`
+	ExtraSec      int        `json:"-"`
 	SubmittedAt   time.Time  `gorm:"autoCreateTime;column:submitted_at" json:"submitted_at"`
 	ConfirmStatus string     `gorm:"size:16;default:pending;column:confirm_status" json:"confirm_status"`
 	ConfirmedAt   *time.Time `gorm:"column:confirmed_at" json:"confirmed_at"`
@@ -193,8 +212,8 @@ type SettlementLedger struct {
 	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	KidID            int64     `gorm:"index" json:"kid_id"`
 	Date             string    `gorm:"size:10;column:date" json:"date"`
-	DailyTaskID      *int64    `gorm:"column:daily_task_id" json:"daily_task_id"`
-	Source           string    `gorm:"size:32" json:"source"` // task/task_extra/wish_refund
+	DailyTaskID      *int64    `gorm:"column:daily_task_id;index:idx_ledger_task,priority:1" json:"daily_task_id"`
+	Source           string    `gorm:"size:32;index:idx_ledger_task,priority:2" json:"source"` // task/task_extra/wish_refund
 	Base             int       `json:"base"`
 	DateMultiplier   float64   `gorm:"column:date_multiplier" json:"date_multiplier"`
 	StreakMultiplier float64   `gorm:"column:streak_multiplier" json:"streak_multiplier"`

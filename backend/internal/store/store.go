@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,27 @@ import (
 
 type DB struct {
 	*gorm.DB
+}
+
+// TaskTransaction 任务领域统一使用RC；MySQL默认RR会让锁前identity查询
+// 建立的读视图污染锁后的普通判断。禁止嵌套，避免隔离级别设置形同虚设。
+func (d *DB) TaskTransaction(fn func(*gorm.DB) error) error {
+	if _, ok := d.Statement.ConnPool.(gorm.TxCommitter); ok {
+		return fmt.Errorf("任务事务不能嵌套")
+	}
+	return d.Transaction(func(tx *gorm.DB) error {
+		// Set返回的链式实例不可作为共享查询根；恢复可克隆Session防止条件串到下一次查询。
+		return fn(tx.Set("meowquest:task_transaction", true).Session(&gorm.Session{}))
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+}
+
+func (d *DB) RequireTaskTransaction() error {
+	_, inTx := d.Statement.ConnPool.(gorm.TxCommitter)
+	marked, _ := d.Get("meowquest:task_transaction")
+	if !inTx || marked != true {
+		return fmt.Errorf("必须使用ReadCommitted任务事务")
+	}
+	return nil
 }
 
 // OpenDB 双库：PG DSN 优先，否则 MySQL（自动建库 + AutoMigrate + 存量迁移）
@@ -79,7 +101,7 @@ func autoMigrateAll(gdb *gorm.DB) error {
 	return gdb.AutoMigrate(
 		&Family{}, &Kid{}, &TaskAssign{}, &DeviceToken{},
 		&Pet{}, &SpeciesConfig{}, &TaskTemplate{}, &TaskSchedule{}, &RewardPolicy{},
-		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &TaskCompletion{}, &AIReviewJob{},
+		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &KidStreakDay{}, &TaskCompletion{}, &AIReviewJob{},
 		&SettlementLedger{}, &Wish{}, &SceneItem{}, &OwnedItem{}, &PetEvent{}, &ChatMessage{}, &KidMessage{},
 	)
 }
@@ -366,14 +388,14 @@ func (d *DB) EventCount(kidID int64, day, typ string) int64 {
 	return n
 }
 
-func (d *DB) AddEvent(kidID int64, typ string, payload map[string]any) {
+func (d *DB) AddEvent(kidID int64, typ string, payload map[string]any) error {
 	pj := "{}"
 	if payload != nil {
 		if b, err := json.Marshal(payload); err == nil {
 			pj = string(b)
 		}
 	}
-	d.Create(&PetEvent{KidID: kidID, Type: typ, Payload: pj, Day: today()})
+	return d.Create(&PetEvent{KidID: kidID, Type: typ, Payload: pj, Day: today()}).Error
 }
 
 func (d *DB) EventsSince(kidID int64, day string) ([]PetEvent, error) {

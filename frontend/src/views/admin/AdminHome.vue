@@ -56,6 +56,18 @@ async function loadHistory(page = 1) {
   } catch (e) { historyError.value = e.message }
   finally { historyLoading.value = false }
 }
+async function refreshHistorySettlements() {
+  if (historyLoading.value || !historyItems.value.some(it => it.settlement_status === 'pending')) return
+  historyLoading.value = true
+  try {
+    const pages = await Promise.all(Array.from({ length: historyPage.value }, (_, i) => jget(`/api/admin/confirm/history?page=${i + 1}&page_size=20`)))
+    if (pages.every(p => Array.isArray(p.items))) {
+      historyItems.value = pages.flatMap(p => p.items)
+      historyTotal.value = pages[0].total || 0
+    }
+  } catch { /* 保留已加载历史，下一轮更新到账状态 */ }
+  finally { historyLoading.value = false }
+}
 const expanded = ref(0) // 待确认卡片展开的 id（默认全收起）
 function toggleExpand(id) { expanded.value = expanded.value === id ? 0 : id }
 function snapOf(it) {
@@ -85,7 +97,7 @@ function editTask(t) {
   newTask.value = {
     name: t.name, icon: t.icon || '⭐', category: t.category || 'custom',
     goal_type: t.goal_type || 'duration', goal_value: t.goal_value || 0, review_prompt: t.review_prompt || '', analysis_mode: t.analysis_mode || 'judge',
-    confirm_mode: (t.confirm_mode || '').includes('b') ? 'b' : t.confirm_mode || 'c', base_score: t.base_score || 20,
+    confirm_mode: (t.confirm_mode || '').includes('b') ? 'b' : t.confirm_mode || 'c', base_score: t.base_score ?? 20,
     date_mode: t.schedule?.date_mode || 'weekday_fixed',
     weekdays: t.schedule?.weekdays || '1,2,3,4,5',
     weekly_quota: t.schedule?.weekly_quota || 3,
@@ -146,7 +158,7 @@ async function decideReview(it, approve) {
       approve, completion_id: it.completion_id, reason: approve ? '' : '请补充材料，再认真试一次哦～',
     })
     if (!ok) return showToast(data.error || '审核失败，请刷新后再试')
-    showToast(approve ? '已通过，AI 评价可在审核历史回看' : '已退回，可补交材料')
+    showToast(approve ? (data.settlement_pending ? '审核已通过，等待连击确定后自动发放奖励' : '审核已通过，奖励已到账') : '已退回，截止前可补交材料')
     expanded.value = 0; await loadReviews()
   } catch (e) { if (e !== 'cancel' && e !== 'close') showToast('网络异常，请刷新核对任务状态') }
   finally { busyReview.value = 0 }
@@ -224,6 +236,7 @@ onMounted(() => {
   statusTicker = setInterval(() => {
     now.value = Date.now()
     if (!document.hidden && tab.value === 'confirm') loadReviews()
+    if (!document.hidden && tab.value === 'history') refreshHistorySettlements()
   }, 5000)
 })
 onBeforeUnmount(() => clearInterval(statusTicker))

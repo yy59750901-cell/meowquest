@@ -30,7 +30,7 @@ type taskReq struct {
 	EvidenceSteps json.RawMessage `json:"evidence_steps"` // JSON 字符串；区分未提供和显式清空
 	AnalysisMode  string          `json:"analysis_mode"`  // judge / score
 	BaseScore     int             `json:"base_score"`
-	StreakEnabled int             `json:"streak_enabled"`
+	StreakEnabled *int            `json:"streak_enabled"`
 	ExtraMinutes  int             `json:"extra_minutes"`
 	ExtraStars    int             `json:"extra_stars"`
 	ExtraCap      int             `json:"extra_cap"`
@@ -77,9 +77,12 @@ func (r taskReq) toTemplate() (store.TaskTemplate, error) {
 	if r.Enabled != nil && !*r.Enabled {
 		enabled = 0
 	}
-	streak := r.StreakEnabled
-	if streak == 0 {
-		streak = 1
+	streak := 1
+	if r.StreakEnabled != nil {
+		if *r.StreakEnabled != 0 && *r.StreakEnabled != 1 {
+			return store.TaskTemplate{}, fmt.Errorf("streak_enabled 必须为 0 或 1")
+		}
+		streak = *r.StreakEnabled
 	}
 	return store.TaskTemplate{
 		Name: r.Name, Icon: defStr(r.Icon, "⭐"), Category: defStr(r.Category, "custom"),
@@ -87,7 +90,8 @@ func (r taskReq) toTemplate() (store.TaskTemplate, error) {
 		EvidenceType: defStr(r.EvidenceType, "none"), ConfirmMode: defStr(r.ConfirmMode, "a"),
 		ReviewPrompt: r.ReviewPrompt, EvidenceSteps: engine.NormalizeSteps(steps, r.EvidenceType),
 		AnalysisMode: defStr(r.AnalysisMode, "judge"),
-		BaseScore:    maxInt(r.BaseScore, 20), StreakEnabled: streak,
+		// 完成奖励按家长填的原样存，不再有下限：填 5 就是 5，填 100 就是 100。
+		BaseScore: r.BaseScore, StreakEnabled: streak,
 		ExtraMinutes: r.ExtraMinutes, ExtraStars: r.ExtraStars, ExtraCap: r.ExtraCap,
 		Sort: r.Sort, Enabled: enabled,
 	}, nil
@@ -121,27 +125,71 @@ func (s *Server) createTask(c *gin.Context) {
 		return
 	}
 	tpl.FamilyID = famOf(c)
-	if err := s.DB.Create(&tpl).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	// map 创建不会把显式零值替换成模型 default:1。
+	values := map[string]any{"family_id": tpl.FamilyID, "name": tpl.Name, "icon": tpl.Icon, "category": tpl.Category,
+		"goal_type": tpl.GoalType, "goal_value": tpl.GoalValue, "evidence_type": tpl.EvidenceType, "confirm_mode": tpl.ConfirmMode,
+		"review_prompt": tpl.ReviewPrompt, "evidence_steps": tpl.EvidenceSteps, "analysis_mode": tpl.AnalysisMode,
+		"base_score": tpl.BaseScore, "streak_enabled": tpl.StreakEnabled, "extra_minutes": tpl.ExtraMinutes,
+		"extra_stars": tpl.ExtraStars, "extra_cap": tpl.ExtraCap, "sort": tpl.Sort, "enabled": tpl.Enabled,
+		"created_at": s.now(), "updated_at": s.now()}
+	status := http.StatusInternalServerError
+	err = s.DB.TaskTransaction(func(tx *gorm.DB) error {
+		db := &store.DB{DB: tx}
+		kids, err := db.KidsOfFamily(famOf(c))
+		if err != nil {
+			return err
+		}
+		requested := map[int64]bool{}
+		for _, id := range req.KidIDs {
+			requested[id] = true
+		}
+		targets := []store.Kid{}
+		for _, kid := range kids {
+			if len(req.KidIDs) == 0 || requested[kid.ID] {
+				targets = append(targets, kid)
+				delete(requested, kid.ID)
+			}
+		}
+		if len(requested) > 0 {
+			status = http.StatusBadRequest
+			return fmt.Errorf("指派孩子不属于当前家庭")
+		}
+		for _, kid := range targets {
+			if err := engine.LockKid(db, kid.ID); err != nil {
+				return err
+			}
+		}
+		now := s.now()
+		for _, kid := range targets {
+			effective, err := engine.LockedNow(db, kid.ID, s.now)
+			if err != nil {
+				return err
+			}
+			if effective.After(now) {
+				now = effective
+			}
+		}
+		values["created_at"], values["updated_at"] = now, now
+		if err := tx.Model(&store.TaskTemplate{}).Create(values).Error; err != nil {
+			return err
+		}
+		tpl.ID = values["id"].(int64)
+		sch := req.toSchedule(tpl.ID)
+		if err := tx.Create(&sch).Error; err != nil {
+			return err
+		}
+		for _, kid := range targets {
+			if err := db.AssignTask(tpl.ID, kid.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	sch := req.toSchedule(tpl.ID)
-	if err := s.DB.Create(&sch).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	// 指派：kid_ids 空 = 指派给家庭全部现有孩子
-	if len(req.KidIDs) == 0 {
-		kids, _ := s.DB.KidsOfFamily(famOf(c))
-		for _, k := range kids {
-			s.DB.AssignTask(tpl.ID, k.ID)
-		}
-	} else {
-		for _, kidID := range req.KidIDs {
-			s.DB.AssignTask(tpl.ID, kidID)
-		}
-	}
-	if err := engine.Materialize(s.DB, time.Now()); err != nil {
+	if err := engine.MaterializeCurrent(s.DB, s.now); err != nil {
 		c.JSON(http.StatusOK, gin.H{"id": tpl.ID, "materialize_error": err.Error()})
 		return
 	}
@@ -151,7 +199,7 @@ func (s *Server) createTask(c *gin.Context) {
 // todayHit 今天是否有孩子命中该模板（家长创建后的即时反馈）
 func (s *Server) todayHit(templateID int64) int64 {
 	var n int64
-	s.DB.Model(&store.DailyTask{}).Where("template_id=? AND date=?", templateID, time.Now().Format("2006-01-02")).Count(&n)
+	s.DB.Model(&store.DailyTask{}).Where("template_id=? AND date=?", templateID, engine.BusinessDate(s.now())).Count(&n)
 	return n
 }
 
@@ -167,14 +215,16 @@ func (s *Server) updateTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	today := time.Now().Format("2006-01-02")
-	err = s.DB.Transaction(func(tx *gorm.DB) error {
+	err = s.DB.TaskTransaction(func(tx *gorm.DB) error {
 		var existing store.TaskTemplate
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id=? AND family_id=?", c.Param("id"), famOf(c)).First(&existing).Error; err != nil {
 			return err
 		}
 		tpl.ID, tpl.FamilyID = existing.ID, existing.FamilyID
+		if req.StreakEnabled == nil {
+			tpl.StreakEnabled = existing.StreakEnabled
+		}
 		// 未提供步骤时沿用已保存的显式配置，不能从隐藏的旧媒体字段恢复材料。
 		if len(req.EvidenceSteps) == 0 {
 			tpl.EvidenceType = defStr(req.EvidenceType, existing.EvidenceType)
@@ -198,7 +248,7 @@ func (s *Server) updateTask(c *gin.Context) {
 			return err
 		}
 		// submitted/approved 不动；pending 同 ID 刷新，有历史达标记录时冻结目标。
-		return engine.RefreshPendingTasks(&store.DB{DB: tx}, tpl, sch, today)
+		return engine.RefreshPendingTasks(&store.DB{DB: tx}, tpl, sch, s.now)
 	})
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -208,7 +258,7 @@ func (s *Server) updateTask(c *gin.Context) {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	if err := engine.Materialize(s.DB, time.Now()); err != nil {
+	if err := engine.MaterializeCurrent(s.DB, s.now); err != nil {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "materialize_error": err.Error(), "today_hit": s.todayHit(atoi64(c.Param("id")))})
 		return
 	}
@@ -257,15 +307,75 @@ func (s *Server) setLeave(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	kids, _ := s.DB.KidsOfFamily(famOf(c))
-	targets := kids
-	if req.KidID > 0 {
-		targets = []store.Kid{{ID: req.KidID}}
+	if _, err := time.Parse("2006-01-02", req.Date); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "date 无效"})
+		return
 	}
-	for _, k := range targets {
-		lr := store.LeaveRecord{Date: req.Date, KidID: k.ID, Reason: req.Reason}
-		s.DB.Where(&lr).Assign(lr).FirstOrCreate(&lr)
-		s.DB.Model(&store.DailyTask{}).Where("date=? AND kid_id=? AND status='pending'", req.Date, k.ID).Update("status", "skipped")
+	kids, err := s.DB.KidsOfFamily(famOf(c))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	targets := kids
+	if req.KidID != 0 {
+		targets = nil
+		for _, kid := range kids {
+			if kid.ID == req.KidID {
+				targets = append(targets, kid)
+			}
+		}
+		if len(targets) == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "孩子不属于当前家庭"})
+			return
+		}
+	}
+	err = s.DB.TaskTransaction(func(tx *gorm.DB) error {
+		db := &store.DB{DB: tx}
+		for _, kid := range targets {
+			if err := engine.LockKid(db, kid.ID); err != nil {
+				return err
+			}
+		}
+		for _, kid := range targets {
+			now, err := engine.LockedNow(db, kid.ID, s.now)
+			if err != nil {
+				return err
+			}
+			if err := engine.EnsureStreakBaseline(db, kid.ID, now); err != nil {
+				return err
+			}
+			// 已终结历史日不接受追溯请假，避免改写已采用的倍率。
+			var day store.KidStreakDay
+			if err := tx.Where("kid_id=? AND date=?", kid.ID, req.Date).Limit(1).Find(&day).Error; err != nil {
+				return err
+			}
+			if req.Date < engine.BusinessDate(now) && day.ID > 0 && day.State != "pending" && day.State != "success" {
+				return fmt.Errorf("该任务日已终结，不能追溯请假")
+			}
+			lr := store.LeaveRecord{Date: req.Date, KidID: kid.ID, Reason: req.Reason}
+			if err := tx.Where("date=? AND kid_id=?", req.Date, kid.ID).Assign(lr).FirstOrCreate(&lr).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&store.DailyTask{}).Where("date=? AND kid_id=? AND status IN ('pending','rejected','submitted')", req.Date, kid.ID).Update("status", "skipped").Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&store.TaskCompletion{}).Where("kid_id=? AND confirm_status='pending' AND daily_task_id IN (SELECT id FROM daily_task WHERE kid_id=? AND date=? AND status='skipped')", kid.ID, kid.ID, req.Date).
+				Updates(map[string]any{"confirm_status": "skipped", "confirmed_at": now, "reject_reason": "整日请假"}).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&store.AIReviewJob{}).Where("kid_id=? AND status IN ('queued','running','failed') AND daily_task_id IN (SELECT id FROM daily_task WHERE kid_id=? AND date=? AND status='skipped')", kid.ID, kid.ID, req.Date).
+				Updates(map[string]any{"status": "canceled", "stage": "canceled", "finished_at": now, "lease_token": "", "lease_expires_at": nil}).Error; err != nil {
+				return err
+			}
+			if err := engine.ReconcileKidLocked(db, kid.ID, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -281,18 +391,54 @@ func (s *Server) assignTask(c *gin.Context) {
 		return
 	}
 	tid := c.Param("id")
-	var tpl store.TaskTemplate
-	if err := s.DB.Where("id=? AND family_id=?", tid, famOf(c)).First(&tpl).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+	status := http.StatusInternalServerError
+	err := s.DB.TaskTransaction(func(tx *gorm.DB) error {
+		db := &store.DB{DB: tx}
+		var tpl store.TaskTemplate
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id=? AND family_id=?", tid, famOf(c)).First(&tpl).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				status = http.StatusNotFound
+			}
+			return err
+		}
+		kids, err := db.KidsOfFamily(famOf(c))
+		if err != nil {
+			return err
+		}
+		requested := map[int64]bool{}
+		for _, id := range req.KidIDs {
+			requested[id] = true
+		}
+		for _, kid := range kids {
+			delete(requested, kid.ID)
+		}
+		if len(requested) > 0 {
+			status = http.StatusBadRequest
+			return fmt.Errorf("指派孩子不属于当前家庭")
+		}
+		// 与模板刷新一致，按孩子ID有序锁；指派变更不能越过物化/日计算。
+		for _, kid := range kids {
+			if err := engine.LockKid(db, kid.ID); err != nil {
+				return err
+			}
+		}
+		if req.Replace {
+			if err := tx.Where("template_id=?", tpl.ID).Delete(&store.TaskAssign{}).Error; err != nil {
+				return err
+			}
+		}
+		for _, id := range req.KidIDs {
+			if err := db.AssignTask(tpl.ID, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	if req.Replace {
-		s.DB.Where("template_id=?", tpl.ID).Delete(&store.TaskAssign{})
-	}
-	for _, kidID := range req.KidIDs {
-		s.DB.AssignTask(tpl.ID, kidID)
-	}
-	if err := engine.Materialize(s.DB, time.Now()); err != nil {
+	if err := engine.MaterializeCurrent(s.DB, s.now); err != nil {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "materialize_error": err.Error()})
 		return
 	}
@@ -301,7 +447,7 @@ func (s *Server) assignTask(c *gin.Context) {
 
 // POST /api/admin/materialize 手动物化
 func (s *Server) rematerialize(c *gin.Context) {
-	if err := engine.Materialize(s.DB, time.Now()); err != nil {
+	if err := engine.MaterializeCurrent(s.DB, s.now); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -312,7 +458,7 @@ func (s *Server) rematerialize(c *gin.Context) {
 
 // GET /api/tasks/today
 func (s *Server) todayTasks(c *gin.Context) {
-	date := time.Now().Format("2006-01-02")
+	date := engine.BusinessDate(s.now())
 	var tasks []store.DailyTask
 	if err := s.DB.Where("date=? AND kid_id=?", date, kidOf(c)).Order("id").Find(&tasks).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -345,7 +491,11 @@ func (s *Server) todayTasks(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	mul := engine.DateMultiplier(s.DB, time.Now())
+	mul, err := engine.DateMultiplier(s.DB, s.now())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"date": date, "date_multiplier": mul, "tasks": out,
 		"had_duration": hadDur, "achieved_duration": achievedDur})
 }
@@ -356,11 +506,4 @@ func defStr(v, def string) string {
 		return def
 	}
 	return v
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

@@ -75,6 +75,8 @@ async function pickKid(k) {
 let pickedKidID = 0 // 选择页进入领养的孩子（0=全新孩子）
 function gotoNewKid() { pickedKidID = 0; adoptStep.value = 'new' }
 const pet = ref(null)
+const streakPending = ref(false)
+const pendingRewardCount = ref(0)
 const today = ref({ date: '', date_multiplier: 1, tasks: [] })
 const wishes = ref([])
 const shopItems = ref([])
@@ -157,7 +159,7 @@ function onDocumentVisibility() {
   if (!document.hidden) {
     syncSceneLighting()
     if (adopted.value) {
-      refreshTasks()
+      refreshProgress()
       syncMail()
     }
   } else if (taskRec.value && taskRec.value.state === 'recording') {
@@ -224,7 +226,7 @@ async function loadAll() {
     jget('/species'), jget('/pet'), jget('/tasks/today'), jget('/wish/list'), jget('/shop'), jget('/scene'),
   ])
   if (sp) speciesList.value = sp.species || []
-  if (p && p.pet) { adopted.value = true; pet.value = p.pet; species.value = p.pet.species }
+  if (p && p.pet) { adopted.value = true; applyPet(p); species.value = p.pet.species }
   applyToday(t)
   if (w) wishes.value = w.wishes || []
   if (s) shopItems.value = s.items || []
@@ -232,9 +234,21 @@ async function loadAll() {
   restoreTimer()
 }
 
+function applyPet(p) {
+  if (!p?.pet) return
+  pet.value = p.pet
+  streakPending.value = !!p.streak_pending
+  pendingRewardCount.value = p.pending_reward_count || 0
+}
+let petLoading = null
 async function refreshPet() {
-  const p = await jget('/pet')
-  if (p && p.pet) pet.value = p.pet
+  if (petLoading) return petLoading
+  petLoading = (async () => { applyPet(await jget('/pet')) })()
+  try { await petLoading } finally { petLoading = null }
+}
+async function refreshProgress() {
+  // 家长确认、补审或宽限结束都可能改变余额和连击，不只刷新今日任务。
+  await Promise.all([refreshTasks(), refreshPet().catch(() => {})])
 }
 
 // ===== 猫的信箱 =====
@@ -797,6 +811,10 @@ async function submitTask(t, body = {}) {
     hearts(6)
     say('主人真棒！')
     await loadAll()
+  } else if (data.settlement_pending) {
+    showToast('任务已完成，连击确定后星星会自动到账')
+    say('完成啦！星星先记着，确认好连击就给你～')
+    await loadAll()
   } else if (data.ai_queued) {
     showToast('提交成功！猫会在后台看材料，可以离开页面啦')
     say('材料收到啦！我慢慢看，你可以先休息～')
@@ -1339,7 +1357,7 @@ const moodColor = computed(() => (!pet.value ? '' : pet.value.hunger < 30 || pet
 const TIPS = {
   stars: '⭐ 星星币：完成任务获得。喂猫、买道具、兑换愿望都花它。花的星星另有隐藏账本（累计获得），只涨不掉，决定猫的等级。',
   level: '🏆 等级：由「累计获得的星星」驱动，只涨不掉。升级会解锁新玩法（装扮、新动作）。',
-  streak: '🔥 连击：连续完成任务的周天数。奖励加成 = 1 + 0.1×连击（封顶1.5倍）。当天任务没完成会清零，请假不断。',
+  streak: '连击按任务日期计算：一天任意一项参与连击的任务通过，增加 1 天。休息和请假不加不断，每周次数任务没做不单独断签。待审核不提前清零；相关日期确定后，奖励按 1 + 0.1×连击计算，最高 1.5 倍。',
   hunger: '🍽 饱腹度：猫会随时间慢慢变饿（约两天见底）。喂猫粮一次 +30。低于 30 猫会蔫蔫的、不爱动。',
   mood: '💚 心情：完成任务 +10，摸摸头 +5（每天限 3 次）。低于 30 猫趴着不理人。',
 }
@@ -1381,8 +1399,8 @@ onMounted(async () => {
   lightingTimer = setInterval(() => {
     syncSceneLighting()
     if (!document.hidden && adopted.value) {
-      // 有任务在等 AI 就刷新任务；信箱独立拉取，家长确认后孩子不用刷新也能收到。
-      if (today.value?.tasks?.some(t => t.status === 'submitted')) refreshTasks()
+      // 人审与跨日待结算也会改变连击/余额；前台持续同步，避免审核后状态停住。
+      refreshProgress()
       syncMail()
     }
   }, 15000)
@@ -1486,7 +1504,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="header-stats">
         <button class="star-stat" @click="showTip('stars')" aria-label="查看星星说明"><svg class="ui-icon"><use href="#room-star" /></svg>{{ pet?.balance }}</button>
-        <button class="streak-stat" @click="showTip('streak')" aria-label="查看连击说明"><svg class="ui-icon"><use href="#room-flame" /></svg>{{ pet?.streak }} 天</button>
+        <button class="streak-stat" @click="showTip('streak')" aria-label="查看连击说明"><svg class="ui-icon"><use href="#room-flame" /></svg>{{ pet?.streak }} 天<span v-if="streakPending" class="streak-note">待确定</span></button>
         <button class="status-toggle" ref="statusToggleEl" :class="{ open: hudOpen }" :aria-expanded="hudOpen" aria-controls="cat-status" aria-label="查看小猫状态" @click="toggleStatus"><svg class="ui-icon"><use href="#room-chevron" /></svg></button>
       </div>
     </header>
@@ -1548,7 +1566,7 @@ onBeforeUnmount(() => {
       <div class="chip">🐱 {{ pet?.name }} <small>{{ today.date }} {{ today.date_multiplier > 1 ? '· 奖励日×' + today.date_multiplier : '' }}</small></div>
       <div class="chip tippable" @mouseenter="showTip('stars')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('stars', e)" @pointerup="tipUp" @pointerleave="tipUp">星星 ⭐{{ pet?.balance }}</div>
       <div class="chip tippable" @mouseenter="showTip('level')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('level', e)" @pointerup="tipUp" @pointerleave="tipUp">等级 Lv{{ pet?.level }}</div>
-      <div class="chip tippable" @mouseenter="showTip('streak')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('streak', e)" @pointerup="tipUp" @pointerleave="tipUp">连击 ×{{ pet?.streak }}</div>
+      <div class="chip tippable" @mouseenter="showTip('streak')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('streak', e)" @pointerup="tipUp" @pointerleave="tipUp">连击 {{ pet?.streak }} 天<span v-if="streakPending"> · 待确定</span></div>
       <div class="chip mini tippable" @mouseenter="showTip('hunger')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('hunger', e)" @pointerup="tipUp" @pointerleave="tipUp">饱腹<div class="bar"><i :style="{ width: (pet?.hunger || 0) + '%' }" /></div><small>{{ Math.round(pet?.hunger || 0) }}</small></div>
       <div class="chip mini tippable" @mouseenter="showTip('mood')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('mood', e)" @pointerup="tipUp" @pointerleave="tipUp">心情<div class="bar"><i class="mood" :style="{ width: (pet?.mood || 0) + '%' }" /></div><small>{{ Math.round(pet?.mood || 0) }}</small></div>
       <div class="chip switch" @click="switchKid" title="换一个小朋友登录">👤 换人</div>
@@ -1564,16 +1582,19 @@ onBeforeUnmount(() => {
     <div class="panel" id="taskPanel" v-show="!isNarrow || sheet === 'task'">
       <div class="panel-bar">📋 今日任务（{{ today.tasks.filter(t => t.status === 'approved').length }}/{{ today.tasks.length }}）<button class="sheet-close" @click="sheet = ''" aria-label="关闭任务"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
+        <p v-if="pendingRewardCount" class="reward-notice">有 {{ pendingRewardCount }} 项任务已通过，连击确定后星星会自动到账，不用重新提交。</p>
         <div v-for="t in today.tasks" :key="t.id" class="task" :class="t.status === 'approved' ? 'done' : t.status === 'submitted' ? 'wait' : ''">
           <div class="ic">{{ t.snapshot?.icon }}</div>
           <div class="info">
             <div class="nm">{{ t.snapshot?.name }}</div>
-            <div class="sub">{{ t.snapshot?.goal_type === 'duration' ? t.snapshot.goal_value + ' 分钟' : '自由完成' }} · {{ t.snapshot?.base_score }}⭐{{ today.date_multiplier > 1 ? '×' + today.date_multiplier : '' }}</div>
+            <div class="sub">{{ t.snapshot?.goal_type === 'duration' ? t.snapshot.goal_value + ' 分钟' : '自由完成' }} · 基础 {{ t.snapshot?.base_score }}⭐{{ (t.snapshot?.date_multiplier ?? today.date_multiplier) > 1 ? ' × 日期' + (t.snapshot?.date_multiplier ?? today.date_multiplier) : '' }}</div>
+            <div v-if="t.settlement_status === 'pending'" class="task-settlement">已通过，等待 {{ t.settlement_wait_date || '相关日期' }} 的连击确定。</div>
+            <div v-else-if="t.settlement_status === 'settled'" class="task-settlement settled">奖励已到账</div>
             <div v-if="reviewPending(t.ai_review)" class="task-ai">{{ t.ai_review.status === 'queued' ? '猫在排队看材料' : reviewStages[t.ai_review.stage] || '猫在分析材料' }}，可以先休息。</div>
             <div v-else-if="t.ai_review?.status === 'failed'" class="task-ai">AI 暂时没看完，家长可以重试，不用重交。</div>
             <div v-else-if="t.ai_review?.result" class="task-ai">{{ t.ai_review.result.kid_feedback || t.ai_review.result.reason }}<span v-if="!t.ai_review.result.pass"> 可以补交材料。</span></div>
           </div>
-          <span v-if="t.status === 'approved'" class="st ok">✓</span>
+          <span v-if="t.status === 'approved'" class="st" :class="t.settlement_status === 'pending' ? 'wait-t' : 'ok'">{{ t.settlement_status === 'pending' ? '待到账' : '✓' }}</span>
           <span v-else-if="t.status === 'submitted'" class="st wait-t">{{ reviewPending(t.ai_review) ? 'AI 分析中' : '等妈妈…' }}</span>
           <span v-else-if="t.status === 'skipped'" class="st skip">请假</span>
           <button v-else :disabled="!!startingTask || !!submitting" @click="startTask(t)">{{ submitting === t.id ? '提交中…' : taskBtnLabel(t) }}</button>
@@ -1874,6 +1895,10 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .task .ic { flex: 0 0 30px; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; font-size: 17px; border: 1px solid #E3CFB1; border-radius: 8px; background: #FAEEDA; }
 .task .info { flex: 1; min-width: 0; }
 .task-ai { margin-top: 5px; color: #75609D; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.task-settlement { margin-top: 5px; color: #854F0B; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.task-settlement.settled { color: #3B6D11; }
+.reward-notice { margin: 0 0 10px; padding: 9px 10px; background: #FFF0D5; border: 1px solid #D8BFA1; border-radius: 8px; color: #70543C; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.streak-note { font-size: 11px; font-weight: 400; }
 .task .nm { font-size: 12.5px; line-height: 1.45; font-weight: 600; overflow-wrap: anywhere; }
 .task .sub { font-size: 10.5px; line-height: 1.5; color: #88786A; }
 .task button, .shop-row button { flex-shrink: 0; font-size: 11px; font-weight: 600; cursor: pointer; color: #75609D; border: 1px solid #D5C8E7; border-radius: 8px; padding: 6px 8px; background: #EEEBF7; white-space: nowrap; box-shadow: 0 2px 0 #E5DDEE; }

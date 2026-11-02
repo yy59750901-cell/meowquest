@@ -50,12 +50,19 @@ func (s *Server) retryAIReview(c *gin.Context) {
 	id := atoi64(c.Param("id"))
 	status := http.StatusInternalServerError
 	var job store.AIReviewJob
-	err := s.DB.Transaction(func(tx *gorm.DB) error {
+	err := s.DB.TaskTransaction(func(tx *gorm.DB) error {
 		var comp store.TaskCompletion
 		if err := tx.Where("id=? AND kid_id IN (SELECT id FROM kid WHERE family_id=?)", id, famOf(c)).First(&comp).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				status = http.StatusNotFound
 			}
+			return err
+		}
+		if err := engine.LockKid(&store.DB{DB: tx}, comp.KidID); err != nil {
+			return err
+		}
+		now, err := engine.LockedNow(&store.DB{DB: tx}, comp.KidID, s.now)
+		if err != nil {
 			return err
 		}
 		var dt store.DailyTask
@@ -71,11 +78,11 @@ func (s *Server) retryAIReview(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("daily_task_id=?", dt.ID).Order("id DESC").First(&latest).Error; err != nil {
 			return err
 		}
-		if latest.ID != id || latest.ConfirmStatus != "pending" || dt.Status != "submitted" {
+		if !engine.ReviewOpen(dt.Date, now) || latest.ID != id || latest.ConfirmStatus != "pending" || dt.Status != "submitted" {
 			status = http.StatusConflict
 			return fmt.Errorf("只能重试当前未处理的最新提交")
 		}
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("completion_id=?", id).First(&job).Error
+		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("completion_id=?", id).First(&job).Error
 		if err == nil {
 			switch job.Status {
 			case "queued", "running":

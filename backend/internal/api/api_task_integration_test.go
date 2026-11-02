@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,7 +74,7 @@ func taskIntegrationDB(t *testing.T) *store.DB {
 	if err := gdb.AutoMigrate(&store.Family{}, &store.Kid{}, &store.TaskTemplate{}, &store.TaskSchedule{},
 		&store.TaskAssign{}, &store.DailyTask{}, &store.TaskCompletion{}, &store.AIReviewJob{}, &store.LeaveRecord{},
 		&store.RewardPolicy{}, &store.Holiday{}, &store.Pet{}, &store.PetEvent{}, &store.SettlementLedger{},
-		&store.KidMessage{}); err != nil {
+		&store.KidMessage{}, &store.KidStreakDay{}, &store.OwnedItem{}); err != nil {
 		t.Fatal(err)
 	}
 	return &store.DB{DB: gdb}
@@ -250,6 +251,41 @@ func TestRejectedEditKeepsIDGoalAndRealDuration(t *testing.T) {
 	}
 }
 
+// 完成奖励曾经被 maxInt(x, 20) 夹住，家长填小于 20 的值存不进去。
+func TestTaskBaseScoreStoresExactlyWhatParentTyped(t *testing.T) {
+	s, tpl, kid, _ := taskFixture(t)
+	r := taskTestRouter(s, tpl.FamilyID, kid.ID)
+	edit := fmt.Sprintf("/api/admin/task/%d", tpl.ID)
+	for _, want := range []int{0, 1, 5, 19, 20, 100} {
+		body := taskEditBody("duration", 20)
+		body["base_score"] = want
+		requireTaskStatus(t, taskTestRequest(r, http.MethodPut, edit, body), http.StatusOK)
+		var current store.TaskTemplate
+		if err := s.DB.First(&current, tpl.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if current.BaseScore != want {
+			t.Fatalf("填 %d 应存 %d，实际 %d", want, want, current.BaseScore)
+		}
+	}
+}
+
+// 新建同样原样存，不补默认值。
+func TestTaskCreateBaseScoreKeepsTypedValue(t *testing.T) {
+	s, tpl, kid, _ := taskFixture(t)
+	r := taskTestRouter(s, tpl.FamilyID, kid.ID)
+	body := map[string]any{"name": "小奖励任务", "goal_type": "free", "base_score": 3,
+		"confirm_mode": "c", "date_mode": "weekday_fixed", "weekdays": "1,2,3,4,5,6,7"}
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, "/api/admin/task", body), http.StatusOK)
+	var created store.TaskTemplate
+	if err := s.DB.Where("family_id=? AND name=?", tpl.FamilyID, "小奖励任务").First(&created).Error; err != nil {
+		t.Fatalf("任务未创建: %v", err)
+	}
+	if created.BaseScore != 3 {
+		t.Fatalf("新建时填 3 应存 3，实际 %d", created.BaseScore)
+	}
+}
+
 func TestTaskEditRollbackAndOwnership(t *testing.T) {
 	s, tpl, kid, dt := taskFixture(t)
 	r := taskTestRouter(s, tpl.FamilyID, kid.ID)
@@ -290,8 +326,15 @@ func TestConcurrentTaskEditAndSubmit(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
+			var kidLockQueries atomic.Int32
 			if err := s.DB.Callback().Query().Before("gorm:query").Register("test_second_started", func(tx *gorm.DB) {
-				if (first == "submit" && isEdit(tx)) || (first == "edit" && isSubmit(tx)) {
+				// 提交先锁孩子时，编辑会停在孩子锁而尚未进入实例查询。
+				_, isKid := tx.Statement.Dest.(*store.Kid)
+				_, hasLock := tx.Statement.Clauses["FOR"]
+				if first == "submit" && isKid && hasLock && kidLockQueries.Add(1) == 2 {
+					startOnce.Do(func() { close(secondStarted) })
+				}
+				if first == "edit" && isSubmit(tx) {
 					startOnce.Do(func() { close(secondStarted) })
 				}
 			}); err != nil {
