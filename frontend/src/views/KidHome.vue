@@ -117,6 +117,7 @@ function openPlayground() {
   showBubble.value = false
   catAnim.value = 'sit'
   playOpen.value = true
+  markPlayHintPlayed()
 }
 function closePlayground() {
   playOpen.value = false
@@ -512,6 +513,44 @@ function toggleCompanion() {
   sheet.value = ''
   hudOpen.value = false
 }
+
+// 和猫玩入口气泡：只对还没玩过的孩子出现；玩过一次或累计曝光满 5 次后不再打扰。
+const PLAY_HINT_KEY = 'meowquest.playground.hint.v1'
+const PLAY_HINT_MAX_VIEWS = 5
+function readPlayHint() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PLAY_HINT_KEY) || '{}')
+    return { views: Number(raw.views) || 0, played: raw.played === true }
+  } catch {
+    return { views: 0, played: false }
+  }
+}
+function writePlayHint() {
+  try { localStorage.setItem(PLAY_HINT_KEY, JSON.stringify(playHint)) } catch { /* 无痕模式下忽略 */ }
+}
+const playHint = readPlayHint()
+const playHintActive = ref(false)
+let playHintCounted = false
+function markPlayHintPlayed() {
+  if (playHint.played) return
+  playHint.played = true
+  writePlayHint()
+  playHintActive.value = false
+}
+// 每次进房间记一次曝光，只在还没玩过时生效。
+watch(adopted, (hasCat) => {
+  if (!hasCat || playHintCounted) return
+  playHintCounted = true
+  if (playHint.played || playHint.views >= PLAY_HINT_MAX_VIEWS) return
+  playHint.views += 1
+  writePlayHint()
+  playHintActive.value = true
+})
+const showPlayHint = computed(() => playHintActive.value && adopted.value && !playOpen.value && !sheet.value)
+// 小屏收起态入口看不见，先指向「陪伴」；展开后再指向「和猫玩」。
+const showCompanionHint = computed(() => showPlayHint.value && isNarrow.value && !toolsOpen.value)
+const showPlaygroundHint = computed(() => showPlayHint.value && (!isNarrow.value || toolsOpen.value))
+const playgroundHintText = computed(() => (isNarrow.value ? '点这里，和猫玩！' : '新玩法！按住羽毛逗猫'))
 function checkNarrow() { isNarrow.value = narrowMedia.matches }
 function onViewportResize() {
   checkNarrow()
@@ -1628,7 +1667,7 @@ onBeforeUnmount(() => {
         <span>信箱</span>
         <i v-if="unread > 0" class="mail-dot">{{ unread > 99 ? '99+' : unread }}</i>
       </button>
-      <button class="mobile-companion" :class="{ on: toolsOpen }" :aria-expanded="toolsOpen" @click="toggleCompanion"><svg class="ui-icon"><use href="#room-paw" /></svg>陪伴</button>
+      <button class="mobile-companion" :class="{ on: toolsOpen }" :aria-expanded="toolsOpen" @click="toggleCompanion"><svg class="ui-icon"><use href="#room-paw" /></svg>陪伴<span v-if="showCompanionHint" class="play-entry-hint" aria-hidden="true">点「陪伴」，就能和猫玩</span></button>
       <span class="camera-hint">{{ camMode === 'free' ? '自由视角' : '拖动画面，逛逛小屋' }}</span>
       <button class="camera-reset" :class="{ free: camMode === 'free' }" @click="resetCam" aria-label="视角回到小猫"><svg class="ui-icon"><use href="#room-target" /></svg>回猫</button>
     </div>
@@ -1720,7 +1759,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="actions" v-show="!isNarrow || toolsOpen">
-      <button class="pbtn playground-entry" @click="openPlayground"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>和猫玩</b><small>羽毛逗猫 · 免费</small></span></button>
+      <button class="pbtn playground-entry" @click="openPlayground"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>和猫玩</b><small>羽毛逗猫 · 免费</small></span><span v-if="showPlaygroundHint" class="play-entry-hint" aria-hidden="true">{{ playgroundHintText }}</span></button>
       <button class="pbtn feed" @click="feed"><span class="action-icon"><svg class="ui-icon"><use href="#room-food" /></svg></span><span class="action-copy"><b>{{ placingFeed ? '取消喂食' : '喂猫粮' }}</b><small>10 星星 / 次</small></span></button>
       <button class="pbtn hint" @click="petCat"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>摸摸头</b><small>陪它开心一下</small></span></button>
       <button class="pbtn chatbtn" @click="openChat"><span class="action-icon"><svg class="ui-icon"><use href="#room-chat" /></svg></span><span class="action-copy"><b>聊聊天</b><small>今日还可聊 {{ chatLeft }} 句</small></span></button>
@@ -2007,7 +2046,43 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .pbtn small { display: block; font-size: 10px; line-height: 1.4; font-weight: 400; color: #88786A; }
 .actions { position: absolute; bottom: 30px; left: 24px; max-width: calc(100% - 470px); display: flex; gap: 10px; z-index: 17; }
 .actions .pbtn { display: flex; align-items: center; gap: 10px; min-width: 0; height: 52px; padding: 8px 14px; }
-.actions .playground-entry { background: #E9F1DD; color: #526646; border-color: #B9CAA7; }
+.actions .playground-entry { position: relative; background: #E9F1DD; color: #526646; border-color: #B9CAA7; }
+/* 新玩法引导气泡：跟着入口按钮走，点击气泡等同点击按钮 */
+.play-entry-hint {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  z-index: 3;
+  padding: 7px 12px;
+  border: 1.5px solid #B9CAA7;
+  border-radius: 12px;
+  background: #FFFCF6;
+  color: #4C6242;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.3;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(103, 75, 47, .16);
+  animation: play-hint-float 2s ease-in-out infinite;
+}
+.play-entry-hint::after {
+  content: '';
+  position: absolute;
+  top: calc(100% - 6px);
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  background: #FFFCF6;
+  border-right: 1.5px solid #B9CAA7;
+  border-bottom: 1.5px solid #B9CAA7;
+  border-bottom-right-radius: 3px;
+  transform: rotate(45deg);
+}
+@keyframes play-hint-float {
+  0%, 100% { transform: translateX(-50%) translateY(0); }
+  50% { transform: translateX(-50%) translateY(-3px); }
+}
 .actions .feed { background: #FFF0D9; border-color: #DABF9B; }
 .actions .hint { background: #EEE9F8; color: #75609D; border-color: #CFC2E3; }
 .actions .chatbtn { background: #F9EAE3; border-color: #DFC1B4; }
@@ -2169,7 +2244,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .nav-icon { display: flex; align-items: center; justify-content: center; }
   .nav-icon svg { width: 24px; height: 24px; }
   .room-tools { left: 16px; right: 16px; bottom: calc(92px + env(safe-area-inset-bottom, 0px)); justify-content: space-between; }
-  .mobile-companion { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; background: rgba(255, 252, 246, .94); color: #796653; border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+  .mobile-companion { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; background: rgba(255, 252, 246, .94); color: #796653; border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
   .mobile-companion.on, .mobile-companion.active { background: #EEEBF7; color: #75609D; border-color: #CFC2E3; }
   .actions { bottom: calc(142px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; max-width: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 4px; background: rgba(255, 252, 246, .9); border: 1px solid #E4D6C4; border-radius: 18px; box-shadow: 0 5px 16px rgba(103, 75, 47, .09); }
   .actions .pbtn { width: 100%; height: 58px; justify-content: center; gap: 8px; padding: 8px; }
@@ -2197,5 +2272,6 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .scene-item.shake, .think-cat, .think-dots i, .cursor, .chat-input .rec-btn.recording i { animation: none; }
   .cat-card, .cat-inner, .chip.mini .bar i, .wish-row .track i, :global(.drag-ghost) { transition: none; }
   .modal-box, .chat-box, .wizard-box, .tip-bubble { animation: none; }
+  .play-entry-hint { animation: none; }
 }
 </style>
