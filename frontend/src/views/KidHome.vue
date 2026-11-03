@@ -7,6 +7,7 @@ import PixelItem from '../components/PixelItem.vue'
 import GardenBackdrop from '../components/GardenBackdrop.vue'
 import { decorArt, getSceneLighting, isWallpaper, wallStyle } from '../scene-art.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
+import CatPlayground from '../components/CatPlayground.vue'
 import { evidenceSteps } from '../task-evidence.js'
 import { reviewPending, reviewStages } from '../ai-review.js'
 
@@ -81,6 +82,54 @@ const today = ref({ date: '', date_multiplier: 1, tasks: [] })
 const wishes = ref([])
 const shopItems = ref([])
 const sceneItems = ref([])
+const playOpen = ref(false)
+let roomPoseBeforePlay = null
+
+function openPlayground() {
+  if (!adopted.value || playOpen.value) return
+  // 不取消已经开始的吃饭、上传或计时，避免半途消费/任务状态被抢占。
+  if (eating || timerTask.value || wizard.value || startingTask.value || submitting.value || evidenceUploading.value || evidenceTask || chatStreaming.value || recState.value !== 'idle') {
+    showToast('先完成正在进行的操作，再和猫玩吧')
+    return
+  }
+  cancelDecorDrag?.()
+  cancelCameraDrag?.()
+  if (catEl.value) {
+    syncCatPos()
+    catEl.value.style.transition = 'none'
+  }
+  // 猫与相机都冻结在实际渲染点，而非仍在进行的 transition 终点。
+  if (worldEl.value && roomEl.value) {
+    const transform = getComputedStyle(worldEl.value).transform
+    const matrix = transform === 'none' ? null : new DOMMatrixReadOnly(transform)
+    camAnim.value = 'none'
+    if (matrix) setCamera(matrix.m41, matrix.m42)
+  }
+  roomPoseBeforePlay = { anim: walking ? 'sit' : catAnim.value, flipped: flipped.value, tools: toolsOpen.value, cameraMode: camMode.value }
+  interrupt()
+  placingFeed.value = false
+  hudOpen.value = false
+  toolsOpen.value = false
+  sheet.value = ''
+  chatOpen.value = false
+  mailOpen.value = false
+  hideTip()
+  showBubble.value = false
+  catAnim.value = 'sit'
+  playOpen.value = true
+}
+function closePlayground() {
+  playOpen.value = false
+  if (roomPoseBeforePlay) {
+    catAnim.value = roomPoseBeforePlay.anim
+    flipped.value = roomPoseBeforePlay.flipped
+    toolsOpen.value = roomPoseBeforePlay.tools
+    camMode.value = roomPoseBeforePlay.cameraMode
+    if (camMode.value === 'follow') centerOn(catPos.x, catPos.y - 48, 0)
+    roomPoseBeforePlay = null
+  }
+  if (adopted.value && !document.hidden) behaviorNext(1800)
+}
 
 // 猫行为
 const catAnim = ref('sit')
@@ -102,6 +151,7 @@ const zzz = ref(false)
 
 let stateTimer = null
 let walking = false
+let walkEpoch = 0
 
 // ===== API =====
 async function jget(url) {
@@ -158,7 +208,7 @@ function syncSceneLighting() { sceneLighting.value = getSceneLighting() }
 function onDocumentVisibility() {
   if (!document.hidden) {
     syncSceneLighting()
-    if (adopted.value) {
+    if (adopted.value && !playOpen.value) {
       refreshProgress()
       syncMail()
     }
@@ -324,16 +374,20 @@ function syncCatPos() {
 }
 // 打断猫当前行为（喂食/触摸可抢占自主走动）
 function interrupt() {
+  walkEpoch++
   clearTimeout(stateTimer)
   walking = false
 }
 async function walkTo(target, done, opts = {}) {
+  if (playOpen.value) return
   interrupt() // 抢占
+  const epoch = walkEpoch
   const el = catEl.value
   if (!el) return
   syncCatPos() // 先校准到真实位置
   el.style.transition = 'none'
   await nextTick() // 等 Vue 把校准位置 patch 到 DOM
+  if (playOpen.value || epoch !== walkEpoch) return
   void el.offsetWidth // 强制 reflow 固化
   walking = true
   catAnim.value = 'walk'
@@ -345,16 +399,18 @@ async function walkTo(target, done, opts = {}) {
   el.style.transition = `left ${dur / 1000}s linear, top ${dur / 1000}s linear`
   // 相机跟猫同步走（follow 模式）
   if (camMode.value === 'follow') centerOn(target.x, target.y - 48, dur / 1000)
-  requestAnimationFrame(() => { catPos.x = target.x; catPos.y = target.y })
+  requestAnimationFrame(() => { if (!playOpen.value && epoch === walkEpoch) { catPos.x = target.x; catPos.y = target.y } })
   clearTimeout(stateTimer)
-  stateTimer = setTimeout(() => { catAnim.value = 'sit'; walking = false; done && done() }, dur + 60)
+  stateTimer = setTimeout(() => { if (playOpen.value || epoch !== walkEpoch) return; catAnim.value = 'sit'; walking = false; done && done() }, dur + 60)
 }
 function lieDown() { zzz.value = false; catAnim.value = 'sleep' }
 function behaviorNext(delay) {
+  clearTimeout(stateTimer)
+  if (playOpen.value) return
   stateTimer = setTimeout(behaviorTick, delay || (600 + Math.random() * 1200))
 }
 function behaviorTick() {
-  if (!adopted.value) return
+  if (!adopted.value || playOpen.value) return
   const hungry = pet.value && pet.value.hunger < 30
   const r = Math.random()
   // 道具互动：饱腹时 35% 概率找植物/毛线球/猫窝玩（饿了没力气玩）
@@ -677,16 +733,25 @@ async function sendChat() {
 
 // 触摸交互：点地面 → 猫快速跑过去；点物品 → 跑过去互动
 let dragCam = null // 视角拖动状态
+let cancelCameraDrag = null
 function onRoomTap(e) {
-  if (!adopted.value || e.button !== 0) return
+  if (!adopted.value || playOpen.value || e.button !== 0) return
+  cancelCameraDrag?.()
   if (e.target.closest('button, input, .cat-wrap, .inv-bar')) return
   hudOpen.value = false
   toolsOpen.value = false
   const r = roomEl.value.getBoundingClientRect()
   // 视角拖动：按下后移动超阈值 → 拖动视角（不点地）
   dragCam = { sx: e.clientX, sy: e.clientY, camx: cam.value.x, camy: cam.value.y, moved: false }
+  const cleanup = () => {
+    document.removeEventListener('pointermove', move)
+    document.removeEventListener('pointerup', up)
+    document.removeEventListener('pointercancel', up)
+    dragCam = null
+    cancelCameraDrag = null
+  }
   const move = (ev) => {
-    if (!dragCam) return
+    if (!dragCam || playOpen.value || ev.pointerId !== e.pointerId) return
     const dx = ev.clientX - dragCam.sx, dy = ev.clientY - dragCam.sy
     if (!dragCam.moved && Math.hypot(dx, dy) < 12) return
     dragCam.moved = true
@@ -695,12 +760,10 @@ function onRoomTap(e) {
     setCamera(dragCam.camx + dx, dragCam.camy + dy)
   }
   const up = (ev) => {
-    document.removeEventListener('pointermove', move)
-    document.removeEventListener('pointerup', up)
-    document.removeEventListener('pointercancel', up)
+    if (ev.pointerId !== e.pointerId) return
     const wasDrag = dragCam && dragCam.moved
-    dragCam = null
-    if (wasDrag) return // 拖了视角就不点地
+    cleanup()
+    if (wasDrag || playOpen.value) return // 拖了视角就不点地
     // 点地（世界坐标 = 屏幕 - 视口原点 - 相机平移）
     if (ev.type === 'pointercancel') return
     const worldRect = worldEl.value.getBoundingClientRect()
@@ -710,6 +773,7 @@ function onRoomTap(e) {
     say(['来啦来啦！', '等等我～', '马上去！'][Math.floor(Math.random() * 3)])
     walkTo({ x, y }, () => behaviorNext(1500), { speed: 220 }) // 快速跑
   }
+  cancelCameraDrag = cleanup
   document.addEventListener('pointermove', move)
   document.addEventListener('pointerup', up)
   document.addEventListener('pointercancel', up)
@@ -725,7 +789,7 @@ function hearts(n) { hopFx() }
 
 // ===== 交互 =====
 async function petCat() {
-  if (!adopted.value) return
+  if (!adopted.value || playOpen.value) return
   const { data } = await jpost('/pet/touch')
   if (data.touch_left_today === 0 && data.touch_left_today !== undefined) showToast('今天摸够啦，小猫要被摸秃了～')
   hearts(3)
@@ -737,7 +801,7 @@ async function petCat() {
 const placingFeed = ref(false)
 let eating = false
 function feed() {
-  if (!adopted.value || eating) return
+  if (!adopted.value || eating || playOpen.value) return
   if (placingFeed.value) { placingFeed.value = false; say('不喂了吗？'); return } // 再点一次=取消
   placingFeed.value = true
   toolsOpen.value = false
@@ -778,7 +842,7 @@ const bowlPos = reactive({ x: 0, y: 0 })
 // ===== 任务 =====
 const submitting = ref(0)
 async function submitTask(t, body = {}) {
-  if (submitting.value) return
+  if (playOpen.value || submitting.value) return
   submitting.value = t.id
   const snap = t.snapshot
   const payload = {
@@ -866,17 +930,19 @@ function restoreTimer() {
 }
 const startingTask = ref(0)
 async function startTask(t) {
-  if (startingTask.value || submitting.value) return
+  if (playOpen.value || startingTask.value || submitting.value) return
   startingTask.value = t.id
   try {
     // 点击前复核最新状态：不能因旧页面、请求失败或家长编辑误启计时。
     if (!await refreshTasks()) return showToast('暂时无法更新任务，请稍后再试')
+    if (playOpen.value) return
     t = today.value.tasks.find(x => x.id === t.id)
     if (!t || t.status !== 'pending') return showToast('任务状态已更新，请查看任务列表')
     startCurrentTask(t)
   } finally { startingTask.value = 0 }
 }
 function startCurrentTask(t) {
+  if (playOpen.value) return
   const snap = t.snapshot
   let steps
   try { steps = parseSteps(snap) }
@@ -1147,24 +1213,29 @@ function onTimerGiveup() { timerTask.value = null; clearTimer() }
 
 // 拍照/录音（file input：HTTP 局域网下摄像头 API 不可用，iPad 会调起相机/录音）
 const evidenceInput = ref(null)
+const evidenceUploading = ref(false)
 let evidenceTask = null
+function cancelEvidencePick() { evidenceTask = null; timerSec = 0 }
 async function onEvidenceFile(e) {
   const f0 = e.target.files && e.target.files[0]
   e.target.value = ''
-  if (!f0 || !evidenceTask) return
-  const file = await normalizeImage(f0)
-  const fd = new FormData()
-  fd.append('file', file)
-  showToast('上传中…')
-  const r = await fetch('/api/upload', { method: 'POST', body: fd })
-  const d = await r.json()
-  if (!d.path) { showToast('上传失败，再试一次？'); return }
-  const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
+  if (!f0 || !evidenceTask) { cancelEvidencePick(); return }
+  if (playOpen.value || evidenceUploading.value) return
   const t = evidenceTask
-  evidenceTask = null
   const dur = timerSec || achievedDuration.value[t.id] || 0
-  timerSec = 0
-  await submitTask(t, { evidence: [{ type, path: d.path }], duration_sec: dur })
+  evidenceUploading.value = true
+  try {
+    const file = await normalizeImage(f0)
+    const fd = new FormData()
+    fd.append('file', file)
+    showToast('上传中…')
+    const r = await fetch('/api/upload', { method: 'POST', body: fd })
+    const d = await r.json()
+    if (!r.ok || !d.path) { showToast('上传失败，再试一次？'); return }
+    const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
+    await submitTask(t, { evidence: [{ type, path: d.path }], duration_sec: dur })
+  } catch { showToast('上传失败，请重新选择材料') }
+  finally { evidenceUploading.value = false; cancelEvidencePick() }
 }
 function taskBtnLabel(t) {
   const snap = t.snapshot
@@ -1286,6 +1357,7 @@ function shopAction(it) {
 // 拖拽：物品栏拖入房间（新摆放）；场景内拖动改位置；拖到边缘收回
 let cancelDecorDrag = null
 function onItemPointerDown(e, it, sceneId) {
+  if (playOpen.value) return
   if (e.button !== 0) return
   e.preventDefault()
   e.stopPropagation()
@@ -1398,7 +1470,7 @@ onMounted(async () => {
   syncSceneLighting()
   lightingTimer = setInterval(() => {
     syncSceneLighting()
-    if (!document.hidden && adopted.value) {
+    if (!document.hidden && adopted.value && !playOpen.value) {
       // 人审与跨日待结算也会改变连击/余额；前台持续同步，避免审核后状态停住。
       refreshProgress()
       syncMail()
@@ -1420,7 +1492,7 @@ onMounted(async () => {
   checkNarrow()
 })
 // 领养完成 → 初始化猫位置（修复：猫从左上角 0,0 起步的问题）
-watch(adopted, (v) => { if (v) setTimeout(initCat, 100) })
+watch(adopted, (v) => { if (v) setTimeout(initCat, 100); else if (playOpen.value) closePlayground() })
 onBeforeUnmount(() => {
   clearTimeout(stateTimer)
   viewportObserver?.disconnect()
@@ -1428,6 +1500,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', dismissStatusOutside)
   document.removeEventListener('visibilitychange', onDocumentVisibility)
   clearInterval(lightingTimer)
+  cancelCameraDrag?.()
   cancelDecorDrag?.()
 })
 </script>
@@ -1480,7 +1553,7 @@ onBeforeUnmount(() => {
   </div>
 
   <!-- 房间 -->
-  <div v-else class="room" ref="rootEl" :class="{ 'drawer-open': isNarrow && !!sheet }" :data-time-phase="sceneLighting.label">
+  <div v-else class="room" ref="rootEl" :inert="playOpen" :aria-hidden="playOpen ? 'true' : undefined" :class="{ 'drawer-open': isNarrow && !!sheet }" :data-time-phase="sceneLighting.label">
     <svg class="ui-icons" aria-hidden="true" width="0" height="0">
       <defs>
         <symbol id="room-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9Z" /></symbol>
@@ -1537,7 +1610,7 @@ onBeforeUnmount(() => {
       <div class="bubble" v-if="showBubble">{{ bubble }}</div>
       <span class="zzz" v-if="catAnim === 'sleep' && zzz">💤</span>
       <div class="cat-inner" :class="{ flip: flipped }">
-        <CatSprite :species="species" :anim="catAnim" :size="110" />
+        <CatSprite :species="species" :anim="catAnim" :size="110" :paused="playOpen" />
       </div>
     </div>
     </div><!-- /world -->
@@ -1647,6 +1720,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="actions" v-show="!isNarrow || toolsOpen">
+      <button class="pbtn playground-entry" @click="openPlayground"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>和猫玩</b><small>羽毛逗猫 · 免费</small></span></button>
       <button class="pbtn feed" @click="feed"><span class="action-icon"><svg class="ui-icon"><use href="#room-food" /></svg></span><span class="action-copy"><b>{{ placingFeed ? '取消喂食' : '喂猫粮' }}</b><small>10 星星 / 次</small></span></button>
       <button class="pbtn hint" @click="petCat"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>摸摸头</b><small>陪它开心一下</small></span></button>
       <button class="pbtn chatbtn" @click="openChat"><span class="action-icon"><svg class="ui-icon"><use href="#room-chat" /></svg></span><span class="action-copy"><b>聊聊天</b><small>今日还可聊 {{ chatLeft }} 句</small></span></button>
@@ -1776,7 +1850,7 @@ onBeforeUnmount(() => {
       @done="onTimerDone" @giveup="onTimerGiveup" />
 
     <!-- 拍照/录音（调起相机或语音备忘录） -->
-    <input ref="evidenceInput" type="file" :accept="'image/*,video/*,' + AUDIO_ACCEPT" capture="environment" style="display:none" @change="onEvidenceFile" />
+    <input ref="evidenceInput" type="file" :accept="'image/*,video/*,' + AUDIO_ACCEPT" capture="environment" style="display:none" @change="onEvidenceFile" @cancel="cancelEvidencePick" />
 
     <!-- 许愿输入框 -->
     <div v-if="wishModal" class="modal-mask" @click.self="wishModal = false">
@@ -1791,6 +1865,9 @@ onBeforeUnmount(() => {
       </div>
     </div>
   </div>
+  <Teleport to="body">
+    <CatPlayground v-if="playOpen && adopted" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
+  </Teleport>
 </template>
 
 <style scoped>
@@ -1930,6 +2007,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .pbtn small { display: block; font-size: 10px; line-height: 1.4; font-weight: 400; color: #88786A; }
 .actions { position: absolute; bottom: 30px; left: 24px; max-width: calc(100% - 470px); display: flex; gap: 10px; z-index: 17; }
 .actions .pbtn { display: flex; align-items: center; gap: 10px; min-width: 0; height: 52px; padding: 8px 14px; }
+.actions .playground-entry { background: #E9F1DD; color: #526646; border-color: #B9CAA7; }
 .actions .feed { background: #FFF0D9; border-color: #DABF9B; }
 .actions .hint { background: #EEE9F8; color: #75609D; border-color: #CFC2E3; }
 .actions .chatbtn { background: #F9EAE3; border-color: #DFC1B4; }
@@ -2098,7 +2176,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .action-icon svg { width: 22px; height: 22px; }
   .action-copy b { font-size: 13px; }
   .action-copy small { font-size: 10px; }
-  .actions .chatbtn { display: none; }
+  .actions .chatbtn { display: flex; }
   .inv-bar, .scene-viewport .inv-bar { bottom: calc(214px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; width: max-content; max-width: calc(100% - 32px); }
   .sidebar.narrow { top: auto; bottom: calc(90px + env(safe-area-inset-bottom, 0px)); left: 12px; right: 12px; width: auto; max-height: 60dvh; display: none; gap: 0; }
   .sidebar.narrow.open { display: flex; }

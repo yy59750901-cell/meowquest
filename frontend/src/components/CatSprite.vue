@@ -1,12 +1,13 @@
 <script setup>
 // CatSprite：hyclub 像素猫引擎的 Vue 组件版
-// 帧表/序列/调色板 100% 复用逆向源码；prop: species / anim(auto,walk,sit,sleep,eat) / size
+// 原有帧表保持不变；游乐场追加手工像素动作帧。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 const props = defineProps({
   species: { type: String, default: 'orange' },
-  anim: { type: String, default: 'sit' }, // auto | walk | sit | sleep | eat
+  anim: { type: String, default: 'sit' }, // auto | walk | sit | sleep | eat | crouch | pounce | catch | recover
   size: { type: Number, default: 110 },
+  paused: { type: Boolean, default: false },
 })
 
 const PAL = {
@@ -24,6 +25,16 @@ const FR = {
   sleep: ['................', '................', '................', '................', '................', '..B....B........', '..BB..BBppBBB...', '..BBBBBBppBBBB..', '.BeeBeeBBBBBBBB.', '.BBBBBBBBppBBBB.', '..BBBBBBBppBBBB.', '.BBBBBBBBBBBBB..'],
   eat: ['.B....B.....BB..', '.BB..BB.....BB..', '.BBBBBB.....BB..', 'BeBeBBBBppBBBB..', 'BmmBBBBpppBBBB..', 'BmmBBBBBBBBBB...', '.BBBBBBBBBBBB...', '.BBBBpppBBBBB...', '.BBBBpppBBBBB...', '.BB.BB..BB.BB...', '.BB.BB..BB.BB...', '.B...B..B...B...'],
 }
+const PLAY_FR = {
+  crouchA: ['................', '................', '................', '................', '.B....B......B..', '.BB..BB.....BB..', '.BBBBBB...BBBB..', 'BeBeBBBBppBBBB..', 'BBBBBBBpppBBBB..', '.BBBBBBBBBBBB...', 'BB.BBpppBBB.BB..', 'BBBBBBBBBBBBBB..'],
+  crouchB: ['................', '................', '................', '................', '..............B.', '.B....B......BB.', '.BB..BB...BBBBB.', '.BBBBBBBppBBBB..', 'BeBeBBBpppBBBB..', 'BBBBBBBBBBBBB...', 'BB.BBpppBBB.BB..', 'BBBBBBBBBBBBBB..'],
+  pounceA: ['................', '.B....B.........', '.BB..BB.........', '.BBBBBB......BB.', 'BeBeBBBBppBBBBB.', 'BBBBBBBpppBBBB..', '.BBBBBBBBBBBBB..', '.BBBBpppBBBBBB..', 'BB..BBBBBB..BBB.', 'BB...BBB......BB', 'B.....BB.......B', '................'],
+  pounceB: ['................', '................', '.B....B.........', '.BB..BB.......B.', '.BBBBBB......BB.', 'BeBeBBBBppBBBBB.', 'BBBBBBBpppBBBB..', '.BBBBBBBBBBBB...', 'BBB.BpppBBBBBB..', 'BB..BBBBBBB.BBB.', 'B....BB......BB.', '................'],
+  catchA: ['................', '..B....B........', '..BB..BB........', '..BBBBBB........', '.BeBeBBB........', '.BBBBBBB........', '..BBBBBBppB.....', '...BBBBppBBB....', '..BBppppBBBBB...', '..BBBpppBBBBB.B.', '...BBpppBBBBBBB.', '..BBBBBBBBBBBB..'],
+  catchB: ['................', '..B....B........', '..BB..BB........', '..BBBBBB........', '.BeBeBBB........', '.BBBBBBB........', '..BBBBBBppB.....', '..BBBBBppBBB....', '..BBBpppBBBBB...', '...BBpppBBBBB...', '..BBppppBBBBBBB.', '..BBBBBBBBBBBB..'],
+  recoverA: ['................', '................', '..B....B........', '..BB..BB........', '..BBBBBB........', '.BeBeBBBB..BB...', '.BBBBBBBppBBBB..', '..BBBBBBppBBBB..', '...BBBBBBBBBBB..', '..BBBBpppBBBBB..', '..BB.BBBBBB.BB..', '.BBB.BB..BB.BBB.'],
+  recoverB: ['................', '.B....B.....BB..', '.BB..BB.....BB..', '.BBBBBB.....BB..', 'BeBeBBBBppBBBB..', 'BBBBBBBpppBBBB..', '.BBBBBBBBBBBB...', '.BBBBpppBBBBB...', '.BBBBpppBBBBB...', '.BBB.BB..BBB.BB.', '.BB..BB...BB.BB.', '.B...B....B...B.'],
+}
 const VARf = (f, row, nl) => f.map((r, i) => (i === row ? nl : r))
 const FR_sitBlink = VARf(FR.sit, 3, '.BBBBBBB........')
 const FR_sitTail = VARf(FR.sit, 8, '...BBBBBBBBB..B.')
@@ -32,6 +43,10 @@ const SEQ = {
   sit: [[FR.sit, 1900], [FR_sitBlink, 140], [FR.sit, 850], [FR_sitTail, 260], [FR.sit, 260], [FR_sitTail, 260], [FR.sit, 1000]],
   sleep: [[FR.sleep, 1700], [FR_sleepDream, 1300], [FR.sleep, 900]],
   eat: [[FR.eat, 375]],
+  crouch: [[PLAY_FR.crouchA, 260], [PLAY_FR.crouchB, 200]],
+  pounce: [[PLAY_FR.pounceA, 240], [PLAY_FR.pounceB, 240]],
+  catch: [[PLAY_FR.catchA, 170], [PLAY_FR.catchB, 170]],
+  recover: [[PLAY_FR.recoverA, 150], [PLAY_FR.recoverB, 150]],
 }
 const AUTO_IDLE = ['idle', 'idle', 'idle', 'wag', 'idle', 'idle']
 const AUTO_WALK = ['walkA', 'walkB', 'walkA', 'walkB']
@@ -46,6 +61,7 @@ function currentSeq() {
 }
 function play() {
   clearTimeout(timer)
+  if (props.paused) return
   const seq = currentSeq()
   let idx = 0
   const tick = () => {
@@ -57,7 +73,7 @@ function play() {
   tick()
 }
 onMounted(play)
-watch(() => [props.anim, props.species], play)
+watch(() => [props.anim, props.species, props.paused], play)
 onBeforeUnmount(() => clearTimeout(timer))
 
 const rects = computed(() => {
