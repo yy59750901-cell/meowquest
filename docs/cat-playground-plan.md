@@ -216,3 +216,11 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - 发布前后四个孩子的streak/balance/earned_total一致，任务流水仍10笔、合计258；没有新增星星发放或消费。
 - 真实线上bundle在桌面1280x800和手机390x844用拦截API的模拟数据验收：房间入口、perfect评价、路线挑战完整通关、退出恢复通过，无页面报错；未登录真实账号、未向业务接口写入，手机截图无重叠或溢出。
 - 代码未提交/推送，线上来自当前工作区构建。真实手机Safari和孩子试玩仍待用户反馈。需要恢复时优先回滚备份二进制，本轮没有schema变化，不需为UI回滚恢复数据库。
+
+### 入口引导气泡部署（2026年11月3日17:11）
+
+- 用户授权部署并推送。发布范围只有房间页“和猫玩”入口气泡（KidHome.vue），玩法引擎与后端逻辑未变，无schema变化。
+- 部署前旧二进制备份在服务器 `/home/ubuntu/meowquest/backup-entry-hint-20261103_171104/meowquest.prev`（SHA256 fea3a6c8…），未备份数据库（本轮无数据写入变化）。
+- 线上 index.html 指向 index-DNju-YJj.js / index-DMDmEdgX.css，两个文件 SHA256 与本地 embed 产物一致，CSS 已含 play-entry-hint；systemd active，首页 HTTP 200。
+- 本地浏览器实测三态（桌面1280x800、手机390x844收起/展开）气泡均显示且不溢出不重叠；玩过一次后消失，连续进入第6次不再出现。线上真机Safari与孩子实际试玩仍待反馈。
+- 代码已提交并推送：commit 632126f → origin/main。
