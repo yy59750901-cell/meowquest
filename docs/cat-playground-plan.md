@@ -224,3 +224,11 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - 线上 index.html 指向 index-DNju-YJj.js / index-DMDmEdgX.css，两个文件 SHA256 与本地 embed 产物一致，CSS 已含 play-entry-hint；systemd active，首页 HTTP 200。
 - 本地浏览器实测三态（桌面1280x800、手机390x844收起/展开）气泡均显示且不溢出不重叠；玩过一次后消失，连续进入第6次不再出现。线上真机Safari与孩子实际试玩仍待反馈。
 - 代码已提交并推送：commit 632126f → origin/main。
+
+### 入口气泡移除（2026年11月4日10:25）
+
+- 用户反馈孩子已看到气泡、引导目的达成，授权按「重建 embed 产物 → 提交 push → 部署上线」撤掉该逻辑。
+- `KidHome.vue` 精确恢复到加入气泡前的 4a32179 版本（差异 0 行），移除气泡显示/计数/localStorage/动画全部逻辑；游乐场入口与房间交互不受影响。embed 产物重建后 hash 回到 index-CiOx2hB0.js / index-DcGKbptS.css。
+- 本地浏览器实测大屏、小屏收起、小屏展开三态气泡均为 0，入口仍能打开游乐场，构建通过；线上 js/css 的 SHA256 与本地一致，且 play-entry-hint / hint.v1 命中 0 处，首页 HTTP 200、systemd active。
+- 部署前旧二进制备份在服务器 `/home/ubuntu/meowquest/backup-remove-hint-20261104_102519/meowquest.prev`（SHA256 fba0b733…）；纯前端无 schema 变化，未备份数据库。
+- 提交推送：9def08e（代码与产物）→ origin/main。孩子端残留的 localStorage key 已无代码读取，无需清理。
