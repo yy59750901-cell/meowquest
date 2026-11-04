@@ -1,33 +1,66 @@
-// 世界坐标向上为正；cat.y 始终是脚底，平台 x 是中心、y 是顶面。
+// 世界坐标向上为正；cat.y 是脚底；x 首尾相接成圆柱，取模 360。
 export const CAT_CLIMB_CONFIG = Object.freeze({
   width: 360, height: 560, step: 1 / 120, maxDt: 0.1,
-  jumpSpeed: 430, gravity: 1000, horizontalSpeed: 160, catHalfWidth: 12,
-  startY: 56, cameraThreshold: 0.6, dropBuffer: 80,
+  jumpSpeed: 430, gravity: 1000, horizontalSpeed: 180, catHalfWidth: 12,
+  startY: 56, cameraThreshold: 0.82, dropBuffer: 110,
   ahead: 560 + 2 * (430 * 430 / 2000), maxPlatforms: 60,
-  minGap: 48, maxGap: 68, warmupWidth: 95, platformWidth: 60,
+  minGap: 48, maxGap: 80, warmupWidth: 95, platformWidth: 60,
   movingWidth: 65, maxAmplitude: 16, minPeriod: 3.6,
   landingMargin: 4, horizontalSafety: 10, difficultyEvery: 5, difficultyMaxLevel: 4,
+  coyote: 0.1, jumpBuffer: 0.1, scrollCap: 60, scrollSafety: 0.62,
+  shortWidth: 34, themeEvery: 6,
 })
 const C = CAT_CLIMB_CONFIG
 const EPS = 1e-9
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n))
+const wrap = (x) => ((x % C.width) + C.width) % C.width
+const ringDistance = (a, b) => {
+  const d = Math.abs(wrap(a) - wrap(b))
+  return Math.min(d, C.width - d)
+}
+const ringDelta = (from, to) => {
+  const d = wrap(to) - wrap(from)
+  if (d > C.width / 2) return d - C.width
+  if (d < -C.width / 2) return d + C.width
+  return d
+}
 const validMode = (mode) => mode === 'fixed' || mode === 'random'
 const validSeed = (seed) => Number.isInteger(seed) && seed >= 0 && seed <= 0xffffffff
 
 export const CAT_CLIMB_STAGE_LABELS = Object.freeze({
   warmup: '宽台热身', alternating: '交错爬高', narrow: '窄台练习', moving: '窄台与慢移台',
 })
+export const CAT_CLIMB_THEME_LABELS = Object.freeze({
+  stair: '小台阶', zigzag: '大摆动', cross: '跨半周', rush: '穿接缝',
+})
+// 外观只由 surface 决定；moving 是正交属性，任何地面都可以移动或静止。
+// accel 是 vx 趋近目标速度的一阶响应系数，worst 是可达性证明用的最坏有效横速比例。
+export const CAT_CLIMB_SURFACES = Object.freeze({
+  normal: Object.freeze({ key: 'normal', label: '普通地面', short: '普通', accel: 60, speedFactor: 1, belt: 0, worst: 0.95 }),
+  ice: Object.freeze({ key: 'ice', label: '冰面 · 会打滑', short: '冰面', accel: 3, speedFactor: 1, belt: 0, worst: 0.5 }),
+  sticky: Object.freeze({ key: 'sticky', label: '粘地面 · 变慢', short: '粘地', accel: 5, speedFactor: 0.55, belt: 0, worst: 0.35 }),
+  belt: Object.freeze({ key: 'belt', label: '传送带', short: '传送带', accel: 12, speedFactor: 1, belt: 0.35, worst: 0.6 }),
+})
 
+// 每档同时收紧平台、拉大间距、提高横速与镜头速度；scroll 恒低于该档最小 gap 的理论爬升速率。
 export const CAT_CLIMB_DIFFICULTIES = Object.freeze([
-  { stage: 'warmup', width: 95, minGap: 48, maxGap: 56, minOffset: 48, maxOffset: 60, movingBranchInterval: 0 },
-  { stage: 'alternating', width: 85, minGap: 48, maxGap: 60, minOffset: 54, maxOffset: 66, movingBranchInterval: 0 },
-  { stage: 'narrow', width: 72, minGap: 48, maxGap: 64, minOffset: 58, maxOffset: 70, movingBranchInterval: 6 },
-  { stage: 'moving', width: 64, minGap: 48, maxGap: 68, minOffset: 60, maxOffset: 74, movingBranchInterval: 4 },
-  { stage: 'moving', width: 60, minGap: 50, maxGap: 68, minOffset: 64, maxOffset: 76, movingBranchInterval: 3 },
+  { stage: 'warmup', width: 95, minGap: 48, maxGap: 56, minOffset: 40, maxOffset: 70,
+    speed: 180, scroll: 32, movingInterval: 0, shortChance: 0, surfaceChance: 0, surfaces: ['normal'] },
+  { stage: 'alternating', width: 85, minGap: 52, maxGap: 60, minOffset: 60, maxOffset: 110,
+    speed: 220, scroll: 38, movingInterval: 0, shortChance: 0.10, surfaceChance: 0, surfaces: ['normal'] },
+  { stage: 'narrow', width: 72, minGap: 58, maxGap: 66, minOffset: 80, maxOffset: 150,
+    speed: 255, scroll: 46, movingInterval: 6, shortChance: 0.18,
+    surfaceChance: 0.18, surfaces: ['normal', 'ice', 'sticky'] },
+  { stage: 'moving', width: 64, minGap: 64, maxGap: 72, minOffset: 100, maxOffset: 175,
+    speed: 290, scroll: 54, movingInterval: 4, shortChance: 0.24,
+    surfaceChance: 0.26, surfaces: ['normal', 'ice', 'sticky', 'belt'] },
+  { stage: 'moving', width: 60, minGap: 68, maxGap: 76, minOffset: 120, maxOffset: 190,
+    speed: 320, scroll: 60, movingInterval: 3, shortChance: 0.30,
+    surfaceChance: 0.34, surfaces: ['normal', 'ice', 'sticky', 'belt'] },
 ].map((settings) => Object.freeze(settings)))
 
 function checkDifficultyEvery(difficultyEvery) {
-  if (!Number.isSafeInteger(difficultyEvery) || difficultyEvery <= 0) throw new RangeError('升档层数必须是安全正整数')
+  if (!Number.isSafeInteger(difficultyEvery) || difficultyEvery <= 0) throw new RangeError('升档层数必须是安全非负整数')
   return difficultyEvery
 }
 
@@ -56,15 +89,16 @@ export function catClimbDescendingTime(gap) {
 
 export function getCatClimbPlatformX(platform, time) {
   const base = platform.baseX ?? platform.x
-  return platform.type === 'moving'
+  return wrap(platform.type === 'moving'
     ? base + platform.amplitude * Math.sin(time * 2 * Math.PI / platform.period + platform.phase)
-    : base
+    : base)
 }
 
-// 对全部可能的脚底接触中心（含平台运动两端）证明，而非只证明中心到中心。
-// 目标区间取各运动相位的交集，并要求脚底至少重叠 landingMargin。
-// 任意 entry 到该区间的最短距离 <= 下降落地时间 * 速度 - safety。
-export function proveCatClimbSegment(from, to) {
+// 环形可达性：脚底接触区间按环形最短距离度量，并额外校验镜头追不上玩家的理论爬升速率。
+export function proveCatClimbSegment(from, to, opts = {}) {
+  const speed = Number.isFinite(opts.speed) ? opts.speed : C.horizontalSpeed
+  const scroll = Number.isFinite(opts.scroll) ? opts.scroll : 0
+  const maxGap = Number.isFinite(opts.maxGap) ? opts.maxGap : C.maxGap
   const geometry = (p) => p && Number.isFinite(p.baseX ?? p.x) && Number.isFinite(p.y)
     && Number.isFinite(p.width) && p.width >= C.landingMargin * 2
     && ['fixed', 'moving'].includes(p.type)
@@ -74,23 +108,31 @@ export function proveCatClimbSegment(from, to) {
   if (!geometry(from) || !geometry(to)) return { valid: false, reason: 'invalid-geometry' }
   const gap = to.y - from.y
   const time = catClimbDescendingTime(gap)
-  if (!time || gap < C.minGap || gap > C.maxGap) return { valid: false, reason: 'invalid-gap', gap }
+  if (!time || gap < C.minGap || gap > maxGap) return { valid: false, reason: 'invalid-gap', gap }
   const a = from.type === 'moving' ? from.amplitude : 0
   const b = to.type === 'moving' ? to.amplitude : 0
-  const x1 = from.baseX ?? from.x
-  const x2 = to.baseX ?? to.x
-  const fromEntry = [clamp(x1 - from.width / 2 - a - C.catHalfWidth, C.catHalfWidth, C.width - C.catHalfWidth),
-    clamp(x1 + from.width / 2 + a + C.catHalfWidth, C.catHalfWidth, C.width - C.catHalfWidth)]
-  const landingInterval = [Math.max(C.catHalfWidth, x2 - to.width / 2 + b - C.catHalfWidth + C.landingMargin),
-    Math.min(C.width - C.catHalfWidth, x2 + to.width / 2 - b + C.catHalfWidth - C.landingMargin)]
-  const endpointDistances = fromEntry.map((x) => Math.max(landingInterval[0] - x, x - landingInterval[1], 0))
-  const horizontalBudget = C.horizontalSpeed * time - C.horizontalSafety
-  const inBounds = x1 - from.width / 2 - a >= 0 && x1 + from.width / 2 + a <= C.width
-    && x2 - to.width / 2 - b >= 0 && x2 + to.width / 2 + b <= C.width
-  return { valid: inBounds && landingInterval[0] <= landingInterval[1]
-      && Math.max(...endpointDistances) <= horizontalBudget + EPS,
-    gap, descendingTime: time, horizontalBudget, fromEntry, landingInterval, endpointDistances,
-    margin: C.landingMargin, safety: C.horizontalSafety, fromId: from.id, toId: to.id }
+  const x1 = wrap(from.baseX ?? from.x)
+  const x2 = wrap(to.baseX ?? to.x)
+  const halfFrom = from.width / 2 + a + C.catHalfWidth
+  const entries = [wrap(x1 - halfFrom), x1, wrap(x1 + halfFrom)]
+  const halfLanding = Math.max(0, to.width / 2 - b + C.catHalfWidth - C.landingMargin)
+  const endpointDistances = entries.map((x) => Math.max(0, ringDistance(x, x2) - halfLanding))
+  const horizontalBudget = speed * time - C.horizontalSafety
+  const climbRate = gap / time
+  const scrollValid = scroll <= climbRate * C.scrollSafety + EPS
+  const valid = halfLanding > 0 && scrollValid
+    && Math.max(...endpointDistances) <= horizontalBudget + EPS
+  return { valid, gap, descendingTime: time, horizontalBudget, climbRate, scroll, scrollValid,
+    fromEntry: entries, landingInterval: [wrap(x2 - halfLanding), wrap(x2 + halfLanding)],
+    landingHalfWidth: halfLanding, endpointDistances, margin: C.landingMargin,
+    safety: C.horizontalSafety, fromId: from.id, toId: to.id }
+}
+
+function themePool(level) {
+  if (level <= 0) return ['stair']
+  if (level === 1) return ['stair', 'zigzag']
+  if (level === 2) return ['stair', 'zigzag', 'cross']
+  return ['stair', 'zigzag', 'cross', 'rush']
 }
 
 export function createCatClimbGenerator({ seed = 1, mode = 'random', difficultyEvery = C.difficultyEvery } = {}) {
@@ -99,110 +141,91 @@ export function createCatClimbGenerator({ seed = 1, mode = 'random', difficultyE
   const routeSeed = routeMode === 'fixed' ? 0xc47 : validSeed(seed) ? seed : 1
   const random = createCatClimbRandom(routeSeed)
   const settingsAt = (index) => getCatClimbStage(index, { difficultyEvery })
-  const branchDue = (index, settings) => settings.movingBranchInterval > 0
-    && (index - 1 - settings.level * difficultyEvery) % settings.movingBranchInterval === 0
-  const start = () => ({ id: 0, index: 0, stage: 'warmup', difficultyLevel: 0, level: 0,
-    x: 180, baseX: 180, y: C.startY, width: C.warmupWidth,
-    type: 'fixed', primary: true, launchpad: true, chunk: 0 })
   let index = 0
-  let last = start()
-  let fork = null
-  let pattern = 0
-  let sign = 1
+  let last = {
+    id: 0, index: 0, baseX: 180, x: 180, y: C.startY, width: C.warmupWidth,
+    type: 'fixed', primary: true, launchpad: true, stage: 'warmup', level: 0,
+    difficultyLevel: 0, theme: 'stair', surface: 'normal', beltDir: 1,
+  }
+  function start() { return { ...last } }
   function next() {
-    index++
+    index += 1
     const settings = settingsAt(index)
-    const gap = routeMode === 'fixed' ? Math.floor((settings.minGap + settings.maxGap) / 2)
-      : settings.minGap + Math.floor(random() * (settings.maxGap - settings.minGap + 1))
-    const width = settings.width
+    const pool = themePool(settings.level)
+    const theme = routeMode === 'fixed'
+      ? pool[Math.floor(index / C.themeEvery) % pool.length]
+      : pool[Math.floor(random() * pool.length)]
+    let gap = settings.minGap + Math.floor(random() * (settings.maxGap - settings.minGap + 1))
+    // 镜头速度必须能被该 gap 的理论爬升速率覆盖，否则数学上追不上。
+    while (gap < settings.maxGap
+      && settings.scroll > (gap / catClimbDescendingTime(gap)) * C.scrollSafety) gap += 1
     const y = last.y + gap
-    const chunk = Math.floor(index / 6)
-    if (index % 6 === 0) {
-      pattern = routeMode === 'fixed' ? chunk % 3 : Math.floor(random() * 3)
-      sign = last.baseX > 180 ? -1 : 1
-    }
-    const primary = { id: index * 2, index, stage: settings.stage, difficultyLevel: settings.level, level: settings.level,
-      x: last.baseX, baseX: last.baseX, y, width, type: 'fixed', primary: true, chunk }
-    const branches = []
-    const proofs = []
-    // 世界边界与全 entry 可达区间取交集，不能先夹边再用另一夹持把平台推出边界。
-    const budget = C.horizontalSpeed * catClimbDescendingTime(gap) - C.horizontalSafety
-    const maxOffset = budget - (last.width - width) / 2 - C.landingMargin
-    let minX = Math.max(width / 2 + 10, last.baseX - maxOffset)
-    let maxX = Math.min(C.width - width / 2 - 10, last.baseX + maxOffset)
-    if (fork) {
-      primary.baseX = fork.joinX
-      primary.x = primary.baseX
-      proofs.push(proveCatClimbSegment(fork.branch, primary))
-      fork = null
+    let width = settings.width
+    if (random() < settings.shortChance) width = C.shortWidth
+    const moving = settings.movingInterval > 0 && index % settings.movingInterval === 0
+    if (moving) width = Math.max(width, C.movingWidth)
+    const amplitude = moving ? 8 + Math.floor(random() * 8) : 0
+    const chunk = Math.floor(index / C.themeEvery)
+    // 大跨度路线强制普通地面，避免减速类地面把跨半周做成死局。
+    const bigJump = theme === 'cross' || theme === 'rush'
+    const specials = settings.surfaces.filter((s) => s !== 'normal')
+    const surface = (bigJump || !specials.length || random() >= settings.surfaceChance)
+      ? 'normal' : specials[Math.floor(random() * specials.length)]
+    // zigzag 段传送带顺向助推，其余随机左右。
+    const beltDir = theme === 'zigzag' ? (chunk % 2 === 0 ? 1 : -1)
+      : (random() < 0.5 ? -1 : 1)
+    // 地面效果延续到起跳后的空中，所以证明用「起跳平台」的最坏有效横速。
+    const proveSpeed = settings.speed * CAT_CLIMB_SURFACES[last.surface || 'normal'].worst
+    let delta = 0
+    if (theme === 'stair') {
+      const top = Math.min(settings.maxOffset, 80)
+      delta = (random() < 0.5 ? -1 : 1) * (settings.minOffset + random() * (top - settings.minOffset))
+    } else if (theme === 'zigzag') {
+      delta = (chunk % 2 === 0 ? 1 : -1) * settings.maxOffset * (0.7 + random() * 0.3)
+    } else if (theme === 'cross') {
+      delta = (random() < 0.5 ? -1 : 1) * (C.width / 2 - 8 + random() * 16)
     } else {
-      const nextSettings = settingsAt(index + 1)
-      if (branchDue(index + 1, nextSettings)) {
-        // 前一固定台预留分叉起跳区；最坏幅度/宽度/间距也可接两侧，N=1 不跳过慢移入门档。
-        const incoming = C.horizontalSpeed * catClimbDescendingTime(nextSettings.maxGap) - C.horizontalSafety
-          - (width - nextSettings.width) / 2 - C.landingMargin
-        const joinSettings = settingsAt(index + 2)
-        const outgoing = C.horizontalSpeed * catClimbDescendingTime(joinSettings.maxGap) - C.horizontalSafety
-          - (nextSettings.width - joinSettings.width) / 2 - C.maxAmplitude - C.landingMargin
-        const offset = Math.min(nextSettings.maxOffset, incoming - C.maxAmplitude, outgoing)
-        const minLaunch = nextSettings.width / 2 + 10 + 2 * offset - incoming + C.maxAmplitude
-        const maxLaunch = C.width - nextSettings.width / 2 - C.maxAmplitude - 2 * offset + incoming
-        minX = Math.max(minX, minLaunch)
-        maxX = Math.min(maxX, maxLaunch)
-      }
-      const offset = settings.minOffset + Math.floor(random() * (settings.maxOffset - settings.minOffset + 1))
-      const sequence = [[1, -1, 1, -1], [-1, -1, 1, 1], [1, 1, -1, -1]][pattern]
-      // 起点软垫只用于启动；第一落点需要右移，不可不操作刷层数。
-      primary.baseX = clamp(index === 1 ? last.baseX + settings.maxOffset
-        : last.baseX + sign * sequence[index % 4] * offset, minX, maxX)
-      if (branchDue(index, settings)) {
-        const amplitude = 12 + Math.floor(random() * 5)
-        const nextSettings = settingsAt(index + 1)
-        // 汇合按下一档最窄宽度、最大 gap、所有移动相位证明；N=1 也不可沿用当前档。
-        const nextBudget = C.horizontalSpeed * catClimbDescendingTime(nextSettings.maxGap) - C.horizontalSafety
-        const forkOffset = Math.min(offset, maxOffset - amplitude,
-          nextBudget - (width - nextSettings.width) / 2 - amplitude - C.landingMargin)
-        const minOrigin = Math.max(width / 2 + 10 + forkOffset,
-          nextSettings.width / 2 + 10, last.baseX + forkOffset - maxOffset)
-        const maxOrigin = Math.min(C.width - width / 2 - amplitude - forkOffset,
-          C.width - nextSettings.width / 2 - 10, last.baseX - forkOffset + maxOffset - amplitude)
-        if (minOrigin <= maxOrigin) {
-          const origin = clamp(last.baseX, minOrigin, maxOrigin)
-          const forkPrimary = { ...primary, baseX: origin - forkOffset, x: origin - forkOffset }
-          const branch = { ...primary, id: index * 2 + 1, baseX: origin + forkOffset, x: origin + forkOffset,
-            type: 'moving', primary: false, amplitude, period: C.minPeriod + random() * 1.6,
-            phase: random() * 2 * Math.PI, rejoinsId: (index + 1) * 2 }
-          const nextPreview = { ...primary, id: (index + 1) * 2, index: index + 1, stage: nextSettings.stage,
-            difficultyLevel: nextSettings.level, level: nextSettings.level, width: nextSettings.width,
-            baseX: origin, x: origin, y: y + nextSettings.maxGap }
-          const branchProof = proveCatClimbSegment(last, branch)
-          if (proveCatClimbSegment(last, forkPrimary).valid && branchProof.valid
-              && proveCatClimbSegment(forkPrimary, nextPreview).valid && proveCatClimbSegment(branch, nextPreview).valid) {
-            Object.assign(primary, forkPrimary)
-            branches.push(branch)
-            proofs.push(branchProof)
-            fork = { joinX: origin, branch }
-          }
-        }
-      }
+      delta = ringDelta(last.baseX, random() < 0.5 ? 8 : C.width - 8)
     }
-    primary.x = primary.baseX
-    const proof = proveCatClimbSegment(last, primary)
-    if (!proof.valid || proofs.some((p) => !p.valid)) throw new Error('爬高路段可达性约束失败')
-    proofs.unshift(proof)
-    last = primary
-    return { primary: { ...primary }, branches: branches.map((p) => ({ ...p })),
-      proofs: proofs.map((p) => ({ ...p, fromEntry: [...p.fromEntry], landingInterval: [...p.landingInterval],
-        endpointDistances: [...p.endpointDistances] })) }
+    const proofFor = (baseX, candidateGap) => {
+      const candidate = {
+        id: index, index, baseX, x: baseX, y: last.y + candidateGap, width,
+        type: moving ? 'moving' : 'fixed', primary: true, theme, surface, beltDir,
+        ...(moving ? { amplitude, period: C.minPeriod + random() * 1.6, phase: random() * 2 * Math.PI } : {}),
+      }
+      return { candidate,
+        proof: proveCatClimbSegment(last, candidate,
+          { speed: proveSpeed, scroll: settings.scroll, maxGap: settings.maxGap }) }
+    }
+    let { candidate, proof } = proofFor(wrap(last.baseX + delta), gap)
+    let shrink = 1
+    while (!proof.valid && shrink > 0.04) {
+      shrink *= 0.78
+      const retry = proofFor(wrap(last.baseX + delta * shrink), gap)
+      candidate = retry.candidate
+      proof = retry.proof
+    }
+    if (!proof.valid) {
+      const retry = proofFor(wrap(last.baseX + settings.minOffset), gap)
+      candidate = retry.candidate
+      proof = retry.proof
+    }
+    if (!proof.valid) throw new Error('爬高路段可达性约束失败')
+    const platform = { ...candidate, stage: settings.stage, level: settings.level,
+      difficultyLevel: settings.level }
+    last = platform
+    return { primary: { ...platform }, branches: [],
+      proofs: [{ ...proof, fromEntry: [...proof.fromEntry], landingInterval: [...proof.landingInterval],
+        endpointDistances: [...proof.endpointDistances] }] }
   }
   function snapshot() {
     return { mode: routeMode, seed: routeSeed, difficultyEvery, index,
-      difficultyLevel: last.difficultyLevel, level: last.level, last: { ...last } }
+      difficultyLevel: last.difficultyLevel, level: last.level, theme: last.theme, last: { ...last } }
   }
   return { next, start, snapshot }
 }
 
-// 连续解脚底下降跨顶的时刻；横向夹边和移动平台均在该时刻取位置。
+// 连续解脚底下降跨顶的时刻；横向环绕，落点按环形距离判断。
 export function sweepCatClimbLanding(cat, platforms, dt, simTime = 0) {
   if (!cat || ![cat.x, cat.y, cat.vx, cat.vy, dt, simTime].every(Number.isFinite) || dt <= 0) return null
   let first = null
@@ -212,35 +235,39 @@ export function sweepCatClimbLanding(cat, platforms, dt, simTime = 0) {
     if (discriminant < 0) continue
     const time = (cat.vy + Math.sqrt(discriminant)) / C.gravity
     if (time < -EPS || time > dt + EPS || cat.vy - C.gravity * time >= -EPS) continue
-    const x = clamp(cat.x + cat.vx * time, C.catHalfWidth, C.width - C.catHalfWidth)
+    const x = wrap(cat.x + cat.vx * time)
     const platformX = getCatClimbPlatformX(p, simTime + time)
-    if (Math.abs(x - platformX) >= p.width / 2 + C.catHalfWidth - EPS) continue
-    if (!first || time < first.time) first = { time: Math.max(0, time), x, y: p.y, id: p.id, type: p.type,
-      index: p.index, stage: p.stage }
+    if (ringDistance(x, platformX) >= p.width / 2 + C.catHalfWidth - EPS) continue
+    if (!first || time < first.time) first = { time: Math.max(0, time), x, y: p.y, id: p.id,
+      type: p.type, index: p.index, stage: p.stage, theme: p.theme,
+      surface: p.surface || 'normal', beltDir: p.beltDir || 1 }
   }
   return first
 }
 
 export function createCatClimbEngine({ seed = 1, mode = 'random', difficultyEvery = C.difficultyEvery } = {}) {
   checkDifficultyEvery(difficultyEvery)
-  let state
-  let generator
-  let accumulator = 0
-  let direction = 0
-  let priorPhase = 'ready'
+  let state, generator, accumulator = 0, direction = 0, priorPhase = 'ready'
   let routeSeed = validSeed(seed) ? seed : 1
   let routeMode = validMode(mode) ? mode : 'random'
+  const settingsNow = () => CAT_CLIMB_DIFFICULTIES[state.difficultyLevel]
   function reset() {
     generator = createCatClimbGenerator({ seed: routeSeed, mode: routeMode, difficultyEvery })
     accumulator = 0
     direction = 0
     priorPhase = 'ready'
-    state = { phase: 'ready', mode: routeMode, seed: routeSeed,
-      cat: { x: 180, y: C.startY, vx: 0, vy: 0, facing: 1 },
-      platforms: [generator.start()], cameraY: 0, height: 0, floor: 0, maxLandingIndex: 0,
+    const startPlatform = generator.start()
+    state = {
+      phase: 'ready', mode: routeMode, seed: generator.snapshot().seed,
+      cat: { x: 180, y: C.startY, vx: 0, vy: 0, facing: 1, grounded: true, surface: 'normal' },
+      groundId: startPlatform.id, coyoteUntil: 0, jumpQueuedUntil: 0,
+      beltDir: 1, surfaceLabel: CAT_CLIMB_SURFACES.normal.label,
+      platforms: [startPlatform], cameraY: 0, height: 0, floor: 0, maxLandingIndex: 0,
       difficultyEvery, difficultyLevel: 0, level: 0, difficultyCapped: false,
       difficultyStage: 'warmup', difficultyLabel: CAT_CLIMB_STAGE_LABELS.warmup,
-      reason: '', simTime: 0, jumps: 0, lastLanding: null }
+      speed: CAT_CLIMB_DIFFICULTIES[0].speed, scrollSpeed: CAT_CLIMB_DIFFICULTIES[0].scroll,
+      theme: 'stair', reason: '', simTime: 0, jumps: 0, lastLanding: null,
+    }
     generate()
   }
   function generate() {
@@ -261,40 +288,83 @@ export function createCatClimbEngine({ seed = 1, mode = 'random', difficultyEver
     state.height = Math.max(state.height, (y - C.startY) / 10)
     state.cameraY = Math.max(state.cameraY, y - C.height * C.cameraThreshold)
   }
+  function launch() {
+    state.cat.vy = C.jumpSpeed
+    state.cat.grounded = false
+    state.groundId = null
+    state.coyoteUntil = 0
+    state.jumpQueuedUntil = 0
+  }
   function step() {
+    const settings = settingsNow()
+    state.speed = settings.speed
+    state.scrollSpeed = settings.scroll
+    state.cameraY += settings.scroll * C.step
+    // 地面效果延续到下一次落地：vx 按当前表面的一阶响应逼近目标速度，传送带叠加方向偏置。
+    const surface = CAT_CLIMB_SURFACES[state.cat.surface] || CAT_CLIMB_SURFACES.normal
+    const targetVx = direction * settings.speed * surface.speedFactor
+      + (surface.belt ? state.beltDir * settings.speed * surface.belt : 0)
+    state.cat.vx += (targetVx - state.cat.vx) * Math.min(1, surface.accel * C.step)
     let remaining = C.step
     while (remaining > EPS) {
       const cat = state.cat
-      const hit = sweepCatClimbLanding(cat, state.platforms, remaining, state.simTime)
-      const elapsed = hit ? hit.time : remaining
-      // 精确采样步内顶点，最高高度不依赖渲染帧率。
-      const apexTime = clamp(cat.vy / C.gravity, 0, elapsed)
-      updateHeight(cat.y + cat.vy * apexTime - C.gravity * apexTime ** 2 / 2)
-      cat.x = clamp(cat.x + cat.vx * elapsed, C.catHalfWidth, C.width - C.catHalfWidth)
-      cat.y += cat.vy * elapsed - C.gravity * elapsed ** 2 / 2
-      cat.vy -= C.gravity * elapsed
-      state.simTime += elapsed
-      remaining -= elapsed
-      if (hit) {
-        cat.y = hit.y
-        cat.vy = C.jumpSpeed
-        state.jumps++
-        state.lastLanding = { id: hit.id, type: hit.type, index: hit.index, stage: hit.stage,
-          x: hit.x, y: hit.y, time: state.simTime }
-        state.floor = Math.max(state.floor, hit.index)
-        state.maxLandingIndex = state.floor
-        state.difficultyLevel = Math.min(C.difficultyMaxLevel, Math.floor(state.floor / difficultyEvery))
-        state.level = state.difficultyLevel
-        state.difficultyCapped = state.level === C.difficultyMaxLevel
-        state.difficultyStage = CAT_CLIMB_DIFFICULTIES[state.level].stage
-        state.difficultyLabel = CAT_CLIMB_STAGE_LABELS[state.difficultyStage]
+      if (cat.grounded) {
+        const elapsed = remaining
+        remaining = 0
+        const support = state.platforms.find((p) => p.id === state.groundId)
+        if (support) {
+          const before = getCatClimbPlatformX(support, state.simTime)
+          const after = getCatClimbPlatformX(support, state.simTime + elapsed)
+          cat.x = wrap(cat.x + wrap(after - before + C.width / 2) - C.width / 2 + cat.vx * elapsed)
+          if (ringDistance(cat.x, after) > support.width / 2 + C.catHalfWidth - EPS) {
+            cat.grounded = false
+            cat.vy = 0
+            state.groundId = null
+            state.coyoteUntil = state.simTime + elapsed + C.coyote
+          }
+        } else {
+          cat.x = wrap(cat.x + cat.vx * elapsed)
+        }
+        state.simTime += elapsed
+        if (cat.grounded && state.jumpQueuedUntil >= state.simTime) launch()
+      } else {
+        const hit = sweepCatClimbLanding(cat, state.platforms, remaining, state.simTime)
+        const elapsed = hit ? hit.time : remaining
+        const apexTime = clamp(cat.vy / C.gravity, 0, elapsed)
+        updateHeight(cat.y + cat.vy * apexTime - C.gravity * apexTime ** 2 / 2)
+        cat.x = wrap(cat.x + cat.vx * elapsed)
+        cat.y += cat.vy * elapsed - C.gravity * elapsed ** 2 / 2
+        cat.vy -= C.gravity * elapsed
+        state.simTime += elapsed
+        remaining -= elapsed
+        if (hit) {
+          cat.y = hit.y
+          cat.vy = 0
+          cat.grounded = true
+          state.groundId = hit.id
+          state.jumps++
+          state.lastLanding = { id: hit.id, type: hit.type, index: hit.index, stage: hit.stage,
+            theme: hit.theme, x: hit.x, y: hit.y, time: state.simTime }
+          state.floor = Math.max(state.floor, hit.index)
+          state.maxLandingIndex = state.floor
+          state.difficultyLevel = Math.min(C.difficultyMaxLevel, Math.floor(state.floor / difficultyEvery))
+          state.level = state.difficultyLevel
+          state.difficultyCapped = state.level === C.difficultyMaxLevel
+          state.difficultyStage = CAT_CLIMB_DIFFICULTIES[state.level].stage
+          state.difficultyLabel = CAT_CLIMB_STAGE_LABELS[state.difficultyStage]
+          state.theme = hit.theme || 'stair'
+          state.cat.surface = hit.surface || 'normal'
+          state.beltDir = hit.beltDir || 1
+          state.surfaceLabel = CAT_CLIMB_SURFACES[state.cat.surface].label
+          if (state.jumpQueuedUntil >= state.simTime) launch()
+        }
       }
     }
     for (const p of state.platforms) p.x = getCatClimbPlatformX(p, state.simTime)
     generate()
     if (state.cat.y < state.cameraY - C.dropBuffer) {
       state.phase = 'ended'
-      state.reason = '没接住平台'
+      state.reason = '没跟上上升的地面'
       state.cat.vx = 0
       direction = 0
       accumulator = 0
@@ -306,13 +376,17 @@ export function createCatClimbEngine({ seed = 1, mode = 'random', difficultyEver
       case 'start':
         if (state.phase !== 'ready') break
         state.phase = 'running'
-        state.cat.vy = C.jumpSpeed
-        state.jumps = 1
+        state.cat.vy = 0
+        state.cat.grounded = true
+        break
+      case 'jump':
+        if (state.phase !== 'running') break
+        state.jumpQueuedUntil = state.simTime + C.jumpBuffer
+        if (state.cat.grounded || state.simTime <= state.coyoteUntil) launch()
         break
       case 'direction':
         if (state.phase !== 'running' || ![-1, 0, 1].includes(event.direction)) break
         direction = event.direction
-        state.cat.vx = direction * C.horizontalSpeed
         if (direction) state.cat.facing = direction
         break
       case 'pause':
@@ -330,8 +404,9 @@ export function createCatClimbEngine({ seed = 1, mode = 'random', difficultyEver
         break
       case 'reset':
         if ((event.mode !== undefined && !validMode(event.mode))
-            || (event.seed !== undefined && !validSeed(event.seed))
-            || (event.difficultyEvery !== undefined && (!Number.isSafeInteger(event.difficultyEvery) || event.difficultyEvery <= 0))) break
+          || (event.seed !== undefined && !validSeed(event.seed))
+          || (event.difficultyEvery !== undefined && (!Number.isSafeInteger(event.difficultyEvery)
+            || event.difficultyEvery <= 0))) break
         routeMode = event.mode ?? routeMode
         routeSeed = event.seed ?? routeSeed
         difficultyEvery = event.difficultyEvery ?? difficultyEvery
@@ -345,7 +420,6 @@ export function createCatClimbEngine({ seed = 1, mode = 'random', difficultyEver
     accumulator += Math.min(dt, C.maxDt)
     while (accumulator + EPS >= C.step && state.phase === 'running') {
       accumulator = Math.max(0, accumulator - C.step)
-      state.cat.vx = direction * C.horizontalSpeed
       step()
     }
     return snapshot()

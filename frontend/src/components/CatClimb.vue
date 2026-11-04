@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useId } from 'vue'
 import CatSprite from './CatSprite.vue'
-import { CAT_CLIMB_CONFIG as WORLD, createCatClimbEngine } from '../cat-climb.js'
+import { CAT_CLIMB_CONFIG as WORLD, CAT_CLIMB_THEME_LABELS, CAT_CLIMB_SURFACES, createCatClimbEngine } from '../cat-climb.js'
 
 const props = defineProps({
   species: { type: String, default: 'black' },
@@ -34,7 +34,80 @@ let chosenSeed = 1
 const screenY = (y) => WORLD.height - (y - state.value.cameraY)
 const displayHeight = computed(() => Math.floor(state.value.height))
 const difficultyCaption = computed(() => `每${state.value.difficultyEvery}层升档${state.value.difficultyCapped ? ' · 已到难度上限' : ''}`)
-const catAnim = computed(() => state.value.jumps === 0 ? 'sit' : 'pounce')
+const catAnim = computed(() => state.value.cat.grounded ? 'sit' : 'pounce')
+const themeLabel = computed(() => CAT_CLIMB_THEME_LABELS[state.value.theme] || '小台阶')
+const surfaceLabel = computed(() => CAT_CLIMB_SURFACES[state.value.cat.surface]?.label || '普通地面')
+const surfaceShort = computed(() => CAT_CLIMB_SURFACES[state.value.cat.surface]?.short || '普通')
+const surfaceArt = (platform) => ({
+  normal: { fill: '#d6ad7d', edge: '#b88d63' },
+  ice: { fill: '#b5d4f4', edge: '#378add' },
+  sticky: { fill: '#fac775', edge: '#ba7517' },
+  belt: { fill: '#85b7eb', edge: '#185fa5' },
+}[platform.surface] || { fill: '#d6ad7d', edge: '#b88d63' })
+// 装饰动效统一由 simTime 相位驱动：暂停/隐藏自动冻结，且绝不改 p.x / p.y 碰撞坐标。
+const reducedMotion = ref(false)
+let motionQuery = null
+const motionPhase = computed(() => reducedMotion.value ? 0 : state.value.simTime)
+function onMotionChange(event) { reducedMotion.value = !!event.matches }
+const iceShine = (platform, offset, k) => {
+  const x = platform.x + offset - platform.width / 2 + k * platform.width / 5
+  const y = screenY(platform.y)
+  return `M ${x} ${y} L ${x + 9} ${y + 10}`
+}
+const iceGlint = (platform, offset) => {
+  const span = platform.width + 24
+  const x = (motionPhase.value * 42) % span - 12
+  const left = platform.x + offset - platform.width / 2 + x
+  const y = screenY(platform.y)
+  return `M ${left} ${y + 1} L ${left + 10} ${y + 9}`
+}
+const stickyDot = (platform, offset, k) => {
+  const wave = Math.sin(motionPhase.value * 4 + k * 1.7)
+  return { cx: platform.x + offset - platform.width / 2 + k * platform.width / 4,
+    cy: screenY(platform.y) + 5, r: 2 + 0.8 * wave, opacity: 0.65 + 0.3 * wave }
+}
+// 箭头朝向与滚动方向一致，按 20px 步长无缝铺满整个平台宽度。
+const beltArrows = (platform, offset) => {
+  const step = 20
+  const dir = platform.beltDir >= 0 ? 1 : -1
+  const shift = dir * ((motionPhase.value * 38) % step)
+  const y = screenY(platform.y)
+  const arrows = []
+  for (let k = -2; k <= Math.ceil(platform.width / step) + 3; k++) {
+    const local = k * step + shift
+    if (local < 4 || local > platform.width - 4) continue
+    const cx = platform.x + offset - platform.width / 2 + local
+    arrows.push({ key: `${platform.id}-${offset}-${k}`,
+      d: dir > 0
+        ? `M ${cx - 4} ${y + 1} L ${cx + 4} ${y + 5} L ${cx - 4} ${y + 9} Z`
+        : `M ${cx + 4} ${y + 1} L ${cx - 4} ${y + 5} L ${cx + 4} ${y + 9} Z` })
+  }
+  return arrows
+}
+const floatY = (platform) => (platform.type === 'moving' || platform.launchpad)
+  ? 0 : Math.sin(motionPhase.value * 2.2 + platform.id * 0.9) * 1.2
+const squash = (platform) => {
+  if (reducedMotion.value) return 1
+  const hit = state.value.lastLanding
+  if (!hit || hit.id !== platform.id) return 1
+  const elapsed = state.value.simTime - hit.time
+  if (elapsed < 0 || elapsed > 0.18) return 1
+  return 1 - 0.26 * (1 - elapsed / 0.18)
+}
+const platformMotion = (platform) => {
+  const y = screenY(platform.y)
+  return `translate(0 ${y + floatY(platform)}) scale(1 ${squash(platform)}) translate(0 ${-y})`
+}
+const movingHint = (platform, offset, side) => {
+  const cx = platform.x + offset + side * (platform.width / 2 - 6)
+  const y = screenY(platform.y) + 5
+  return side < 0
+    ? `M ${cx + 3} ${y - 3} L ${cx - 3} ${y} L ${cx + 3} ${y + 3} Z`
+    : `M ${cx - 3} ${y - 3} L ${cx + 3} ${y} L ${cx - 3} ${y + 3} Z`
+}
+const wrapOffsets = [-WORLD.width, 0, WORLD.width]
+const seamX = computed(() => (state.value.cat.x + WORLD.width / 2) % WORLD.width)
+const parallaxX = computed(() => (state.value.cat.x * 0.18) % 60)
 const viewportStyle = computed(() => ({
   width: `${viewport.value.width}px`, height: `${viewport.value.height}px`,
   top: `${viewport.value.top}px`, left: `${viewport.value.left}px`,
@@ -128,15 +201,46 @@ function pointerMove(event) {
   const r = active.element.getBoundingClientRect()
   if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) cancelPointer(event)
 }
-// 兜底热区：整块游戏区左右半屏都能按住控制，孩子按不到两侧大键时照样能玩。
+// 兜底热区：舞台左右半屏都能按住控制，孩子按不到方向控件时照样能玩。
 function playfieldPointerDown(event) {
-  if (event.target?.closest?.('button, .climb-overlay')) return
+  if (event.target?.closest?.('button, .climb-overlay, .climb-controls')) return
   const r = playfield.value?.getBoundingClientRect()
   if (!r || !r.width) return
   pointerDown(event, event.clientX < r.left + r.width / 2 ? -1 : 1)
 }
+// 左下单个双向控件：按住左半向左、右半向右，滑过去直接换向，不用抬手再按。
+function steerDirection(event, element) {
+  const r = element.getBoundingClientRect()
+  return event.clientX < r.left + r.width / 2 ? -1 : 1
+}
+function steerDown(event) {
+  syncClock()
+  if (event.button !== 0 || closing || state.value.phase !== 'running') return
+  event.preventDefault()
+  const element = event.currentTarget
+  pointers.set(event.pointerId, { direction: steerDirection(event, element), element, steer: true })
+  try { element.setPointerCapture(event.pointerId) } catch { pointers.delete(event.pointerId) }
+  syncDirection()
+}
+function steerMove(event) {
+  const active = pointers.get(event.pointerId)
+  if (!active || !active.steer) return pointerMove(event)
+  event.preventDefault()
+  const direction = steerDirection(event, active.element)
+  if (direction !== active.direction) {
+    active.direction = direction
+    syncDirection()
+  }
+}
+function jumpDown(event) {
+  event.preventDefault()
+  if (closing || state.value.phase !== 'running') return
+  syncClock()
+  send({ type: 'jump' })
+}
 function keyboardTarget(target) {
-  return target === stage.value || target?.classList?.contains('climb-left') || target?.classList?.contains('climb-right')
+  return target === stage.value || ['climb-left', 'climb-right', 'climb-steer', 'climb-jump']
+    .some((name) => target?.classList?.contains(name))
 }
 function keyboardDown(event) {
   if (event.key === 'Escape') {
@@ -156,6 +260,14 @@ function keyboardDown(event) {
     } else if (!event.shiftKey && (document.activeElement === last || !elements.includes(document.activeElement))) {
       event.preventDefault()
       first?.focus({ preventScroll: true })
+    }
+    return
+  }
+  if (event.code === 'Space' || [' ', 'ArrowUp', 'KeyW', 'w', 'W'].includes(event.key)) {
+    if (keyboardTarget(event.target)) {
+      event.preventDefault()
+      event.stopPropagation()
+      send({ type: 'jump' })
     }
     return
   }
@@ -256,6 +368,9 @@ onMounted(() => {
   state.value = engine.dispatch({ type: 'reset', seed: chosenSeed })
   updateViewport()
   startButton.value?.focus({ preventScroll: true })
+  motionQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)') || null
+  reducedMotion.value = !!motionQuery?.matches
+  motionQuery?.addEventListener?.('change', onMotionChange)
   window.addEventListener('blur', suspend)
   window.addEventListener('resize', resize)
   window.addEventListener('orientationchange', resize)
@@ -273,6 +388,7 @@ onBeforeUnmount(() => {
   mounted = false
   stopFrames()
   observer?.disconnect()
+  motionQuery?.removeEventListener?.('change', onMotionChange)
   window.removeEventListener('blur', suspend)
   window.removeEventListener('resize', resize)
   window.removeEventListener('orientationchange', resize)
@@ -298,9 +414,11 @@ onBeforeUnmount(() => {
       <div class="climb-hud">
         <p class="climb-height">第 <strong>{{ state.floor }}</strong> 层</p>
         <span class="climb-difficulty" :data-difficulty="state.difficultyStage" :data-level="state.difficultyLevel">难度 {{ state.difficultyLevel }}</span>
-        <small class="climb-caption">{{ difficultyCaption }}</small>
+        <span class="climb-scroll" :data-scroll="state.scrollSpeed">↑ {{ state.scrollSpeed }}px/s</span>
+        <span class="climb-surface" :data-surface="state.cat.surface">{{ surfaceShort }}</span>
+        <small class="climb-caption">{{ themeLabel }} · {{ difficultyCaption }}</small>
       </div>
-      <span :id="helpId" class="climb-help sr-only">按住左右，松手就停。条纹台会慢移。</span>
+      <span :id="helpId" class="climb-help sr-only">左下控制左右，右下点按跳跃；地面不断上升，别被甩出屏幕。</span>
       <div class="climb-header-actions">
         <button v-if="state.phase === 'running'" type="button" class="climb-pause" @click="togglePause"><span class="climb-label">暂停</span></button>
       </div>
@@ -309,58 +427,81 @@ onBeforeUnmount(() => {
       @pointerdown="playfieldPointerDown" @pointermove="pointerMove" @pointerup="cancelPointer" @pointercancel="cancelPointer">
       <div ref="scene" class="climb-scene">
         <div ref="stage" class="climb-stage" :style="stageStyle" tabindex="0"
-          aria-label="爬高场地，按方向键左右或 A、D 控制小猫" data-world="360x560">
+          aria-label="爬高场地，方向键左右或 A、D 移动，空格或上箭头跳跃" data-world="360x560" data-cylinder="true">
           <svg viewBox="0 0 360 560" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-            <defs>
-              <pattern :id="`${titleId}-stripe`" width="12" height="8" patternUnits="userSpaceOnUse">
-                <rect width="12" height="8" fill="#84a99a" />
-                <path d="M0 8L8 0M8 8L16 0" stroke="#e3efcf" stroke-width="3" />
-              </pattern>
-            </defs>
             <g shape-rendering="crispEdges">
               <rect width="360" height="560" fill="#fff2df" />
-              <path d="M24 0V560M336 0V560" stroke="#efdbbd" stroke-width="12" />
-              <path d="M28 40h16M316 160h16M28 310h16M316 440h16" stroke="#e1c399" stroke-width="4" />
+              <g :transform="`translate(${-parallaxX} 0)`">
+                <rect v-for="i in 8" :key="`bg-${i}`" :x="(i - 1) * 60" y="0" width="2" height="560" fill="#efdbbd" opacity="0.6" />
+                <rect x="360" y="0" width="2" height="560" fill="#efdbbd" opacity="0.6" />
+              </g>
+              <line :x1="seamX" y1="0" :x2="seamX" y2="560" stroke="#d9b98a" stroke-width="3" stroke-dasharray="10 8" />
               <g v-for="platform in state.platforms" :key="platform.id" class="climb-platform"
                 :data-id="platform.id" :data-type="platform.type" :data-x="platform.x" :data-y="platform.y"
                 :data-world-x="platform.x" :data-world-y="platform.y" :data-width="platform.width"
-                :data-index="platform.index" :data-stage="platform.stage">
-                <rect :x="platform.x - platform.width / 2" :y="screenY(platform.y)" :width="platform.width" height="10"
-                  :fill="platform.launchpad ? '#edbbad' : platform.type === 'moving' ? `url(#${titleId}-stripe)` : '#d6ad7d'" />
-                <rect :x="platform.x - platform.width / 2" :y="screenY(platform.y) + 10" :width="platform.width" height="4"
-                  :fill="platform.type === 'moving' ? '#638c7c' : '#b88d63'" />
+                :data-index="platform.index" :data-stage="platform.stage" :data-theme="platform.theme"
+                :data-surface="platform.surface" :data-belt="platform.beltDir">
+                <g v-for="offset in wrapOffsets" :key="`${platform.id}-${offset}`"
+                  :data-copy="offset" :data-surface="platform.surface" :data-motion="platform.type"
+                  :transform="platformMotion(platform)">
+                  <rect :x="platform.x + offset - platform.width / 2" :y="screenY(platform.y)" :width="platform.width" height="10"
+                    :fill="platform.launchpad ? '#edbbad' : surfaceArt(platform).fill" />
+                  <rect :x="platform.x + offset - platform.width / 2" :y="screenY(platform.y) + 10" :width="platform.width" height="4"
+                    :fill="platform.launchpad ? '#c78776' : surfaceArt(platform).edge" />
+                  <g v-if="platform.surface === 'ice' && !platform.launchpad">
+                    <path v-for="k in 4" :key="`ice-${k}`" :d="iceShine(platform, offset, k)"
+                      stroke="#ffffff" stroke-width="1.5" opacity="0.4" />
+                    <path :d="iceGlint(platform, offset)" stroke="#ffffff" stroke-width="2.4" opacity="0.95" />
+                  </g>
+                  <g v-else-if="platform.surface === 'sticky' && !platform.launchpad">
+                    <circle v-for="k in 3" :key="`sticky-${k}`" fill="#854f0b"
+                      :cx="stickyDot(platform, offset, k).cx" :cy="stickyDot(platform, offset, k).cy"
+                      :r="stickyDot(platform, offset, k).r" :opacity="stickyDot(platform, offset, k).opacity" />
+                  </g>
+                  <g v-else-if="platform.surface === 'belt' && !platform.launchpad">
+                    <path v-for="arrow in beltArrows(platform, offset)" :key="arrow.key" :d="arrow.d"
+                      fill="#ffffff" opacity="0.95" />
+                  </g>
+                  <g v-if="platform.type === 'moving' && !platform.launchpad" opacity="0.55">
+                    <path :d="movingHint(platform, offset, -1)" fill="#ffffff" />
+                    <path :d="movingHint(platform, offset, 1)" fill="#ffffff" />
+                  </g>
+                </g>
               </g>
+              <line x1="0" y1="552" x2="360" y2="552" stroke="#c78776" stroke-width="3" stroke-dasharray="8 6" />
             </g>
             <g class="climb-cat" :data-x="state.cat.x" :data-y="state.cat.y" :data-vy="state.cat.vy"
-              :data-height="displayHeight" :height="displayHeight" :data-anim="catAnim"
-              :transform="`translate(${state.cat.x} ${screenY(state.cat.y)})`">
-              <g :transform="`scale(${state.cat.facing === 1 ? -1 : 1} 1)`">
-                <!-- pounce 最后一行透明，实际脚底在第十一行的下缘。 -->
-                <CatSprite :key="catAnim" x="-24" :y="catAnim === 'pounce' ? -33 : -36" :size="48" :species="species"
-                  :anim="catAnim" :paused="state.phase !== 'running'" />
+              :data-height="displayHeight" :height="displayHeight" :data-anim="catAnim" :data-grounded="state.cat.grounded">
+              <g v-for="offset in wrapOffsets" :key="`cat-${offset}`"
+                :transform="`translate(${state.cat.x + offset} ${screenY(state.cat.y)})`">
+                <g :transform="`scale(${state.cat.facing === 1 ? -1 : 1} 1)`">
+                  <!-- pounce 最后一行透明，实际脚底在第十一行的下缘。 -->
+                  <CatSprite :key="catAnim" x="-24" :y="catAnim === 'pounce' ? -33 : -36" :size="48" :species="species"
+                    :anim="catAnim" :paused="state.phase !== 'running'" />
+                </g>
               </g>
             </g>
           </svg>
         </div>
       </div>
-      <template v-if="state.phase === 'running'">
-        <button type="button" class="climb-dir climb-left" aria-label="按住向左"
-          @pointerdown.stop="pointerDown($event, -1)" @pointermove="pointerMove" @pointerup="cancelPointer"
+      <div v-if="state.phase === 'running'" class="climb-controls">
+        <div class="climb-steer" role="group" aria-label="左右移动"
+          @pointerdown.stop="steerDown" @pointermove="steerMove" @pointerup="cancelPointer"
           @pointercancel="cancelPointer" @lostpointercapture="cancelPointer" @contextmenu.prevent>
           <svg class="climb-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M30 10 L14 24 L30 38 Z" /></svg>
-          <span class="climb-label">向左</span>
-        </button>
-        <button type="button" class="climb-dir climb-right" aria-label="按住向右"
-          @pointerdown.stop="pointerDown($event, 1)" @pointermove="pointerMove" @pointerup="cancelPointer"
-          @pointercancel="cancelPointer" @lostpointercapture="cancelPointer" @contextmenu.prevent>
+          <span class="climb-steer-divider"></span>
           <svg class="climb-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M18 10 L34 24 L18 38 Z" /></svg>
-          <span class="climb-label">向右</span>
+          <span class="climb-label">方向</span>
+        </div>
+        <button type="button" class="climb-jump" aria-label="点按跳跃" @pointerdown.stop="jumpDown" @contextmenu.prevent>
+          <svg class="climb-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 8 L40 30 L8 30 Z" /></svg>
+          <span class="climb-label">跳跃</span>
         </button>
-      </template>
+      </div>
       <div v-else-if="state.phase === 'ready'" class="climb-overlay climb-ready" role="group" aria-label="准备开始">
         <div class="climb-overlay-card">
-          <strong class="climb-overlay-title">准备好就出发</strong>
-          <p class="climb-help">按住左右，松手就停。条纹台会慢移。<br><span>仅本次试玩，不产生星星。</span></p>
+          <strong class="climb-overlay-title">别被地面追上</strong>
+          <p class="climb-help">左下按住控制左右，右下点按跳跃。<br><span>地面一直上升，要不停往上跳；左右走到头会穿到另一边。</span></p>
           <button ref="startButton" type="button" class="climb-start" @click="start"><span class="climb-label">开始爬高</span></button>
           <div class="climb-modes" role="group" aria-label="选择爬高路线">
             <button type="button" :aria-pressed="state.mode === 'random'" @click="restart('random')"><span class="climb-label">随机爬高</span></button>
@@ -385,7 +526,7 @@ onBeforeUnmount(() => {
             <CatSprite x="24" y="8" :size="48" :species="species" anim="sit" paused />
           </svg>
           <strong>软垫接住啦</strong>
-          <span>没接住平台，本次到第 {{ state.floor }} 层</span>
+          <span>没跟上上升的地面，本次到第 {{ state.floor }} 层</span>
           <button type="button" class="climb-restart" @click="restart()"><span class="climb-label">再来一次</span></button>
           <button type="button" class="climb-close" @click="requestClose"><span class="climb-label">退出</span></button>
         </div>
@@ -429,15 +570,28 @@ button:focus-visible { outline: 3px solid #527d66; outline-offset: 2px; }
   width: calc(100% - 2 * clamp(116px, 20vw, 190px)); height: 100%; }
 .climb-stage { position: relative; overflow: hidden; background: #fff2df; border-radius: 3px; touch-action: none; }
 .climb-stage > svg { display: block; width: 100%; height: 100%; }
-.climb-dir { position: absolute; z-index: 3; bottom: clamp(18px, 10vh, 76px);
-  width: clamp(96px, 14vw, 132px); height: clamp(96px, 14vw, 132px);
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
-  border-radius: 28px; background: #eaf3de; border-color: #639922; color: #27500a; touch-action: none; }
-.climb-left { left: clamp(12px, 3vw, 48px); }
-.climb-right { right: clamp(12px, 3vw, 48px); }
-.climb-dir:active { background: #c0dd97; }
-.climb-arrow { width: 40px; height: 40px; fill: #3b6d11; pointer-events: none; }
-.climb-dir .climb-label { font-size: 14px; }
+.climb-scroll { font-size: 12px; color: #906036; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.climb-surface { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: #f1efe8; color: #5f5e5a; white-space: nowrap; }
+.climb-surface[data-surface='ice'] { background: #e6f1fb; color: #185fa5; }
+.climb-surface[data-surface='sticky'] { background: #faeeda; color: #854f0b; }
+.climb-surface[data-surface='belt'] { background: #e6f1fb; color: #0c447c; }
+.climb-controls { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.climb-steer, .climb-jump { position: absolute; z-index: 3; pointer-events: auto;
+  bottom: clamp(18px, 10vh, 76px); width: clamp(96px, 14vw, 132px); height: clamp(96px, 14vw, 132px);
+  box-sizing: border-box; border: 2px solid #639922; border-radius: 28px;
+  background: #eaf3de; color: #27500a; font: inherit; font-weight: 700; cursor: pointer;
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent; }
+.climb-steer { left: clamp(12px, 3vw, 48px); display: flex; align-items: center; justify-content: center; gap: 2px; }
+.climb-jump { right: clamp(12px, 3vw, 48px); display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 2px; background: #faeeda; border-color: #ba7517; color: #633806; }
+.climb-steer:active { background: #c0dd97; }
+.climb-jump:active { background: #f5c775; }
+.climb-steer-divider { width: 2px; height: 46%; background: #97c459; border-radius: 2px; }
+.climb-arrow { width: 38px; height: 38px; fill: #3b6d11; pointer-events: none; }
+.climb-jump .climb-arrow { fill: #ba7517; }
+.climb-steer .climb-label { position: absolute; bottom: 8px; font-size: 11px; }
+.climb-jump .climb-label { font-size: 13px; }
 .climb-overlay { position: absolute; inset: 0; z-index: 4; display: grid; place-items: center;
   padding: 16px; box-sizing: border-box; background: rgb(246 234 216 / 94%); }
 .climb-overlay-card { width: min(320px, 100%); display: flex; flex-direction: column; align-items: center; gap: 10px;
@@ -456,19 +610,26 @@ button:focus-visible { outline: 3px solid #527d66; outline-offset: 2px; }
 .climb-result .climb-overlay-card > span { font-size: 13px; line-height: 1.5; }
 @media (orientation: portrait) and (max-width: 600px) {
   .climb-scene { width: 100%; height: calc(100% - 124px); align-self: start; }
-  .climb-dir { bottom: 12px; width: min(42vw, 132px); height: 100px; border-radius: 22px; }
-  .climb-left { left: 14px; }
-  .climb-right { right: 14px; }
+  .climb-steer, .climb-jump { bottom: 12px; width: min(42vw, 132px); height: 100px; border-radius: 22px; }
+  .climb-steer { left: 14px; }
+  .climb-jump { right: 14px; }
+  .climb-arrow { width: 32px; height: 32px; }
   .climb-header { flex-basis: 48px; height: 48px; gap: 6px; padding-left: 10px; padding-right: 70px; }
   .climb-title { font-size: 13px; }
   .climb-hud { flex-wrap: nowrap; gap: 6px; }
   .climb-difficulty { font-size: 11px; }
   .climb-caption { display: none; }
 }
+@media (orientation: portrait) and (max-width: 360px) {
+  .climb-title { display: none; }
+  .climb-scroll { font-size: 11px; }
+  .climb-surface { font-size: 10px; padding: 1px 4px; }
+  .climb-hud { gap: 4px; }
+}
 @media (orientation: landscape) and (max-height: 520px) {
   .climb-header { flex-basis: 44px; height: 44px; padding-block: 4px; }
-  .climb-dir { bottom: 12px; width: 96px; height: 96px; border-radius: 22px; }
-  .climb-arrow { width: 32px; height: 32px; }
+  .climb-steer, .climb-jump { bottom: 12px; width: 96px; height: 96px; border-radius: 22px; }
+  .climb-arrow { width: 30px; height: 30px; }
   .climb-overlay-card { padding: 12px; gap: 6px; }
   .climb-cushion { width: 64px; height: 44px; }
   .climb-caption { display: none; }
