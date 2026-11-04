@@ -1,13 +1,16 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { showDialog, showToast, showConfirmDialog } from 'vant'
+import { showDialog, showToast, closeToast, showConfirmDialog } from 'vant'
 import CatSprite from '../components/CatSprite.vue'
 import PixelRoom from '../components/PixelRoom.vue'
 import PixelItem from '../components/PixelItem.vue'
 import GardenBackdrop from '../components/GardenBackdrop.vue'
-import { decorArt, getSceneLighting, isWallpaper, wallStyle } from '../scene-art.js'
+import { decorArt, getSceneLighting, isWallpaper } from '../scene-art.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
 import CatPlayground from '../components/CatPlayground.vue'
+import CatClimb from '../components/CatClimb.vue'
+import PixelShop from '../components/PixelShop.vue'
+import { TREE_CAT_SIZE, TREE_SPRITE_UNITS, GROUND_CAT_FOOT_GAP, treeRoute, treeDownRoute, treePoint, treeGroundExit, treeEntryReason, gameEntryReason, treeHitNode, treeAnchorMatches, treeVisibleBase, treeHopPoint } from '../cat-tree-room.js'
 import { evidenceSteps } from '../task-evidence.js'
 import { reviewPending, reviewStages } from '../ai-review.js'
 
@@ -43,6 +46,9 @@ async function switchKid() {
   try {
     await showConfirmDialog({ title: '换一个小朋友？', message: '这只小猫会等你回来的～' })
   } catch (e) { return }
+  if (roomLocked() || eating || startingTask.value || submitting.value || evidenceUploading.value || recState.value !== 'idle' || chatStreaming.value || wizard.value || timerTask.value) return showToast('先完成正在进行的操作，再换人吧')
+  closeGamePicker(false)
+  resetTreeToFloor()
   document.cookie = 'kid_token=; Max-Age=0; path=/'
   adopted.value = false
   pet.value = null
@@ -68,7 +74,7 @@ async function pickKid(k) {
     adopted.value = true
     await loadAll()
     say('我等到你啦！')
-    setTimeout(behaviorTick, 800)
+    stateTimer = setTimeout(behaviorTick, 800)
   } else if (data.error) {
     showToast(data.error)
   }
@@ -83,40 +89,99 @@ const wishes = ref([])
 const shopItems = ref([])
 const sceneItems = ref([])
 const playOpen = ref(false)
+const gameKind = ref('feather')
+const playOpening = ref(false)
+// 购买猫爬架即解锁无限爬高，房间里是否摆着爬架不影响游戏入口。
+const hasCatTreeGame = computed(() => shopItems.value.some(it => it.key === 'cat-tree' && it.owned))
+const gamePicker = ref(false)
+const gamePickerEl = ref(null)
+const gamePickerClose = ref(null)
+let gamePickerTrigger = null
 let roomPoseBeforePlay = null
-
-function openPlayground() {
-  if (!adopted.value || playOpen.value) return
-  // 不取消已经开始的吃饭、上传或计时，避免半途消费/任务状态被抢占。
-  if (eating || timerTask.value || wizard.value || startingTask.value || submitting.value || evidenceUploading.value || evidenceTask || chatStreaming.value || recState.value !== 'idle') {
-    showToast('先完成正在进行的操作，再和猫玩吧')
-    return
-  }
-  cancelDecorDrag?.()
-  cancelCameraDrag?.()
-  if (catEl.value) {
-    syncCatPos()
-    catEl.value.style.transition = 'none'
-  }
-  // 猫与相机都冻结在实际渲染点，而非仍在进行的 transition 终点。
-  if (worldEl.value && roomEl.value) {
-    const transform = getComputedStyle(worldEl.value).transform
-    const matrix = transform === 'none' ? null : new DOMMatrixReadOnly(transform)
-    camAnim.value = 'none'
-    if (matrix) setCamera(matrix.m41, matrix.m42)
-  }
-  roomPoseBeforePlay = { anim: walking ? 'sit' : catAnim.value, flipped: flipped.value, tools: toolsOpen.value, cameraMode: camMode.value }
-  interrupt()
-  placingFeed.value = false
+function roomLocked() { return playOpen.value || playOpening.value || treeLeaving.value || shopActionBusy.value || catTouchBusy.value }
+function gameBusy() {
+  return roomLocked() || eating || placingFeed.value || timerTask.value || wizard.value || wizardUploading.value || taskRecStarting.value || startingTask.value || submitting.value || evidenceUploading.value || evidenceTask || chatStreaming.value || recHolding || recState.value !== 'idle' || taskRec.value || wallpaperSaving.value || wishModal.value
+}
+function openTreeGame() {
+  const reason = gameEntryReason({ adopted: adopted.value, busy: gameBusy(), owned: hasCatTreeGame.value })
+  if (reason) { showToast(reason); return }
+  return openPlayground('climb')
+}
+// 「和猫玩」先给游戏列表；选中后才真正进游戏，避免打开列表就冻结房间。
+function openGamePicker(trigger) {
+  if (!adopted.value || gameBusy()) { showToast('先完成正在进行的操作，再和猫玩吧'); return }
+  // 刚买完道具的提示会横在屏幕中间，展开列表前先收起，避免压住游戏卡片。
+  closeToast()
   hudOpen.value = false
-  toolsOpen.value = false
   sheet.value = ''
-  chatOpen.value = false
-  mailOpen.value = false
-  hideTip()
-  showBubble.value = false
-  catAnim.value = 'sit'
-  playOpen.value = true
+  // 窄屏「和猫玩」按钮本身在 toolsOpen 的陪伴操作里，不能把它收起。
+  gamePickerTrigger = trigger || null
+  gamePicker.value = true
+  nextTick(() => gamePickerClose.value?.focus())
+}
+function closeGamePicker(restore = true) {
+  gamePicker.value = false
+  const trigger = gamePickerTrigger
+  gamePickerTrigger = null
+  if (restore && trigger?.isConnected) trigger.focus()
+}
+function gamePickerKeydown(e) {
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeGamePicker(); return }
+  if (e.key !== 'Tab') return
+  const buttons = [...(gamePickerEl.value?.querySelectorAll('button:not(:disabled)') || [])]
+  if (!buttons.length) return
+  const i = buttons.indexOf(document.activeElement)
+  e.preventDefault()
+  buttons[(i + (e.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus()
+}
+function startGame(kind) {
+  closeGamePicker(false)
+  if (kind === 'climb') return openTreeGame()
+  return openPlayground('feather')
+}
+async function openPlayground(kind = 'feather') {
+  // Vue 事件不能作为游戏类型；原来的无参入口仍然是羽毛。
+  kind = kind === 'climb' ? 'climb' : 'feather'
+  if (!adopted.value || playOpen.value || playOpening.value) return
+  if (gameBusy()) { showToast('先完成正在进行的操作，再和猫玩吧'); return }
+  if (kind === 'climb' && !hasCatTreeGame.value) return
+  playOpening.value = true
+  try {
+    closeGamePicker(false)
+    cancelDecorDrag?.()
+    cancelCameraDrag?.()
+    await leaveTree()
+    if (!adopted.value || document.hidden || disposed) return
+    if (kind === 'climb' && !hasCatTreeGame.value) return
+    gameKind.value = kind
+    // 下架后的尺寸 patch 完再读 DOM，避免把旧 64px 猫当成地面猫。
+    await nextTick()
+    if (!adopted.value || document.hidden || disposed) return
+    if (catEl.value) {
+      syncCatPos()
+      catEl.value.style.transition = 'none'
+    }
+    // 猫与相机都冻结在实际渲染点，而非仍在进行的 transition 终点。
+    if (worldEl.value && roomEl.value) {
+      const transform = getComputedStyle(worldEl.value).transform
+      const matrix = transform === 'none' ? null : new DOMMatrixReadOnly(transform)
+      camAnim.value = 'none'
+      if (matrix) setCamera(matrix.m41, matrix.m42)
+    }
+    roomPoseBeforePlay = { anim: walking ? 'sit' : catAnim.value, flipped: flipped.value, tools: toolsOpen.value, cameraMode: camMode.value }
+    interrupt()
+    placingFeed.value = false
+    hudOpen.value = false
+    toolsOpen.value = false
+    sheet.value = ''
+    chatOpen.value = false
+    mailOpen.value = false
+    hideTip()
+    showBubble.value = false
+    catAnim.value = 'sit'
+    playOpen.value = true
+  } catch { showToast('游戏暂时没有打开，请再试一次') }
+  finally { playOpening.value = false }
 }
 function closePlayground() {
   playOpen.value = false
@@ -203,10 +268,14 @@ const cam = ref({ x: 0, y: 0 })
 const camMode = ref('follow') // follow(跟猫) | free(自由拖动)
 const camAnim = ref('') // 相机移动的 CSS transition（跟猫同步时设置）
 const sceneLighting = ref(getSceneLighting())
+const roomHidden = ref(document.hidden)
 let lightingTimer = null
 function syncSceneLighting() { sceneLighting.value = getSceneLighting() }
 function onDocumentVisibility() {
+  roomHidden.value = document.hidden
+  if (document.hidden) { cancelFeeding(true); closeGamePicker(false); resetTreeToFloor() }
   if (!document.hidden) {
+    if (!roomLocked() && !eating) behaviorNext(4500)
     syncSceneLighting()
     if (adopted.value && !playOpen.value) {
       refreshProgress()
@@ -222,7 +291,7 @@ const activeWallpaper = computed(() => sceneItems.value.filter(it => isWallpaper
 const placedDecor = computed(() => sceneItems.value.filter(it => !isWallpaper(it.item_key)))
 // 图层按地面锚点排序：未来新增装饰沿用同一坐标与注册表。
 const decorDepth = it => decorArt(it.item_key).surface === 'wall' ? 2 : 10 + Math.floor(it.y)
-const catDepth = computed(() => 10 + Math.floor(catPos.y))
+const catDepth = computed(() => treeRendered.value && treeSession.value ? 11 + Math.floor(treeSession.value.anchor.y) : 10 + Math.floor(catPos.y))
 const rootEl = ref(null)
 const statusToggleEl = ref(null)
 const statusPanelEl = ref(null)
@@ -235,6 +304,7 @@ function alignStatusPanel() {
     right: `${bounds.right - anchor.right}px`, width: `${Math.min(340, bounds.width - 32)}px` }
 }
 async function toggleStatus() {
+  if (roomLocked()) return
   hudOpen.value = !hudOpen.value
   tipShow.value = false
   toolsOpen.value = false
@@ -284,6 +354,13 @@ async function loadAll() {
   restoreTimer()
 }
 
+async function refreshScene() {
+  if (roomLocked() || document.hidden || disposed) return
+  try {
+    const sc = await jget('/scene')
+    if (sc && !roomLocked() && !document.hidden && !disposed) sceneItems.value = sc.items || []
+  } catch { showToast('房间同步暂时失败，稍后会再同步') }
+}
 function applyPet(p) {
   if (!p?.pet) return
   pet.value = p.pet
@@ -330,6 +407,8 @@ async function syncMail() {
 }
 
 async function openMailbox() {
+  if (roomLocked()) return
+  closeGamePicker(false)
   mailOpen.value = true
   if (unread.value === 0) await refreshMessages()
   if (unread.value > 0) {
@@ -353,7 +432,7 @@ async function doAdopt() {
     adopted.value = true
     await loadAll()
     say(`我是${name}！以后请多多关照喵～`)
-    setTimeout(behaviorTick, 1000)
+    stateTimer = setTimeout(behaviorTick, 1000)
   } else if (data.error) {
     showToast(data.error)
   }
@@ -369,17 +448,156 @@ function syncCatPos() {
   const cr = catEl.value.getBoundingClientRect()
   const rr = roomEl.value.getBoundingClientRect()
   const worldRect = worldEl.value.getBoundingClientRect()
-  catPos.x = cr.left - worldRect.left + 55
-  catPos.y = cr.top - worldRect.top + 100
+  const style = getComputedStyle(catEl.value)
+  catPos.x = cr.left - worldRect.left - parseFloat(style.marginLeft)
+  catPos.y = cr.top - worldRect.top - parseFloat(style.marginTop)
 }
 // 打断猫当前行为（喂食/触摸可抢占自主走动）
 function interrupt() {
   walkEpoch++
+  if (walkRAF !== null) cancelAnimationFrame(walkRAF)
+  walkRAF = null
   clearTimeout(stateTimer)
   walking = false
 }
+// 爬架会话只在房间内存中存在；锚点保留旧家具位置供取消时安全下架。
+const treeSession = ref(null)
+const treeRendered = ref(false)
+const treeMoving = ref(false)
+const treeLeaving = ref(false)
+const treeCatSize = computed(() => treeRendered.value ? TREE_CAT_SIZE : 110)
+const catRoomStyle = computed(() => ({ left: `${catPos.x}px`, top: `${catPos.y}px`, zIndex: catDepth.value,
+  ...(treeRendered.value ? { width: `${TREE_CAT_SIZE}px`, marginLeft: `${-TREE_CAT_SIZE / 2}px`, marginTop: `${-Math.round(TREE_CAT_SIZE * .75)}px` } : {}) }))
+let treeEpoch = 0, treeRAF = null, treeWalkResolve = null, leavePromise = null
+let disposed = false, walkRAF = null, bubbleTimer = null, initTimer = null
+const treeTimers = new Map()
+function cancelTreePending() {
+  treeEpoch++
+  if (treeRAF !== null) cancelAnimationFrame(treeRAF)
+  treeRAF = null
+  for (const [id, resolve] of treeTimers) { clearTimeout(id); resolve(false) }
+  treeTimers.clear()
+  if (treeWalkResolve) { treeWalkResolve(false); treeWalkResolve = null }
+  interrupt()
+  treeMoving.value = false
+}
+function treeAlive(epoch, walkingEpoch) {
+  return !disposed && !document.hidden && !playOpen.value && adopted.value && epoch === treeEpoch && walkingEpoch === walkEpoch
+}
+function treeWait(ms, epoch, walkingEpoch) {
+  return new Promise(resolve => {
+    const id = setTimeout(() => { treeTimers.delete(id); resolve(treeAlive(epoch, walkingEpoch)) }, ms)
+    treeTimers.set(id, resolve)
+  })
+}
+async function treeHop(to, epoch, walkingEpoch) {
+  if (!treeAlive(epoch, walkingEpoch)) return false
+  const from = { ...catPos }
+  treeMoving.value = true
+  catAnim.value = 'walk'
+  flipped.value = to.x > from.x
+  if (catEl.value) catEl.value.style.transition = 'none'
+  if (camMode.value === 'follow') centerOn(to.x, to.y - 32, .38)
+  // RAF 提供连续脚点与小段抛物线，取消时读取的就是实际位置。
+  let resolveHop
+  const hop = new Promise(resolve => { resolveHop = resolve })
+  const timeout = setTimeout(() => { treeTimers.delete(timeout); resolveHop(false); if (epoch === treeEpoch) resetTreeToFloor() }, 1200)
+  treeTimers.set(timeout, resolveHop)
+  const start = performance.now()
+  const frame = now => {
+    treeRAF = null
+    if (!treeAlive(epoch, walkingEpoch)) { clearTimeout(timeout); treeTimers.delete(timeout); resolveHop(false); return }
+    const t = Math.min(1, (now - start) / 380)
+    Object.assign(catPos, treeHopPoint(from, to, t))
+    if (t < 1) treeRAF = requestAnimationFrame(frame)
+    else { clearTimeout(timeout); treeTimers.delete(timeout); treeMoving.value = false; catAnim.value = 'sit'; resolveHop(true) }
+  }
+  treeRAF = requestAnimationFrame(frame)
+  return hop
+}
+function finishTreeFloor(anchor) {
+  const exit = treeGroundExit(anchor, catPos.x > anchor.x ? 1 : -1)
+  if (catEl.value) catEl.value.style.transition = 'none'
+  treeRendered.value = false
+  treeSession.value = null
+  treeMoving.value = false
+  Object.assign(catPos, exit)
+  catAnim.value = 'sit'
+  if (camMode.value === 'follow' && !playOpen.value && !disposed) centerOn(exit.x, exit.y - 48, 0)
+}
+function resetTreeToFloor() {
+  const anchor = treeSession.value?.anchor, elevated = treeRendered.value
+  if (!anchor) return
+  if (!elevated) syncCatPos()
+  cancelTreePending()
+  if (anchor && elevated) finishTreeFloor(anchor)
+  else if (anchor) { treeSession.value = null; if (catEl.value) catEl.value.style.transition = 'none'; catAnim.value = 'sit' }
+}
+async function leaveTree() {
+  if (leavePromise) return leavePromise
+  if (!treeSession.value) return
+  const session = treeSession.value, anchor = session.anchor, elevated = treeRendered.value
+  if (!elevated) { syncCatPos(); if (catEl.value) catEl.value.style.transition = 'none' }
+  cancelTreePending()
+  treeLeaving.value = true
+  const epoch = treeEpoch, walkingEpoch = walkEpoch
+  leavePromise = (async () => {
+    try {
+      await nextTick()
+      if (treeRendered.value && treeAlive(epoch, walkingEpoch)) {
+        const node = session.currentnode || 'grip'
+        if (!await treeHop(treePoint(anchor, node), epoch, walkingEpoch)) return
+        for (const next of treeDownRoute(node)) {
+          if (!await treeHop(treePoint(anchor, next), epoch, walkingEpoch)) return
+        }
+        const exit = treeGroundExit(anchor, -1)
+        if (!await treeHop({ x: exit.x, y: exit.y - GROUND_CAT_FOOT_GAP }, epoch, walkingEpoch)) return
+      }
+    } finally {
+      if (treeSession.value === session) {
+        if (elevated) finishTreeFloor(anchor)
+        else { treeSession.value = null; catAnim.value = 'sit' }
+      }
+      await nextTick()
+      treeLeaving.value = false
+      leavePromise = null
+    }
+  })()
+  return leavePromise
+}
+async function playTree(it, mode = 'top') {
+  const reason = treeEntryReason({ adopted: adopted.value, busy: gameBusy(), owned: shopItems.value.some(x => x.key === 'cat-tree' && x.owned), placed: sceneItems.value.some(x => x.id === it?.id && x.item_key === 'cat-tree') })
+  if (reason || document.hidden || disposed) { if (reason) showToast(reason); return }
+  closeGamePicker(false)
+  await leaveTree()
+  if (gameBusy() || document.hidden || disposed || !sceneItems.value.some(x => x.id === it.id)) return
+  cancelTreePending()
+  const anchor = { id: it.id, x: it.x, y: it.y }
+  const epoch = treeEpoch
+  const session = { itemid: it.id, mode, currentnode: null, routeepoch: epoch, anchor }
+  treeSession.value = session
+  const reached = await new Promise(resolve => {
+    treeWalkResolve = resolve
+    walkTo(treeGroundExit(anchor, -1), () => { treeWalkResolve = null; resolve(true) }, { speed: 180, tree: true })
+  })
+  const walkingEpoch = walkEpoch
+  if (!reached || !treeAlive(epoch, walkingEpoch) || treeSession.value?.routeepoch !== epoch) return
+  treeRendered.value = true
+  catPos.y -= GROUND_CAT_FOOT_GAP
+  await nextTick()
+  for (const node of treeRoute(mode)) {
+    if (!await treeHop(treePoint(anchor, node), epoch, walkingEpoch)) return
+    treeSession.value.currentnode = node
+  }
+  catAnim.value = mode === 'nest' ? 'crouch' : mode === 'grip' ? 'crouch' : 'sit'
+  if (mode === 'nest') flipped.value = true
+  if (!await treeWait(mode === 'nest' ? 5000 : 3200, epoch, walkingEpoch)) return
+  await leaveTree()
+  if (!roomLocked() && !document.hidden && adopted.value) behaviorNext(4500)
+}
 async function walkTo(target, done, opts = {}) {
-  if (playOpen.value) return
+  if (playOpen.value || playOpening.value || treeLeaving.value || document.hidden || disposed) return
+  if (treeSession.value && !opts.tree) { showToast('小猫在爬架上，先请它下来再走动吧'); return }
   interrupt() // 抢占
   const epoch = walkEpoch
   const el = catEl.value
@@ -387,7 +605,7 @@ async function walkTo(target, done, opts = {}) {
   syncCatPos() // 先校准到真实位置
   el.style.transition = 'none'
   await nextTick() // 等 Vue 把校准位置 patch 到 DOM
-  if (playOpen.value || epoch !== walkEpoch) return
+  if (playOpen.value || playOpening.value || treeLeaving.value || document.hidden || disposed || epoch !== walkEpoch) return
   void el.offsetWidth // 强制 reflow 固化
   walking = true
   catAnim.value = 'walk'
@@ -399,24 +617,26 @@ async function walkTo(target, done, opts = {}) {
   el.style.transition = `left ${dur / 1000}s linear, top ${dur / 1000}s linear`
   // 相机跟猫同步走（follow 模式）
   if (camMode.value === 'follow') centerOn(target.x, target.y - 48, dur / 1000)
-  requestAnimationFrame(() => { if (!playOpen.value && epoch === walkEpoch) { catPos.x = target.x; catPos.y = target.y } })
+  walkRAF = requestAnimationFrame(() => { walkRAF = null; if (!playOpen.value && !playOpening.value && !document.hidden && epoch === walkEpoch) { catPos.x = target.x; catPos.y = target.y } })
   clearTimeout(stateTimer)
-  stateTimer = setTimeout(() => { if (playOpen.value || epoch !== walkEpoch) return; catAnim.value = 'sit'; walking = false; done && done() }, dur + 60)
+  stateTimer = setTimeout(() => { if (playOpen.value || playOpening.value || document.hidden || disposed || epoch !== walkEpoch) return; catAnim.value = 'sit'; walking = false; done && done() }, dur + 60)
 }
 function lieDown() { zzz.value = false; catAnim.value = 'sleep' }
 function behaviorNext(delay) {
   clearTimeout(stateTimer)
-  if (playOpen.value) return
+  if (roomLocked() || treeSession.value || document.hidden || disposed) return
   stateTimer = setTimeout(behaviorTick, delay || (600 + Math.random() * 1200))
 }
 function behaviorTick() {
-  if (!adopted.value || playOpen.value) return
+  if (!adopted.value || gameBusy() || treeSession.value || gamePicker.value || document.hidden || disposed) return
   const hungry = pet.value && pet.value.hunger < 30
   const r = Math.random()
   // 道具互动：饱腹时 35% 概率找植物/毛线球/猫窝玩（饿了没力气玩）
-  const playables = sceneItems.value.filter((it) => ['plant', 'yarn', 'nest'].includes(it.item_key))
+  const playables = sceneItems.value.filter((it) => ['plant', 'yarn', 'nest', 'cat-tree'].includes(it.item_key))
   if (!hungry && playables.length && r < 0.35) {
-    interactWith(playables[Math.floor(Math.random() * playables.length)])
+    const item = playables[Math.floor(Math.random() * playables.length)]
+    if (item.item_key === 'cat-tree') playTree(item, ['top', 'nest', 'grip'][Math.floor(Math.random() * 3)])
+    else interactWith(item)
     return
   }
   if (r < 0.55) {
@@ -440,7 +660,8 @@ function behaviorTick() {
 const shakeId = ref(0) // 被咬的植物晃动
 function facePoint(px) { flipped.value = px > catPos.x } // 面向目标
 function interactWith(it) {
-  if (!it || !it.item_key) return
+  if (!it || !it.item_key || roomLocked()) return
+  if (it.item_key === 'cat-tree') return playTree(it, 'top')
   const beside = it.item_key === 'yarn' ? 44 : 52
   walkTo({ x: it.x + (catPos.x < it.x ? beside : -beside), y: it.y }, () => {
     facePoint(it.x)
@@ -501,21 +722,36 @@ const isNarrow = ref(narrowMedia.matches)
 const hudOpen = ref(false)
 const toolsOpen = ref(false)
 const sheet = ref('') // '' / 'task' / 'wish' / 'shop'
+const desktopPanel = ref('task')
+const taskCompleted = computed(() => today.value.tasks.filter(t => t.status === 'approved').length)
+const taskPending = computed(() => today.value.tasks.filter(t => t.status === 'pending').length)
+function selectDesktopPanel(name) {
+  if (roomLocked()) return
+  desktopPanel.value = name
+  if (name === 'task') refreshTasks()
+}
+function panelVisible(name) { return (!isNarrow.value && desktopPanel.value === name) || (isNarrow.value && sheet.value === name) }
 function openSheet(name) {
+  if (roomLocked()) return
+  closeGamePicker(false)
   sheet.value = sheet.value === name ? '' : name
   hudOpen.value = false
   toolsOpen.value = false
   if (sheet.value === 'task') refreshTasks()
 }
 function toggleCompanion() {
+  if (roomLocked()) return
+  closeGamePicker(false)
   toolsOpen.value = !toolsOpen.value
   sheet.value = ''
   hudOpen.value = false
 }
 function checkNarrow() { isNarrow.value = narrowMedia.matches }
 function onViewportResize() {
+  closeGamePicker(false)
   checkNarrow()
   nextTick(() => {
+    if (playOpen.value || playOpening.value || disposed) return
     if (hudOpen.value) alignStatusPanel()
     if (camMode.value === 'follow' && adopted.value) centerOn(catPos.x, catPos.y - 48, 0)
     else setCamera(cam.value.x, cam.value.y)
@@ -536,7 +772,7 @@ function releaseStream() {
   recStream = null
 }
 async function recStart() {
-  if (recState.value !== 'idle' || chatStreaming.value) return
+  if (roomLocked() || recState.value !== 'idle' || chatStreaming.value || recHolding) return
   recHolding = true
   recCancelled = false
   recStartedAt = 0
@@ -665,6 +901,10 @@ const chatStreaming = ref(false)
 const chatLeft = ref(30)
 
 async function openChat() {
+  if (roomLocked()) return
+  closeGamePicker(false)
+  await leaveTree()
+  if (roomLocked() || disposed) return
   toolsOpen.value = false
   hudOpen.value = false
   sheet.value = ''
@@ -682,7 +922,7 @@ async function openChat() {
 
 async function sendChat() {
   const text = chatInput.value.trim()
-  if (!text || chatStreaming.value) return
+  if (roomLocked() || !text || chatStreaming.value) return
   if (chatLeft.value <= 0) return showToast('今天聊得够多啦，猫要睡觉了喵～明天再来')
   chatInput.value = ''
   chatMessages.value.push({ role: 'user', content: text })
@@ -735,9 +975,9 @@ async function sendChat() {
 let dragCam = null // 视角拖动状态
 let cancelCameraDrag = null
 function onRoomTap(e) {
-  if (!adopted.value || playOpen.value || e.button !== 0) return
+  if (!adopted.value || roomLocked() || e.button !== 0) return
   cancelCameraDrag?.()
-  if (e.target.closest('button, input, .cat-wrap, .inv-bar')) return
+  if (e.target.closest('button, input, .cat-wrap, .scene-item, .inv-bar')) return
   hudOpen.value = false
   toolsOpen.value = false
   const r = roomEl.value.getBoundingClientRect()
@@ -763,7 +1003,7 @@ function onRoomTap(e) {
     if (ev.pointerId !== e.pointerId) return
     const wasDrag = dragCam && dragCam.moved
     cleanup()
-    if (wasDrag || playOpen.value) return // 拖了视角就不点地
+    if (wasDrag || roomLocked()) return // 拖了视角就不点地
     // 点地（世界坐标 = 屏幕 - 视口原点 - 相机平移）
     if (ev.type === 'pointercancel') return
     const worldRect = worldEl.value.getBoundingClientRect()
@@ -783,31 +1023,67 @@ const TALK = ['喵～陪我玩！', '今天任务做完了吗？', '我在守护
 function say(t) {
   bubble.value = t || TALK[Math.floor(Math.random() * TALK.length)]
   showBubble.value = true
-  setTimeout(() => (showBubble.value = false), 2200)
+  clearTimeout(bubbleTimer)
+  bubbleTimer = setTimeout(() => (showBubble.value = false), 2200)
 }
 function hearts(n) { hopFx() }
 
 // ===== 交互 =====
+const catTouchBusy = ref(false)
 async function petCat() {
-  if (!adopted.value || playOpen.value) return
-  const { data } = await jpost('/pet/touch')
-  if (data.touch_left_today === 0 && data.touch_left_today !== undefined) showToast('今天摸够啦，小猫要被摸秃了～')
-  hearts(3)
-  say(['好舒服呀～', '喵呜！', '最喜欢你啦！'][Math.floor(Math.random() * 3)])
-  await refreshPet()
+  if (!adopted.value || roomLocked() || eating) return
+  catTouchBusy.value = true
+  try {
+    await leaveTree()
+    if (!adopted.value || disposed || document.hidden) return
+    const { data } = await jpost('/pet/touch')
+    if (data.touch_left_today === 0 && data.touch_left_today !== undefined) showToast('今天摸够啦，小猫要被摸秃了～')
+    hearts(3)
+    say(['好舒服呀～', '喵呜！', '最喜欢你啦！'][Math.floor(Math.random() * 3)])
+    await refreshPet()
+  } catch { showToast('摸摸没有保存，请稍后再试') }
+  finally { catTouchBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
 }
 
 // 喂食流程：点按钮 → 放置模式（点地面放碗）→ 猫跑过去吃 → 吃完才调后端结算
 const placingFeed = ref(false)
 let eating = false
-function feed() {
-  if (!adopted.value || eating || playOpen.value) return
+let feedTimer = null, feedEpoch = 0, feedInFlight = false
+function feedCurrent(epoch) { return epoch === feedEpoch && adopted.value && !disposed && !document.hidden }
+function cancelFeeding(notify = false) {
+  if (!eating && !placingFeed.value) return
+  feedEpoch++
+  clearTimeout(feedTimer)
+  feedTimer = null
+  if (eating) {
+    syncCatPos()
+    if (catEl.value) catEl.value.style.transition = 'none'
+    interrupt()
+    catAnim.value = 'sit'
+  }
+  placingFeed.value = false
+  showBowl.value = false
+  clearTimeout(bubbleTimer)
+  showBubble.value = false
+  // 已经发出的结算不能伪回滚；请求完成前仍保持互斥，避免重复扣费。
+  eating = feedInFlight
+  if (notify && !disposed) showToast(feedInFlight ? '喂食请求已发送，回来后会同步结果，请勿重复喂食' : '喂食已取消，还没有扣星星，回来可以重新喂')
+}
+async function feed() {
+  if (!adopted.value || eating || roomLocked()) return
+  closeGamePicker(false)
+  await leaveTree()
+  if (!adopted.value || roomLocked() || document.hidden || disposed) return
   if (placingFeed.value) { placingFeed.value = false; say('不喂了吗？'); return } // 再点一次=取消
   placingFeed.value = true
   toolsOpen.value = false
   say('猫粮放哪儿？点一下地面～')
 }
 function placeBowlAndGo(x, y) {
+  if (!adopted.value || disposed || document.hidden || roomLocked() || treeSession.value || eating || feedInFlight) return
+  clearTimeout(feedTimer)
+  feedTimer = null
+  const epoch = ++feedEpoch
   placingFeed.value = false
   eating = true
   bowlPos.x = x
@@ -816,23 +1092,37 @@ function placeBowlAndGo(x, y) {
   say('闻到香味啦！')
   // 猫小跑到碗边（停左侧，头朝碗）
   walkTo({ x: x - 58, y: y }, () => {
+    if (!feedCurrent(epoch)) { if (epoch === feedEpoch) cancelFeeding(); return }
     flipped.value = true // 面向右侧的碗
     catAnim.value = 'eat'
     say('开动咯！')
-    setTimeout(async () => {
-      // 吃完才请求后端（星星不够 → 猫失望）
-      const { ok, data } = await jpost('/pet/feed')
-      showBowl.value = false
-      catAnim.value = 'sit'
-      eating = false
-      if (!ok) {
-        say(data.error || '星星不够啦…')
-      } else {
-        pet.value = data.pet
-        hearts(6)
-        say('真好吃！谢谢你！')
+    feedTimer = setTimeout(async () => {
+      if (epoch !== feedEpoch) return
+      feedTimer = null
+      if (!feedCurrent(epoch)) { cancelFeeding(); return }
+      feedInFlight = true
+      try {
+        // 吃完才请求后端；隐藏或卸载不会重发已经提交的结算。
+        const { ok, data } = await jpost('/pet/feed')
+        if (!feedCurrent(epoch)) return
+        if (!ok) {
+          say(data.error || '星星不够啦…')
+        } else {
+          pet.value = data.pet
+          hearts(6)
+          say('真好吃！谢谢你！')
+        }
+      } catch {
+        if (feedCurrent(epoch)) showToast('喂食结果暂时无法确认，请先查看小猫状态再重试')
+      } finally {
+        feedInFlight = false
+        eating = false
+        if (feedCurrent(epoch)) {
+          showBowl.value = false
+          catAnim.value = 'sit'
+          behaviorNext(1500)
+        }
       }
-      behaviorNext(1500)
     }, 2300)
   }, { speed: 170 })
 }
@@ -842,7 +1132,7 @@ const bowlPos = reactive({ x: 0, y: 0 })
 // ===== 任务 =====
 const submitting = ref(0)
 async function submitTask(t, body = {}) {
-  if (playOpen.value || submitting.value) return
+  if (roomLocked() || submitting.value) return
   submitting.value = t.id
   const snap = t.snapshot
   const payload = {
@@ -930,7 +1220,7 @@ function restoreTimer() {
 }
 const startingTask = ref(0)
 async function startTask(t) {
-  if (playOpen.value || startingTask.value || submitting.value) return
+  if (roomLocked() || startingTask.value || submitting.value) return
   startingTask.value = t.id
   try {
     // 点击前复核最新状态：不能因旧页面、请求失败或家长编辑误启计时。
@@ -942,7 +1232,7 @@ async function startTask(t) {
   } finally { startingTask.value = 0 }
 }
 function startCurrentTask(t) {
-  if (playOpen.value) return
+  if (roomLocked()) return
   const snap = t.snapshot
   let steps
   try { steps = parseSteps(snap) }
@@ -972,6 +1262,8 @@ function startCurrentTask(t) {
 
 // ===== 提交向导（多步骤证据） =====
 const wizard = ref(null) // { task, steps, done: {} }
+const wizardUploading = ref(false)
+const taskRecStarting = ref(false)
 function parseSteps(snap) { return evidenceSteps(snap.evidence_steps, snap.evidence_type || '') }
 function openWizard(t, steps, durationSec) {
   wizard.value = { task: t, steps, done: {}, duration: durationSec || 0 } // done[i] = [{type,path},...]（每步可多文件）
@@ -985,6 +1277,7 @@ const AUDIO_ACCEPT = 'audio/*,audio/mp4,audio/x-m4a,audio/mpeg,audio/wav,audio/x
 const wizardInput = ref(null)
 let wizardStepIdx = -1
 function wizardPick(st, idx) {
+  if (roomLocked() || wizardUploading.value || taskRecStarting.value) return
   wizardStepIdx = idx
   if (wizardInput.value) {
     wizardInput.value.accept = st.kind === 'photo' ? 'image/*' : st.kind === 'video' ? 'video/*' : AUDIO_ACCEPT
@@ -1015,26 +1308,30 @@ async function normalizeImage(file) {
 async function onWizardFile(e) {
   const files = Array.from(e.target.files || [])
   e.target.value = ''
-  if (!files.length || !wizard.value) return
+  if (!files.length || !wizard.value || roomLocked() || wizardUploading.value) return
   const w = wizard.value
   const idx = wizardStepIdx
   if (!w.steps[idx]) return
-  showToast(files.length > 1 ? `上传 ${files.length} 个文件中…` : '上传中…')
-  for (const f0 of files) {
-    const file = await normalizeImage(f0)
-    const fd = new FormData()
-    fd.append('file', file)
-    try {
-      const r = await fetch('/api/upload', { method: 'POST', body: fd })
-      const d = await r.json()
-      if (!d.path) continue
-      const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
-      if (!w.done[idx]) w.done[idx] = []
-      w.done[idx].push({ type, path: d.path })
-    } catch (err) { /* 单个失败不阻塞 */ }
-  }
-  if (!w.done[idx] || !w.done[idx].length) { showToast('上传失败，再试一次？'); return }
-  wizard.value = { ...w, done: { ...w.done } }
+  wizardUploading.value = true
+  try {
+    showToast(files.length > 1 ? `上传 ${files.length} 个文件中…` : '上传中…')
+    for (const f0 of files) {
+      const file = await normalizeImage(f0)
+      const fd = new FormData()
+      fd.append('file', file)
+      try {
+        const r = await fetch('/api/upload', { method: 'POST', body: fd })
+        const d = await r.json()
+        if (!r.ok || !d.path) { showToast('有文件上传失败，请重新选择'); continue }
+        const type = (file.type || '').startsWith('image') ? 'photo' : (file.type || '').startsWith('video') ? 'video' : 'audio'
+        if (!w.done[idx]) w.done[idx] = []
+        w.done[idx].push({ type, path: d.path })
+      } catch { showToast('有文件上传失败，已成功的材料会保留') }
+    }
+    if (!w.done[idx] || !w.done[idx].length) { showToast('上传失败，再试一次？'); return }
+    if (!disposed) wizard.value = { ...w, done: { ...w.done } }
+  } catch { showToast('材料准备失败，请重新选择') }
+  finally { wizardUploading.value = false }
 }
 function wizardRemoveFile(idx, fi) {
   const w = wizard.value
@@ -1085,6 +1382,7 @@ function taskRecReset() {
   taskRecChunks = []
 }
 function closeWizard() {
+  if (wizardUploading.value || taskRecStarting.value || taskRec.value?.state === 'uploading') { showToast('先等上传或录音准备完成，再关闭吧'); return }
   taskRecReleaseStream()
   taskRecReset()
   wizard.value = null
@@ -1099,16 +1397,19 @@ async function toggleTaskRec(idx) {
 }
 
 async function startTaskRec(idx) {
+  if (roomLocked() || taskRecStarting.value || wizardUploading.value) return
   taskRecReset()
   if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
     return showToast('这个浏览器录不了音，用旁边的「录音 / 音频文件」上传吧')
   }
   let stream
+  taskRecStarting.value = true
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true })
   } catch (e) {
     return showToast('麦克风没开权限，去设置里打开，或者用「录音 / 音频文件」上传～')
-  }
+  } finally { taskRecStarting.value = false }
+  if (!wizard.value || roomLocked() || disposed || document.hidden) { stream.getTracks().forEach(track => track.stop()); return }
   taskRecStream = stream
   taskRecChunks = []
   taskRecStartedAt = Date.now()
@@ -1179,6 +1480,7 @@ async function confirmTaskRec() {
 }
 
 async function wizardSubmit() {
+  if (roomLocked() || wizardUploading.value || taskRecStarting.value || taskRec.value?.state === 'uploading') { showToast('先等材料准备完成，再提交吧'); return }
   const w = wizard.value
   if (!w || !wizardReady(w)) return
   if (taskRec.value && taskRec.value.state === 'recording') { showToast('先点「停止」结束录音～'); return }
@@ -1220,7 +1522,7 @@ async function onEvidenceFile(e) {
   const f0 = e.target.files && e.target.files[0]
   e.target.value = ''
   if (!f0 || !evidenceTask) { cancelEvidencePick(); return }
-  if (playOpen.value || evidenceUploading.value) return
+  if (roomLocked() || evidenceUploading.value) return
   const t = evidenceTask
   const dur = timerSec || achievedDuration.value[t.id] || 0
   evidenceUploading.value = true
@@ -1252,12 +1554,14 @@ function taskBtnLabel(t) {
 const wishModal = ref(false)
 const wishForm = reactive({ title: '', hoped: '' })
 function newWish() {
+  if (roomLocked()) return
   wishForm.title = ''
   wishForm.hoped = ''
   wishModal.value = true
   say('说说你想要什么～')
 }
 async function submitWish() {
+  if (roomLocked()) return
   if (!wishForm.title.trim()) return showToast('先写上想要什么哦')
   const hoped = parseInt(wishForm.hoped) || 0
   await jpost('/wish', { title: wishForm.title.trim(), hoped_price: hoped })
@@ -1266,6 +1570,7 @@ async function submitWish() {
   await loadAll()
 }
 async function cancelWish(w) {
+  if (roomLocked()) return
   await jpost(`/wish/${w.id}/cancel`)
   showToast('撤回了这个愿望')
   await loadAll()
@@ -1273,10 +1578,11 @@ async function cancelWish(w) {
 
 // ===== 商店/场景 =====
 async function buyItem(it) {
+  if (playOpen.value || playOpening.value || treeLeaving.value) return
   if (it.owned) return showToast('已经买过啦')
   const { ok, data } = await jpost('/shop/buy', { key: it.key })
   if (!ok) return showToast(data.error || '购买失败')
-  showToast(`买到${it.name}啦！从下面的物品栏拖进房间～`)
+  showToast(it.key === 'cat-tree' ? '猫爬架解锁啦！「和猫玩」里多了无限爬高，反复玩不耗星星' : `买到${it.name}啦！从下面的物品栏拖进房间～`)
   await loadAll()
 }
 
@@ -1287,6 +1593,7 @@ const inventory = computed(() =>
 const dropActive = ref(false)
 const dropEl = ref(null)
 const wallpaperSaving = ref(false)
+const shopActionBusy = ref(false)
 // 默认墙不是商品，但要在商店里留一个随时能换回来的入口。
 const DEFAULT_WALL_ITEM = { key: 'wall-default', name: '原装白墙', price: 0, owned: true, builtin: true }
 const shopRows = computed(() => {
@@ -1319,13 +1626,21 @@ async function clearWallpaper() {
     showToast('网络暂时不通，稍后再换')
   } finally { wallpaperSaving.value = false }
 }
-async function retrieveItem(it) {
+async function retrieveItem(it, { fromShop = false } = {}) {
+  if (!adopted.value || playOpen.value || playOpening.value || treeLeaving.value || (!fromShop && shopActionBusy.value)) return
   const id = placedIdOf(it.key)
   if (!id) return
-  const { ok, data } = await jpost('/scene/remove', { id })
-  if (!ok) return showToast(data.error || '收回失败，再试一次')
-  await loadAll()
-  showToast('收回物品栏了，随时可以再摆')
+  if (!fromShop) shopActionBusy.value = true
+  try {
+    closeGamePicker(false)
+    if (treeSession.value?.itemid === id) await leaveTree()
+    if (!adopted.value || playOpen.value || disposed || document.hidden) return
+    const { ok, data } = await jpost('/scene/remove', { id })
+    if (!ok) return showToast(data.error || '收回失败，再试一次')
+    await loadAll()
+    showToast('收回物品栏了，随时可以再摆')
+  } catch { showToast('收回没有保存，请稍后再试') }
+  finally { if (!fromShop) shopActionBusy.value = false }
 }
 async function applyWallpaper(it) {
   if (!it.owned || wallpaperSaving.value || activeWallpaper.value === it.key) return
@@ -1345,19 +1660,43 @@ async function applyWallpaper(it) {
     showToast('网络暂时不通，稍后再换壁纸')
   } finally { wallpaperSaving.value = false }
 }
-function shopAction(it) {
-  if (it.builtin) return clearWallpaper()
-  if (!it.owned) return buyItem(it)
-  if (isWallpaper(it.key)) return applyWallpaper(it)
-  if (placedIdOf(it.key)) return retrieveItem(it)
-  if (isNarrow.value) { sheet.value = ''; toolsOpen.value = true }
-  showToast('从物品栏拖进房间；不想要了可以在商店点「收回」')
+const shopViewItems = computed(() => shopRows.value.map(it => ({ ...it, actionLabel: shopButtonText(it), placed: !!placedIdOf(it.key), using: (it.builtin || isWallpaper(it.key)) && wallpaperUsing(it) })))
+async function shopAction(it) {
+  if (!adopted.value || gameBusy()) return
+  shopActionBusy.value = true
+  try {
+    if (it.builtin) return await clearWallpaper()
+    if (!it.owned) return await buyItem(it)
+    if (isWallpaper(it.key)) return await applyWallpaper(it)
+    if (placedIdOf(it.key)) return await retrieveItem(it, { fromShop: true })
+    if (it.key === 'cat-tree') {
+      if (!shopItems.value.some(x => x.key === 'cat-tree' && x.owned)) return
+      const b = cameraBounds()
+      if (b && (b.width < 192 || b.height < 192)) {
+        if (isNarrow.value) { sheet.value = ''; toolsOpen.value = true }
+        showToast('房间视口偏小，从物品栏拖入爬架；放大窗口可以看到完整爬架')
+        return
+      }
+      const position = treeVisibleBase({ left: -cam.value.x, top: -cam.value.y, width: b?.width || 640, height: b?.height || 360 })
+      const { ok, data } = await jpost('/scene/place', { key: it.key, ...position })
+      if (!ok) return showToast(data.error || '爬架没有摆好，请再试一次')
+      await loadAll()
+      if (isNarrow.value) sheet.value = ''
+      camMode.value = 'free'
+      centerOn(position.x, position.y - 96, 0)
+      showToast('爬架摆好啦！点它选择爬高、钻窝、抓柱或爬架游戏')
+      return
+    }
+    if (isNarrow.value) { sheet.value = ''; toolsOpen.value = true }
+    showToast('从物品栏拖进房间；不想要了可以在商店点「收回」')
+  } catch { showToast('商店操作没有保存，请稍后再试') }
+  finally { shopActionBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
 }
 
 // 拖拽：物品栏拖入房间（新摆放）；场景内拖动改位置；拖到边缘收回
 let cancelDecorDrag = null
 function onItemPointerDown(e, it, sceneId) {
-  if (playOpen.value) return
+  if (gameBusy()) return
   if (e.button !== 0) return
   e.preventDefault()
   e.stopPropagation()
@@ -1366,7 +1705,8 @@ function onItemPointerDown(e, it, sceneId) {
   const art = decorArt(drag.key)
   const ghost = document.createElement('div')
   ghost.className = 'drag-ghost'
-  const sprite = e.currentTarget.querySelector('svg')?.cloneNode(true)
+  const trigger = e.currentTarget
+  const sprite = trigger.querySelector('svg')?.cloneNode(true)
   if (sprite) { sprite.style.width = '72px'; sprite.style.height = '72px'; ghost.appendChild(sprite) }
   document.body.appendChild(ghost)
   const cleanup = () => {
@@ -1390,8 +1730,17 @@ function onItemPointerDown(e, it, sceneId) {
     // 先取投放区位置：cleanup 会把 dropActive 清掉
     const dropRect = dropActive.value ? dropEl.value?.getBoundingClientRect() : null
     cleanup()
-    if (ev.type === 'pointercancel') return
+    if (ev.type === 'pointercancel' || gameBusy()) return
     if (!drag.moved) {
+      if (drag.id && drag.key === 'cat-tree') {
+        // 点爬架的不同位置直接做不同反应，不再弹玩法菜单；拖动仍走下面的摆放逻辑。
+        const r = trigger.getBoundingClientRect()
+        const mode = r.width && r.height
+          ? treeHitNode((ev.clientX - r.left) / r.width * TREE_SPRITE_UNITS, (ev.clientY - r.top) / r.height * TREE_SPRITE_UNITS)
+          : 'top'
+        playTree(it, mode)
+        return
+      }
       if (drag.id && ['plant', 'nest', 'yarn'].includes(drag.key)) interactWith(it)
       else showToast('按住拖动来摆放，拖到房间边缘可以收回')
       return
@@ -1403,7 +1752,11 @@ function onItemPointerDown(e, it, sceneId) {
     const y = art.surface === 'wall'
       ? clamp(ev.clientY - worldRect.top, art.size + 20, 380)
       : clamp(ev.clientY - worldRect.top, WORLD_H * 0.62, WORLD_H - 20)
+    shopActionBusy.value = true
     try {
+      closeGamePicker(false)
+      if (treeSession.value?.itemid === drag.id) await leaveTree()
+      if (!adopted.value || playOpen.value || document.hidden || disposed) return
       let result
       const inDropZone = dropRect && ev.clientX >= dropRect.left && ev.clientX <= dropRect.right
         && ev.clientY >= dropRect.top && ev.clientY <= dropRect.bottom
@@ -1416,6 +1769,7 @@ function onItemPointerDown(e, it, sceneId) {
       if (!result.ok) return showToast(result.data.error || '摆放没有保存，请再试一次')
       await loadAll()
     } catch { showToast('网络暂时不通，原来的装饰没有丢失') }
+    finally { shopActionBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
   }
   cancelDecorDrag = cleanup
   document.addEventListener('pointermove', move)
@@ -1452,7 +1806,8 @@ function tipDown(key, ev) {
 function tipUp() { clearTimeout(tipTimer) }
 
 function initCat() {
-  if (!roomEl.value) return
+  if (!roomEl.value || disposed || roomLocked()) return
+  resetTreeToFloor()
   catPos.x = WORLD_W * 0.55
   catPos.y = WORLD_H * 0.82
   camMode.value = 'follow'
@@ -1474,6 +1829,7 @@ onMounted(async () => {
       // 人审与跨日待结算也会改变连击/余额；前台持续同步，避免审核后状态停住。
       refreshProgress()
       syncMail()
+      refreshScene()
     }
   }, 15000)
   await loadAll()
@@ -1492,9 +1848,30 @@ onMounted(async () => {
   checkNarrow()
 })
 // 领养完成 → 初始化猫位置（修复：猫从左上角 0,0 起步的问题）
-watch(adopted, (v) => { if (v) setTimeout(initCat, 100); else if (playOpen.value) closePlayground() })
+watch(adopted, (v) => {
+  clearTimeout(initTimer)
+  resetTreeToFloor()
+  if (v) initTimer = setTimeout(initCat, 100)
+  else { closeGamePicker(false); if (playOpen.value) closePlayground() }
+})
+watch(() => sceneItems.value.map(it => [it.id, it.item_key, it.x, it.y]), () => {
+  if (treeSession.value && !treeAnchorMatches(treeSession.value.anchor, sceneItems.value)) resetTreeToFloor()
+}, { flush: 'sync' })
 onBeforeUnmount(() => {
+  disposed = true
+  cancelFeeding()
+  closeGamePicker(false)
+  resetTreeToFloor()
+  interrupt()
+  clearTimeout(initTimer)
+  clearTimeout(bubbleTimer)
+  clearTimeout(tipTimer)
   clearTimeout(stateTimer)
+  taskRecReleaseStream()
+  taskRecReset()
+  recHolding = false
+  recCancelled = true
+  releaseStream()
   viewportObserver?.disconnect()
   window.removeEventListener('resize', onViewportResize)
   document.removeEventListener('pointerdown', dismissStatusOutside)
@@ -1553,7 +1930,7 @@ onBeforeUnmount(() => {
   </div>
 
   <!-- 房间 -->
-  <div v-else class="room" ref="rootEl" :inert="playOpen" :aria-hidden="playOpen ? 'true' : undefined" :class="{ 'drawer-open': isNarrow && !!sheet }" :data-time-phase="sceneLighting.label">
+  <div v-else class="room" ref="rootEl" :inert="playOpen || playOpening" :aria-hidden="playOpen ? 'true' : undefined" :class="{ 'drawer-open': isNarrow && !!sheet }" :data-time-phase="sceneLighting.label">
     <svg class="ui-icons" aria-hidden="true" width="0" height="0">
       <defs>
         <symbol id="room-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9Z" /></symbol>
@@ -1590,7 +1967,11 @@ onBeforeUnmount(() => {
     <div v-for="it in placedDecor" :key="it.id" class="scene-item"
       :class="{ shake: shakeId === it.id }"
       :style="{ left: it.x + 'px', top: it.y + 'px', zIndex: decorDepth(it), transition: it.item_key === 'yarn' ? 'left .8s ease' : '' }"
-      :title="decorArt(it.item_key).name"
+      :title="it.item_key === 'cat-tree' ? '点顶部、小窝、柱子有不同反应，按住拖动摆放' : decorArt(it.item_key).name"
+      :tabindex="it.item_key === 'cat-tree' ? 0 : undefined" :role="it.item_key === 'cat-tree' ? 'button' : undefined"
+      :aria-label="it.item_key === 'cat-tree' ? '猫爬架，点不同位置和小猫互动，按住拖动摆放' : undefined"
+      @keydown.enter.prevent.stop="it.item_key === 'cat-tree' && playTree(it, 'top')"
+      @keydown.space.prevent.stop="it.item_key === 'cat-tree' && playTree(it, 'top')"
       @pointerdown="(e) => onItemPointerDown(e, it, it.id)">
       <PixelItem :item-key="it.item_key" :size="decorArt(it.item_key).size" />
     </div>
@@ -1605,12 +1986,12 @@ onBeforeUnmount(() => {
     </svg>
 
     <!-- 猫 -->
-    <div class="cat-wrap" ref="catEl" :class="{ sad: moodColor === 'sad' }"
-      :style="{ left: catPos.x + 'px', top: catPos.y + 'px', zIndex: catDepth }" @click="petCat">
+    <div class="cat-wrap" ref="catEl" :class="{ sad: moodColor === 'sad', 'room-paused': roomHidden, 'tree-cat': treeRendered, 'tree-peek': treeRendered && treeSession?.currentnode === 'nest' && !treeMoving, 'tree-scratch': treeRendered && treeSession?.mode === 'grip' && !treeMoving }"
+      :style="catRoomStyle" :data-tree-node="treeRendered ? treeSession?.currentnode : undefined" @click.stop="petCat">
       <div class="bubble" v-if="showBubble">{{ bubble }}</div>
       <span class="zzz" v-if="catAnim === 'sleep' && zzz">💤</span>
       <div class="cat-inner" :class="{ flip: flipped }">
-        <CatSprite :species="species" :anim="catAnim" :size="110" :paused="playOpen" />
+        <CatSprite :species="species" :anim="catAnim" :size="treeCatSize" :paused="playOpen || roomHidden" />
       </div>
     </div>
     </div><!-- /world -->
@@ -1649,10 +2030,21 @@ onBeforeUnmount(() => {
     <!-- 提示气泡（触屏长按后松手/移开消失） -->
     <div v-if="tipShow" class="tip-bubble" @pointerdown="hideTip">{{ tipText }}</div>
 
+    <div v-if="gamePicker" class="game-picker-scrim" @pointerdown.stop @click.stop="closeGamePicker()"></div>
+    <div v-if="gamePicker" ref="gamePickerEl" class="game-picker" role="dialog" aria-modal="true" aria-labelledby="game-picker-title" @pointerdown.stop @click.stop @keydown="gamePickerKeydown">
+      <div class="game-picker-heading"><b id="game-picker-title">和猫玩什么？</b><button ref="gamePickerClose" type="button" aria-label="关闭游戏列表" @click="closeGamePicker()">关闭</button></div>
+      <button type="button" class="game-card" @click="startGame('feather')"><b>逗猫羽毛</b><small>动动手指，免费玩</small></button>
+      <button v-if="hasCatTreeGame" type="button" class="game-card climb" @click="startGame('climb')"><b>无限爬高</b><small>一层一层往上跳</small></button>
+    </div>
     <div v-if="isNarrow && sheet" class="sheet-scrim" @click="sheet = ''"></div>
     <!-- 侧栏容器：桌面=右侧自适应列；窄屏=底部抽屉 -->
     <div class="sidebar" :class="{ open: !!sheet, narrow: isNarrow }">
-    <div class="panel" id="taskPanel" v-show="!isNarrow || sheet === 'task'">
+    <nav v-if="!isNarrow" class="desktop-tabs" role="tablist" aria-label="小屋侧栏">
+      <button id="taskTab" role="tab" aria-controls="taskPanel" :aria-selected="desktopPanel === 'task'" @click="selectDesktopPanel('task')">任务 {{ taskCompleted }}/{{ today.tasks.length }}<span v-if="taskPending" class="pending-badge" :aria-label="taskPending + '项待完成'">{{ taskPending }}</span></button>
+      <button id="wishTab" role="tab" aria-controls="wishPanel" :aria-selected="desktopPanel === 'wish'" @click="selectDesktopPanel('wish')">愿望</button>
+      <button id="shopTab" role="tab" aria-controls="shopPanel" :aria-selected="desktopPanel === 'shop'" @click="selectDesktopPanel('shop')">商店</button>
+    </nav>
+    <div class="panel" id="taskPanel" role="tabpanel" :aria-labelledby="isNarrow ? undefined : 'taskTab'" v-show="panelVisible('task')">
       <div class="panel-bar">📋 今日任务（{{ today.tasks.filter(t => t.status === 'approved').length }}/{{ today.tasks.length }}）<button class="sheet-close" @click="sheet = ''" aria-label="关闭任务"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
         <p v-if="pendingRewardCount" class="reward-notice">有 {{ pendingRewardCount }} 项任务已通过，连击确定后星星会自动到账，不用重新提交。</p>
@@ -1676,7 +2068,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div class="panel wish" id="wishPanel" v-show="!isNarrow || sheet === 'wish'">
+    <div class="panel wish" id="wishPanel" role="tabpanel" :aria-labelledby="isNarrow ? undefined : 'wishTab'" v-show="panelVisible('wish')">
       <div class="panel-bar">🌠 我的愿望 <a @click="newWish">+ 许愿</a><button class="sheet-close" @click="sheet = ''" aria-label="关闭愿望"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
       <div class="panel-body">
         <div v-for="w in wishes.filter(x => x.status !== 'rejected')" :key="w.id" class="wish-row">
@@ -1690,15 +2082,10 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div class="panel shop" id="shopPanel" v-show="!isNarrow || sheet === 'shop'">
-      <div class="panel-bar">🛒 像素商店<button class="sheet-close" @click="sheet = ''" aria-label="关闭商店"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
-      <div class="panel-body">
-        <div v-for="it in shopRows" :key="it.key" class="shop-row">
-          <PixelItem v-if="!isWallpaper(it.key) && !it.builtin" :item-key="it.key" :size="26" />
-          <i v-else class="wallpaper-swatch" :style="wallStyle(it.builtin ? '' : it.key, 64)" aria-hidden="true"></i>
-          <span>{{ it.name }}</span><em>{{ it.builtin ? '免费' : it.price + '⭐' }}</em>
-          <button :class="{ owned: it.owned }" :disabled="wallpaperSaving" @click="shopAction(it)">{{ shopButtonText(it) }}</button>
-        </div>
+    <div class="panel shop" id="shopPanel" role="tabpanel" :aria-labelledby="isNarrow ? undefined : 'shopTab'" v-show="panelVisible('shop')">
+      <div v-if="isNarrow" class="shop-mobile-bar"><button class="sheet-close" @click="sheet = ''" aria-label="关闭商店"><svg class="ui-icon"><use href="#room-close" /></svg></button></div>
+      <div class="shop-body">
+        <PixelShop :items="shopViewItems" :balance="pet?.balance || 0" :busy="wallpaperSaving || shopActionBusy || treeLeaving || playOpening" @action="shopAction" />
       </div>
     </div>
 
@@ -1720,7 +2107,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="actions" v-show="!isNarrow || toolsOpen">
-      <button class="pbtn playground-entry" @click="openPlayground"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>和猫玩</b><small>羽毛逗猫 · 免费</small></span></button>
+      <button class="pbtn playground-entry" :aria-expanded="gamePicker" aria-haspopup="dialog" @click="openGamePicker($event.currentTarget)"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>和猫玩</b><small>{{ hasCatTreeGame ? '选个小游戏' : '羽毛逗猫 · 免费' }}</small></span></button>
       <button class="pbtn feed" @click="feed"><span class="action-icon"><svg class="ui-icon"><use href="#room-food" /></svg></span><span class="action-copy"><b>{{ placingFeed ? '取消喂食' : '喂猫粮' }}</b><small>10 星星 / 次</small></span></button>
       <button class="pbtn hint" @click="petCat"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>摸摸头</b><small>陪它开心一下</small></span></button>
       <button class="pbtn chatbtn" @click="openChat"><span class="action-icon"><svg class="ui-icon"><use href="#room-chat" /></svg></span><span class="action-copy"><b>聊聊天</b><small>今日还可聊 {{ chatLeft }} 句</small></span></button>
@@ -1866,7 +2253,8 @@ onBeforeUnmount(() => {
     </div>
   </div>
   <Teleport to="body">
-    <CatPlayground v-if="playOpen && adopted" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
+    <CatPlayground v-if="playOpen && adopted && gameKind === 'feather'" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
+    <CatClimb v-if="playOpen && adopted && gameKind === 'climb'" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
   </Teleport>
 </template>
 
@@ -1902,8 +2290,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .ui-icon { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .camera-hint { font-size: 11px; color: #88786A; white-space: nowrap; }
 /* 美术分层：庭院在视口外；固定世界内仅基础墙地纹理，装饰独立持久化。 */
-.room { position: fixed; inset: 0; overflow: hidden; color: #5D493B; background: #617a4f; cursor: default; touch-action: manipulation; }
-.scene-viewport { position: absolute; top: clamp(112px, 14vh, 152px); bottom: 132px; left: clamp(68px, 7vw, 132px); right: clamp(344px, 25vw, 420px); max-width: 1280px; max-height: 720px; overflow: hidden; z-index: 1; border: 8px solid #8b6547; border-top-color: #c8a778; border-left-color: #b18b61; border-radius: 6px; background: #dbb27b url('/art/wood-floor.png') center bottom / 1280px 320px repeat; image-rendering: pixelated; box-shadow: 0 0 0 4px #e0d1b4, 0 8px 0 4px #74644d, 0 14px 0 4px rgb(48 58 34 / 35%); touch-action: none; }
+.room { --sidebar-width: 300px; --sidebar-gap: calc(var(--sidebar-width) + 48px); position: fixed; inset: 0; overflow: hidden; color: #5D493B; background: #617a4f; cursor: default; touch-action: manipulation; }
+.scene-viewport { position: absolute; top: clamp(112px, 14vh, 152px); bottom: 132px; left: clamp(68px, 7vw, 132px); right: var(--sidebar-gap); max-width: 1280px; max-height: 720px; overflow: hidden; z-index: 1; border: 8px solid #8b6547; border-top-color: #c8a778; border-left-color: #b18b61; border-radius: 6px; background: #dbb27b url('/art/wood-floor.png') center bottom / 1280px 320px repeat; image-rendering: pixelated; box-shadow: 0 0 0 4px #e0d1b4, 0 8px 0 4px #74644d, 0 14px 0 4px rgb(48 58 34 / 35%); touch-action: none; }
 .world { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; background: #e9c891; will-change: transform; }
 .cat-wrap { position: absolute; width: 110px; margin-left: -55px; margin-top: -100px; cursor: pointer; z-index: 5; }
 .cat-inner { transition: transform .3s; transform-origin: 50% 90%; }
@@ -1912,6 +2300,29 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .bubble { position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); width: max-content; max-width: 300px; background: #FFFCF6; border: 1.5px solid #CBB49A; border-radius: 12px; padding: 8px 12px; font-size: 12px; line-height: 1.5; font-weight: 600; white-space: normal; overflow-wrap: anywhere; box-shadow: 0 4px 12px rgba(103, 75, 47, .12); pointer-events: none; }
 .zzz { position: absolute; top: -20px; right: 0; }
 .scene-item { position: absolute; transform: translate(-50%, -100%); line-height: 0; cursor: grab; user-select: none; touch-action: none; }
+.scene-item:focus-visible { outline: 3px solid #9C8BC5; outline-offset: 4px; }
+.tree-peek { clip-path: inset(20px 16px 0 24px); }
+.tree-peek .cat-inner { translate: -12px 0; }
+.tree-scratch .cat-inner { animation: tree-scratch .24s ease-in-out infinite alternate; }
+.room-paused .cat-inner { animation-play-state: paused; }
+@keyframes tree-scratch { to { translate: 0 -2px; } }
+.game-picker-scrim { position: fixed; inset: 0; z-index: 58; background: rgba(77, 60, 45, .18); }
+.game-picker { position: fixed; z-index: 59; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(300px, calc(100vw - 32px)); padding: 12px; display: flex; flex-direction: column; gap: 8px; border: 2px solid #b59d76; border-radius: 10px; background: #fff9eb; box-shadow: 0 4px 0 #766b4b; }
+.game-picker-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 14px; }
+.game-picker-heading button { min-height: 30px; padding: 3px 10px; border: 1px solid #cfbea1; border-radius: 4px; color: #654738; background: #f1e7d5; font-size: 11px; cursor: pointer; }
+.game-card { min-height: 58px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 3px; padding: 8px 14px; border: 2px solid #cfbea1; border-radius: 8px; color: #654738; background: #f1e7d5; text-align: left; cursor: pointer; }
+.game-card.climb { background: #e9f1dd; border-color: #b9caa7; }
+.game-card b { font-size: 14px; }
+.game-card small { font-size: 11px; opacity: .78; }
+.game-card:hover, .game-card:focus-visible { background: #ffe9bd; outline: 2px solid #9C8BC5; outline-offset: 2px; }
+@media (max-width: 900px) {
+  .game-picker { max-height: calc(100vh - 180px - env(safe-area-inset-bottom, 0px)); overflow-y: auto; }
+}
+@media (max-width: 900px) and (max-height: 500px) {
+  .game-picker { width: min(420px, calc(100vw - 24px)); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .game-picker-heading { grid-column: 1 / -1; }
+  .game-card { min-height: 52px; }
+}
 .scene-item.shake { animation: shake .5s ease-in-out 3; }
 @keyframes shake { 0%, 100% { transform: translate(-50%, -100%) rotate(0); } 30% { transform: translate(-50%, -100%) rotate(-8deg); } 60% { transform: translate(-50%, -100%) rotate(6deg); } }
 .bowl { position: absolute; transform: translate(-50%, -100%); z-index: 6; }
@@ -1919,7 +2330,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .room:has(.place-banner) .scene-viewport { cursor: crosshair; }
 
 /* 标题与默认收起的状态浮层，开关交给 v-show */
-.room-header { position: absolute; top: 20px; left: clamp(68px, 7vw, 132px); right: clamp(344px, 25vw, 420px); min-height: 64px; z-index: 16; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; background: #fff8e8; border: 2px solid #b29870; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; }
+.room-header { position: absolute; top: 20px; left: clamp(68px, 7vw, 132px); right: var(--sidebar-gap); min-height: 64px; z-index: 16; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; background: #fff8e8; border: 2px solid #b29870; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; }
 .room-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .room-identity > :first-child { flex-shrink: 0; }
 .room-name { min-width: 0; }
@@ -1952,10 +2363,15 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 @keyframes tipin { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 
 /* 侧栏与任务、愿望、商店 */
-.sidebar { position: absolute; top: 106px; right: 24px; bottom: 100px; width: 272px; display: flex; flex-direction: column; gap: 12px; z-index: 25; min-height: 0; }
+.sidebar { position: fixed; top: 106px; right: 24px; bottom: 24px; width: var(--sidebar-width); display: flex; flex-direction: column; gap: 8px; z-index: 25; min-height: 0; }
+.desktop-tabs { flex: 0 0 42px; display: flex; gap: 4px; padding: 4px; border: 2px solid #b59d76; border-radius: 6px; background: #fff9eb; }
+.desktop-tabs button { flex: 1; min-width: 0; padding: 4px 3px; border: 0; border-radius: 3px; background: transparent; color: #796653; font-size: 12px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.desktop-tabs button[aria-selected='true'] { background: #e8e0f2; color: #69518f; }
+.pending-badge { display: inline-block; margin-left: 3px; min-width: 16px; padding: 1px 3px; border-radius: 8px; background: #9b6853; color: white; font-size: 10px; }
+.shop-body { flex: 1 1 0; min-height: 0; overflow: hidden; }
+.shop-mobile-bar { display: flex; flex: 0 0 34px; align-items: center; justify-content: flex-end; padding: 3px 8px; background: #f8eddb; }
 .panel { width: 100%; min-width: 0; background: #fff9eb; border: 2px solid #b59d76; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; overflow: hidden; }
 .sidebar .panel { position: static; flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
-#taskPanel { flex-grow: 2; }
 .panel-bar { display: flex; align-items: center; flex-shrink: 0; gap: 8px; min-height: 44px; padding: 10px 12px; border-bottom: 1px solid #E6D8C5; font-size: 13px; font-weight: 700; background: #EAF0E3; }
 .panel.wish .panel-bar { background: #EFEBF7; }
 .panel.shop .panel-bar { background: #FAEEDB; }
@@ -2005,7 +2421,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .pbtn { font-size: 14px; font-weight: 600; cursor: pointer; padding: 10px 14px; color: #70543C; background: #FFF1DB; border: 1.5px solid #D8BFA1; border-radius: 12px; box-shadow: 0 3px 8px rgba(103, 75, 47, .08); }
 .pbtn:active { transform: translateY(1px); box-shadow: none; }
 .pbtn small { display: block; font-size: 10px; line-height: 1.4; font-weight: 400; color: #88786A; }
-.actions { position: absolute; bottom: 30px; left: 24px; max-width: calc(100% - 470px); display: flex; gap: 10px; z-index: 17; }
+.actions { position: absolute; bottom: 30px; left: 24px; max-width: calc(100% - var(--sidebar-gap) - 32px); display: flex; gap: 10px; z-index: 17; }
 .actions .pbtn { display: flex; align-items: center; gap: 10px; min-width: 0; height: 52px; padding: 8px 14px; }
 .actions .playground-entry { background: #E9F1DD; color: #526646; border-color: #B9CAA7; }
 .actions .feed { background: #FFF0D9; border-color: #DABF9B; }
@@ -2016,7 +2432,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .action-copy { min-width: 0; text-align: left; }
 .action-copy b { display: block; font-size: 13px; line-height: 1.4; white-space: nowrap; }
 .action-copy small { margin-top: 2px; white-space: nowrap; }
-.room-tools { position: absolute; right: 320px; bottom: 38px; z-index: 18; display: flex; align-items: center; gap: 10px; }
+.room-tools { position: absolute; right: var(--sidebar-gap); bottom: 38px; z-index: 18; display: flex; align-items: center; gap: 10px; }
 .mobile-companion { display: none; }
 .mailbox-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .mailbox-btn svg { flex-shrink: 0; width: 18px; height: 18px; }
@@ -2038,7 +2454,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .camera-reset { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .camera-reset svg, .mobile-companion svg { flex-shrink: 0; width: 18px; height: 18px; }
 .camera-reset.free, .camera-reset.on { background: #EEEBF7; color: #75609D; border-color: #CFC2E3; }
-.inv-bar { position: absolute; bottom: 126px; left: 40px; max-width: min(580px, calc(100% - 376px)); z-index: 17; background: rgba(255, 252, 246, .94); border: 1px solid #D5C1A8; border-radius: 14px; box-shadow: 0 4px 12px rgba(103, 75, 47, .1); padding: 6px 10px; display: flex; gap: 8px; align-items: center; overflow-x: auto; overscroll-behavior-x: contain; touch-action: pan-x; scrollbar-width: thin; }
+.inv-bar { position: fixed; height: 64px; bottom: 126px; left: 40px; max-width: min(70vw, calc(100% - var(--sidebar-gap) - 64px)); z-index: 17; background: rgba(255, 252, 246, .94); border: 1px solid #D5C1A8; border-radius: 14px; box-shadow: 0 4px 12px rgba(103, 75, 47, .1); padding: 6px 10px; display: flex; gap: 8px; align-items: center; overflow-x: auto; overscroll-behavior-x: contain; touch-action: pan-x; scrollbar-width: thin; }
 .scene-viewport .inv-bar { bottom: 16px; left: 16px; max-width: min(580px, calc(100% - 32px)); }
 .inv-bar .lbl { flex-shrink: 0; font-size: 11px; color: #88786A; white-space: nowrap; }
 .inv-item { flex: 0 0 44px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; border: 2px dashed #b39b73; border-radius: 4px; cursor: grab; user-select: none; touch-action: none; background: #fff1d8; }
@@ -2145,6 +2561,16 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .wprev-item audio { height: 36px; width: 200px; max-width: 100%; }
 .wprev-del { position: absolute; top: -8px; right: -8px; width: 20px; height: 20px; background: #AF6D66; color: #fff; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; cursor: pointer; border: 1.5px solid #fff; }
 
+/* 矮桌面让右侧使用全高；房间取景框仍与相机独立。 */
+@media (min-width: 901px) and (max-height: 599px) {
+  .sidebar { top: 16px; bottom: 16px; }
+  .room-tools .camera-hint { display: none; }
+}
+@media (min-width: 600px) and (max-width: 900px) and (max-height: 500px) {
+  .room .sidebar.narrow { top: 12px; bottom: calc(90px + env(safe-area-inset-bottom, 0px)); height: auto; max-height: none; }
+  .room .actions { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .room .inv-bar { height: 56px; z-index: 18; }
+}
 /* 与 JS matchMedia 的 900px 断点一致 */
 @media (max-width: 900px) {
   .scene-viewport { inset: max(82px, calc(env(safe-area-inset-top, 0px) + 70px)) 10px calc(142px + env(safe-area-inset-bottom, 0px)); max-width: none; max-height: none; border-width: 4px; border-radius: 4px; box-shadow: 0 0 0 2px #e0d1b4, 0 6px 0 2px #74644d; }
@@ -2177,10 +2603,10 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .action-copy b { font-size: 13px; }
   .action-copy small { font-size: 10px; }
   .actions .chatbtn { display: flex; }
-  .inv-bar, .scene-viewport .inv-bar { bottom: calc(214px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; width: max-content; max-width: calc(100% - 32px); }
-  .sidebar.narrow { top: auto; bottom: calc(90px + env(safe-area-inset-bottom, 0px)); left: 12px; right: 12px; width: auto; max-height: 60dvh; display: none; gap: 0; }
+  .inv-bar, .scene-viewport .inv-bar { bottom: calc(214px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; width: max-content; max-width: 70vw; }
+  .sidebar.narrow { top: auto; bottom: calc(90px + env(safe-area-inset-bottom, 0px)); left: 12px; right: 12px; width: auto; height: calc(100dvh - 180px); max-height: 70dvh; display: none; gap: 0; }
   .sidebar.narrow.open { display: flex; }
-  .sidebar.narrow .panel { flex: 0 1 auto; max-height: 60dvh; }
+  .sidebar.narrow .panel { flex: 1 1 0; max-height: none; }
   .sidebar.narrow .sheet-close { display: inline-flex; }
   .chat-box, .wizard-box { width: 100%; border-bottom: 0; }
   .chat-head { padding: 12px; }
@@ -2194,7 +2620,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 /* 抽屉打开时让操作区与物品栏退场 */
 .room.drawer-open .actions, .room.drawer-open .inv-bar { display: none; }
 @media (prefers-reduced-motion: reduce) {
-  .scene-item.shake, .think-cat, .think-dots i, .cursor, .chat-input .rec-btn.recording i { animation: none; }
+  .tree-scratch .cat-inner, .scene-item.shake, .think-cat, .think-dots i, .cursor, .chat-input .rec-btn.recording i { animation: none; }
   .cat-card, .cat-inner, .chip.mini .bar i, .wish-row .track i, :global(.drag-ghost) { transition: none; }
   .modal-box, .chat-box, .wizard-box, .tip-bubble { animation: none; }
 }

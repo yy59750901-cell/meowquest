@@ -209,6 +209,7 @@ func (s *Server) adminWishAction(c *gin.Context) {
 
 var ITEM_REGISTRY = []gin.H{
 	{"key": "nest", "name": "猫窝", "price": 30, "type": "furniture"},
+	{"key": "cat-tree", "name": "猫爬架", "price": 50, "type": "furniture"},
 	{"key": "yarn", "name": "毛线球", "price": 15, "type": "furniture"},
 	{"key": "plant", "name": "盆栽", "price": 20, "type": "furniture"},
 	{"key": "fish", "name": "小鱼挂画", "price": 12, "type": "furniture"},
@@ -297,24 +298,36 @@ func (s *Server) placeItem(c *gin.Context) {
 	var req struct {
 		ID  int64   `json:"id"`
 		Key string  `json:"key" binding:"required"`
-		X   float64 `json:"x" binding:"required"`
-		Y   float64 `json:"y" binding:"required"`
+		X   float64 `json:"x" binding:"required,gt=0,lte=1280"`
+		Y   float64 `json:"y" binding:"required,gt=0,lte=720"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	var owned int64
-	s.DB.Model(&store.OwnedItem{}).Where("kid_id=? AND item_key=?", kidOf(c), req.Key).Count(&owned)
+	if err := s.DB.Model(&store.OwnedItem{}).Where("kid_id=? AND item_key=?", kidOf(c), req.Key).Count(&owned).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	if owned == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not owned"})
 		return
 	}
+	var res *gorm.DB
 	if req.ID > 0 {
-		s.DB.Model(&store.SceneItem{}).Where("id=? AND item_key=?", req.ID, req.Key).
+		res = s.DB.Model(&store.SceneItem{}).Where("id=? AND kid_id=? AND item_key=?", req.ID, kidOf(c), req.Key).
 			Updates(map[string]any{"x": req.X, "y": req.Y})
 	} else {
-		s.DB.Create(&store.SceneItem{KidID: kidOf(c), ItemKey: req.Key, X: req.X, Y: req.Y})
+		res = s.DB.Create(&store.SceneItem{KidID: kidOf(c), ItemKey: req.Key, X: req.X, Y: req.Y})
+	}
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -322,12 +335,20 @@ func (s *Server) placeItem(c *gin.Context) {
 // POST /api/scene/remove { id }
 func (s *Server) removeItem(c *gin.Context) {
 	var req struct {
-		ID int64 `json:"id" binding:"required"`
+		ID int64 `json:"id" binding:"required,gt=0"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	s.DB.Delete(&store.SceneItem{}, req.ID)
+	res := s.DB.Where("kid_id=?", kidOf(c)).Delete(&store.SceneItem{}, req.ID)
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

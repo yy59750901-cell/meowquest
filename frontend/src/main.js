@@ -15,7 +15,10 @@ const router = createRouter({
     { path: '/', component: KidHome },
     { path: '/admin', component: AdminLogin },
     { path: '/admin/home', component: AdminHome },
-    ...(import.meta.env.DEV ? [{ path: '/playground-preview', component: () => import('./views/CatPlayPreview.vue') }] : []),
+    ...(import.meta.env.DEV ? [
+      { path: '/playground-preview', component: () => import('./views/CatPlayPreview.vue') },
+      { path: '/climb-preview', component: () => import('./views/CatClimbPreview.vue') },
+    ] : []),
   ],
 })
 

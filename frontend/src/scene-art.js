@@ -39,6 +39,8 @@ export function getSceneLighting(date = new Date()) {
 // 注册新装饰只需追加原始 key，不改已有存储结构。
 export const DECOR_ART = {
   nest: { name: '暖橘猫窝', size: 96, surface: 'floor' },
+  // 沿用 PixelItem 的 48 单位画布与底部中心锚点 (24, 48)。
+  'cat-tree': { name: '猫爬架', size: 192, surface: 'floor' },
   yarn: { name: '紫色毛线球', size: 72, surface: 'floor' },
   plant: { name: '红陶盆栽', size: 96, surface: 'floor' },
   fish: { name: '小鱼挂画', size: 84, surface: 'wall' },
