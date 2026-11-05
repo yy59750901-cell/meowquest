@@ -558,3 +558,32 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - `gesturestart` / `gesturechange` 是 iOS Safari 专有事件，Chromium 不触发，本地只能验证多指 `touchmove` 拦截、监听注册移除、双指输入不丢与缩放兜底；**最终仍需在真实 iPad Safari 上捏一下确认**。
 - 本轮只改 `CatClimb.vue`、`CatPlayground.vue`、`cat-climb.test.js`、`cat-play.test.js`；**未运行 `frontend/build.sh`、未改 embed、未部署**，线上仍是 21:11 版本（不含本次防缩放修复）。注意仓库内 embed 产物仍是 21:11 发布版（含方向实时判向、不含防缩放），与最新源码存在版本差；**后续部署前必须重跑 `frontend/build.sh`**，否则从仓库直接构建的二进制不会带上本次防缩放修复。
 - 用户随后明确「提交push」，本轮改动与 21:11 发布记录一并提交并推送 origin/main；`backend/.deploy.local` 与 `frontend/dist` 仍被忽略，仓库不含真实部署域名、密钥或账号密码。
+
+## 二十八、房间道具互动改为最短路径与统一连玩调度（2026年11月5日10:40，本地未发布）
+
+### 用户反馈与拍板
+
+- 用户反馈：猫爬架互动是「从地面出发的固定脚本」——到最高处要 地面→抓柱→中层→最高；但当猫**本来就在中层或小窝里**时点最高处，会先跳回地面再重放整条路线，应该「从当前所在位置走最短路径」。
+- 澄清：房间实际有 **4 个**互动落点（最高 `top`、中层 `mid`、小窝 `nest`、麻绳柱 `grip`），自动行为只随机挑 `top/nest/grip`，热区点击还能到 `mid`。
+- 根因：`cat-tree-room.js` 的 `routes` 是固定序列；`KidHome.vue:572` 的 `playTree()` 每次点击先 `await leaveTree()` 下架回地面，再 `walkTo` 走回起点重放；`cat-tree-room.test.js` 有条测试「新邀请先安全下架再替换路线」把这个行为锁死。
+- 用户逐项拍板：①A+B（最短路径 ＋ 取消每次互动结束自动下架）；②跳跃中再点按建议「等当前跳落地再走新路径」；③点当前节点原地重播；④**最短路径方法要通用可复用**，将来其它道具也能用；⑤姿态切换一并处理。追加建议评估后拍板「一起做、数值可以、点击抢占、nest/yarn/plant 都收编、25s 兜底」。
+- 评估结论：两条追加建议合理，但**爬架/玩球是多次短互动、猫窝睡觉是一次长停留**，不能用同一个随机次数套所有道具，改用按道具的 profile；且它们正好补上 A+B 取消自动下架后「猫何时结束」的收尾机制，分两轮会返工，故一次做完。
+
+### 实现
+
+- 新增纯逻辑模块 `frontend/src/room-interaction.js`（不读写 DOM/存储/奖励，随机可注入）：`buildAdjacency` + `shortestNodePath(edges, from, to)`（无向图 BFS，同点返回 `[]`、不可达返回 `null`）；`ROOM_INTERACTION_NODES` / `ROOM_INTERACTION_PROFILES`；`planInteractionSession(key, random)`（有界随机次数与时长，统一 `maxDuration: 25000`）；`pickInteractionNode`；`dwellForNode`。新道具只要给一份 `edges` 与一份 profile 即可复用，不需要改调度代码，不引入类或状态机库。
+- `cat-tree-room.js`：`TREE_EDGES`（ground↔grip、grip↔mid、grip↔nest、mid↔top）＋ `treePath(from,to)` 复用通用 BFS；`treeRoute(mode) = treePath('ground', mode)`、`treeDownRoute(node) = treePath(node,'grip')`，对外输出与原来逐字节一致（49 项既有房间断言全部不改通过）。
+- `KidHome.vue` 爬架会话重构：`playTree()` 若猫已在架上只 `requestTreeTarget()` 登记目标并唤醒等待，**不再 leaveTree**；新增 `runTreeSession()` 循环，从 `currentnode` 走 `treePath` 最短路，每跳之间检查 `requested`（实现「等当前跳落地再改道」和点击抢占），同点 `path=[]` 时原地重播姿态；`applyTreePose()` 按目标切 `crouch`/`tree-peek`/`tree-scratch` 与 `flipped`；停留走 `dwellForNode`（窝用长停留），结束后按 profile 自动随机挑下一个节点连玩，次数用完或累计 25s 兜底才 `leaveTree()` 并恢复 `behaviorNext`。`cancelTreePending()` 增加 `finishTreeSession()` 幂等收尾，保证任何取消路径都能结束 `playTree` 返回的 Promise、不留悬空计时器。
+- `nest` / `yarn` / `plant` 收编统一 profile：点击互动与 `behaviorTick` 里的自动睡觉改用 `planInteractionSession` 的随机时长；玩球连玩次数由 `plan.repeats` 决定（保留球滚动、`hearts` 与结束时**仅一次** `/scene/place` 持久化）；睡觉是「一次长停留 6–12s」而不是连续蹦几次。profile：爬架 2–4 次 / 2.5–5s（窝 6–12s），玩球 2–3 次 / 1.5–3s，猫窝 1 次 / 6–12s，植物 1 次 / 2.2–3.2s。
+
+### 验证证据
+
+- 新增 `room-interaction.test.js` 6 项（邻接表、任意起点最短路、同点/不可达、随机边界、睡觉长停留、自动挑选不同目标）；`cat-tree-room.test.js` 重写「先下架」为「已在架上点新目标不回地面、姿态切换、从窝到最高处、同点重播、自动连玩、25s 兜底下架」，补 `treePath` 断言与玩球只写一次摆放；测试宿主注入新模块。全量 `node --test src/*.test.js` **240/240** 通过；`npm run build`、`git diff --check` 通过。
+- 六视口真实热区点击验收（固定 `Math.random=0.99` 让观察窗口不被自动连玩干扰、POST 全拦截）：`mid→top` 节点序列只有 **`[top]`**（1 跳、全程 `tree-cat`、不经过 `grip`、不回地面）；`nest→top` 为 **`grip→mid→top`**（3 跳、全程留在架上）；超过停留后自动连玩换到 `mid→grip→nest`。桌面/iPad/iPad宽/手机/320小屏全通过，844×390 矮横屏按既有约定只做渲染检查。无页面报错、无业务 POST。
+- 截图逐张确认桌面/手机/320小屏小猫正确停在最高平台、房间与导航完整无重叠溢出。观察到一个**既有**细节：320 小屏右下「回猫」按钮略有裁切，本轮未改布局，未擅自扩大范围。
+
+### 边界
+
+- 本轮改 `room-interaction.js`(新)、`room-interaction.test.js`(新)、`cat-tree-room.js`、`cat-tree-room.test.js`、`KidHome.vue`；**未运行 `frontend/build.sh`、未改 embed、未部署**，线上仍是 21:11 版本。仓库 embed 仍落后于最新源码（差防缩放与本轮房间互动两轮改动），部署前必须重跑 `frontend/build.sh`。
+- 用户随后明确「提交push代码」，本轮改动已提交并推送 origin/main；`backend/.deploy.local` 与 `frontend/dist` 仍被忽略，仓库不含真实部署域名、密钥或账号密码。
+- 自动连玩的次数与时长是随机有界的，真机上不同道具的实际节奏仍需用户试玩确认；25s 兜底保证猫不会一直挂在架上把房间自动行为卡死。

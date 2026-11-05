@@ -1,4 +1,6 @@
 // 房间脚点坐标，不读写 DOM、存储或奖励数据。
+import { shortestNodePath } from './room-interaction.js'
+
 export const CAT_TREE_SIZE = 192
 export const TREE_CAT_SIZE = 64
 export const TREE_SPRITE_UNITS = 48
@@ -7,7 +9,12 @@ export const GROUND_CAT_FOOT_GAP = 100 - Math.round(110 * .75)
 const SPRITE_NODES = Object.freeze({ grip: [11, 43], nest: [33, 37], mid: [14, 23], top: [33, 10] })
 export const TREE_NODES = Object.freeze(Object.fromEntries(Object.entries(SPRITE_NODES)
   .map(([key, [x, y]]) => [key, Object.freeze({ x: (x - 24) * 4, y: (y - 48) * 4 })])))
-const routes = { grip: ['grip'], nest: ['grip', 'nest'], mid: ['grip', 'mid'], top: ['grip', 'mid', 'top'] }
+// 互动点构成一张无向图；任一节点都能作为起点算最短路，地面只是其中一个节点。
+// 将来其它多互动点道具只要给一份 edges 就能复用 shortestNodePath。
+export const TREE_EDGES = Object.freeze([
+  Object.freeze(['ground', 'grip']), Object.freeze(['grip', 'mid']),
+  Object.freeze(['grip', 'nest']), Object.freeze(['mid', 'top']),
+])
 // 点击爬架的位置分区：上半平台 / 左侧中层 / 左下麻绳柱 / 右下小窝。
 export const TREE_HOT_ZONES = Object.freeze([
   Object.freeze({ node: 'top', x1: 20, y1: 0, x2: 48, y2: 18 }),
@@ -17,11 +24,12 @@ export const TREE_HOT_ZONES = Object.freeze([
 ].map(zone => Object.freeze(zone)))
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
 
-export function treeRoute(mode = 'top') { return [...(routes[mode] || routes.top)] }
+export function treePath(from, to) { return shortestNodePath(TREE_EDGES, from, to) }
+// 从地面起步、以及下架回到抓柱，都只是最短路的两个特例。
+export function treeRoute(mode = 'top') { return treePath('ground', mode) || [] }
 export function treeDownRoute(node) {
-  if (node === 'top') return ['mid', 'grip']
-  if (node === 'mid' || node === 'nest') return ['grip']
-  return []
+  if (!node || node === 'ground' || node === 'grip') return []
+  return treePath(node, 'grip') || []
 }
 export function treePoint(anchor, node) {
   const offset = TREE_NODES[node]

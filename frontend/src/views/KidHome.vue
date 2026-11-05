@@ -10,7 +10,8 @@ import TimerOverlay from '../components/TimerOverlay.vue'
 import CatPlayground from '../components/CatPlayground.vue'
 import CatClimb from '../components/CatClimb.vue'
 import PixelShop from '../components/PixelShop.vue'
-import { TREE_CAT_SIZE, TREE_SPRITE_UNITS, GROUND_CAT_FOOT_GAP, treeRoute, treeDownRoute, treePoint, treeGroundExit, treeEntryReason, gameEntryReason, treeHitNode, treeAnchorMatches, treeVisibleBase, treeHopPoint } from '../cat-tree-room.js'
+import { TREE_CAT_SIZE, TREE_SPRITE_UNITS, GROUND_CAT_FOOT_GAP, treeRoute, treePath, treeDownRoute, treePoint, treeGroundExit, treeEntryReason, gameEntryReason, treeHitNode, treeAnchorMatches, treeVisibleBase, treeHopPoint } from '../cat-tree-room.js'
+import { planInteractionSession, pickInteractionNode, dwellForNode } from '../room-interaction.js'
 import { evidenceSteps } from '../task-evidence.js'
 import { reviewPending, reviewStages } from '../ai-review.js'
 
@@ -480,6 +481,8 @@ function cancelTreePending() {
   if (treeWalkResolve) { treeWalkResolve(false); treeWalkResolve = null }
   interrupt()
   treeMoving.value = false
+  const session = treeSession.value
+  if (session) { session.wake = null; finishTreeSession(session) }
 }
 function treeAlive(epoch, walkingEpoch) {
   return !disposed && !document.hidden && !playOpen.value && adopted.value && epoch === treeEpoch && walkingEpoch === walkEpoch
@@ -565,35 +568,116 @@ async function leaveTree() {
   })()
   return leavePromise
 }
+// ===== 道具互动会话：从当前节点走最短路，按 profile 连续玩，总时长兜底 =====
+function finishTreeSession(session) {
+  if (!session || session.finished) return
+  session.finished = true
+  session.wake = null
+  if (session.resolveDone) { session.resolveDone(); session.resolveDone = null }
+}
+// 用户点击只登记目标并唤醒等待；若正在跳跃，循环会在当前跳落地后再改道。
+function requestTreeTarget(session, mode) {
+  if (!session || session.finished) return
+  session.requested = mode
+  if (session.wake) { const wake = session.wake; session.wake = null; wake() }
+}
+function sessionWait(ms, epoch, walkingEpoch, session) {
+  return new Promise(resolve => {
+    const id = setTimeout(() => {
+      treeTimers.delete(id)
+      if (session.wake === wake) session.wake = null
+      resolve(treeAlive(epoch, walkingEpoch))
+    }, ms)
+    const wake = () => {
+      clearTimeout(id)
+      treeTimers.delete(id)
+      session.wake = null
+      resolve(true)
+    }
+    session.wake = wake
+    treeTimers.set(id, resolve)
+  })
+}
+function applyTreePose(node) {
+  catAnim.value = node === 'nest' || node === 'grip' ? 'crouch' : 'sit'
+  flipped.value = node === 'nest'
+}
+async function runTreeSession(session, plan, epoch, walkingEpoch) {
+  const startedAt = performance.now()
+  let target = session.mode
+  let remaining = plan.repeats
+  try {
+    while (treeAlive(epoch, walkingEpoch) && remaining > 0
+      && performance.now() - startedAt < plan.maxDuration) {
+      if (session.requested) {
+        // 主动点击抢占：重新给一轮连玩，不消耗自动次数、不回地面。
+        target = session.requested
+        session.requested = null
+        session.mode = target
+        remaining = plan.repeats
+      }
+      const path = treePath(session.currentnode || 'grip', target)
+      if (!path) break
+      let diverted = false
+      for (const node of path) {
+        if (session.requested) { diverted = true; break }
+        if (!await treeHop(treePoint(session.anchor, node), epoch, walkingEpoch)) return
+        session.currentnode = node
+        session.mode = node
+      }
+      if (diverted || session.requested) continue
+      applyTreePose(target) // 同点或抵达后重播动作，并切掉旧的钻窝/抓柱姿态
+      if (!await sessionWait(dwellForNode(plan, target), epoch, walkingEpoch, session)) return
+      if (session.requested) continue
+      remaining -= 1
+      if (remaining <= 0) break
+      const next = pickInteractionNode('cat-tree', target)
+      if (!next) break
+      target = next
+      session.mode = next
+    }
+  } finally {
+    finishTreeSession(session)
+  }
+  if (treeAlive(epoch, walkingEpoch)) {
+    await leaveTree()
+    if (!roomLocked() && !document.hidden && adopted.value) behaviorNext(4500)
+  }
+}
 async function playTree(it, mode = 'top') {
   const reason = treeEntryReason({ adopted: adopted.value, busy: gameBusy(), owned: shopItems.value.some(x => x.key === 'cat-tree' && x.owned), placed: sceneItems.value.some(x => x.id === it?.id && x.item_key === 'cat-tree') })
   if (reason || document.hidden || disposed) { if (reason) showToast(reason); return }
   closeGamePicker(false)
+  // 猫已在架上：不再先回地面重放整条路线，直接把新目标交给会话循环。
+  if (treeSession.value && treeRendered.value && !treeSession.value.finished) {
+    requestTreeTarget(treeSession.value, mode)
+    return treeSession.value.done
+  }
   await leaveTree()
   if (gameBusy() || document.hidden || disposed || !sceneItems.value.some(x => x.id === it.id)) return
   cancelTreePending()
   const anchor = { id: it.id, x: it.x, y: it.y }
   const epoch = treeEpoch
-  const session = { itemid: it.id, mode, currentnode: null, routeepoch: epoch, anchor }
+  const session = { itemid: it.id, mode, currentnode: 'ground', routeepoch: epoch, anchor,
+    requested: null, wake: null, finished: false, resolveDone: null, done: null }
+  session.done = new Promise(resolve => { session.resolveDone = resolve })
   treeSession.value = session
   const reached = await new Promise(resolve => {
     treeWalkResolve = resolve
     walkTo(treeGroundExit(anchor, -1), () => { treeWalkResolve = null; resolve(true) }, { speed: 180, tree: true })
   })
   const walkingEpoch = walkEpoch
-  if (!reached || !treeAlive(epoch, walkingEpoch) || treeSession.value?.routeepoch !== epoch) return
+  if (!reached || !treeAlive(epoch, walkingEpoch) || treeSession.value?.routeepoch !== epoch) {
+    finishTreeSession(session)
+    return session.done
+  }
   treeRendered.value = true
   catPos.y -= GROUND_CAT_FOOT_GAP
   await nextTick()
-  for (const node of treeRoute(mode)) {
-    if (!await treeHop(treePoint(anchor, node), epoch, walkingEpoch)) return
-    treeSession.value.currentnode = node
-  }
-  catAnim.value = mode === 'nest' ? 'crouch' : mode === 'grip' ? 'crouch' : 'sit'
-  if (mode === 'nest') flipped.value = true
-  if (!await treeWait(mode === 'nest' ? 5000 : 3200, epoch, walkingEpoch)) return
-  await leaveTree()
-  if (!roomLocked() && !document.hidden && adopted.value) behaviorNext(4500)
+  const plan = planInteractionSession('cat-tree')
+  session.plan = plan
+  void runTreeSession(session, plan, epoch, walkingEpoch)
+  return session.done
 }
 async function walkTo(target, done, opts = {}) {
   if (playOpen.value || playOpening.value || treeLeaving.value || document.hidden || disposed) return
@@ -642,13 +726,14 @@ function behaviorTick() {
   if (r < 0.55) {
     walkTo(randTarget(), () => behaviorNext())
   } else if (r < 0.8) {
-    // 有猫窝 → 走到窝里睡；否则原地睡
+    // 睡觉是一次长停留（不是连续多次互动），时长走统一的随机 profile。
     const nest = sceneItems.value.find((it) => it.item_key === 'nest')
+    const nap = planInteractionSession('nest')
     if (nest) {
-      walkTo({ x: nest.x, y: nest.y }, () => { lieDown(); behaviorNext(3500 + Math.random() * 4000) })
+      walkTo({ x: nest.x, y: nest.y }, () => { lieDown(); behaviorNext(nap.dwell) })
     } else {
       lieDown()
-      behaviorNext(3000 + Math.random() * 4000)
+      behaviorNext(nap.dwell)
     }
   } else {
     if (Math.random() < 0.4) say()
@@ -662,6 +747,8 @@ function facePoint(px) { flipped.value = px > catPos.x } // 面向目标
 function interactWith(it) {
   if (!it || !it.item_key || roomLocked()) return
   if (it.item_key === 'cat-tree') return playTree(it, 'top')
+  // 每个道具的连续次数与停留时长都走同一份可复用 profile。
+  const plan = planInteractionSession(it.item_key)
   const beside = it.item_key === 'yarn' ? 44 : 52
   walkTo({ x: it.x + (catPos.x < it.x ? beside : -beside), y: it.y }, () => {
     facePoint(it.x)
@@ -676,18 +763,18 @@ function interactWith(it) {
         hearts(2)
         say('真新鲜！')
         behaviorNext()
-      }, 2600)
+      }, plan ? plan.dwell : 2600)
     } else if (it.item_key === 'yarn') {
-      playYarn(it, 0)
+      playYarn(it, 0, plan)
     } else if (it.item_key === 'nest') {
       catAnim.value = 'sleep'
       say('呼…呼…')
-      stateTimer = setTimeout(() => { catAnim.value = 'sit'; behaviorNext() }, 4000)
+      stateTimer = setTimeout(() => { catAnim.value = 'sit'; behaviorNext() }, plan ? plan.dwell : 4000)
     }
   })
 }
-// 追毛线球：球滚开（本地位置动画）→ 猫追上 → 最多 3 轮 → 保存新位置
-function playYarn(it, round) {
+// 追毛线球：球滚开（本地位置动画）→ 猫追上 → 按 profile 连玩几轮 → 保存新位置
+function playYarn(it, round, plan = planInteractionSession('yarn')) {
   say('推球球！咕噜咕噜～')
   const W = WORLD_W
   const dir = Math.random() < 0.5 ? -1 : 1
@@ -700,8 +787,8 @@ function playYarn(it, round) {
   walkTo({ x: nx + (dir > 0 ? -40 : 40), y: it.y }, () => {
     catAnim.value = 'sit'
     hearts(2)
-    if (round < 2 && Math.random() < 0.6) {
-      stateTimer = setTimeout(() => playYarn({ ...it, x: nx }, round + 1), 600)
+    if (plan && round + 1 < plan.repeats) {
+      stateTimer = setTimeout(() => playYarn({ ...it, x: nx }, round + 1, plan), plan.dwell)
     } else {
       // 玩完：保存毛线球新位置
       jpost('/scene/place', { id: it.id, key: 'yarn', x: nx, y: it.y }).then(() => loadAll())

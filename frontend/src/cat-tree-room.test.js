@@ -5,6 +5,7 @@ import { runInNewContext } from 'node:vm'
 import * as Vue from 'vue'
 import { parse, compileScript, compileTemplate } from '@vue/compiler-sfc'
 import * as tree from './cat-tree-room.js'
+import * as interaction from './room-interaction.js'
 import { decorArt, getSceneLighting, isWallpaper } from './scene-art.js'
 
 const source = readFileSync(new URL('./views/KidHome.vue', import.meta.url), 'utf8')
@@ -27,7 +28,7 @@ function harness() {
   const focusable = name => Vue.markRaw({ name, isConnected: true, focus() { document.activeElement = this }, getBoundingClientRect: () => ({ left: 350, top: 260, width: 192, height: 192 }), querySelector: () => null })
   const trigger = focusable('爬架'), close = focusable('关闭'), action = focusable('动作')
   const context = {
-    ...tree, decorArt, getSceneLighting, isWallpaper, ref: Vue.ref, computed: Vue.computed, reactive: Vue.reactive, nextTick: Vue.nextTick,
+    ...tree, ...interaction, decorArt, getSceneLighting, isWallpaper, ref: Vue.ref, computed: Vue.computed, reactive: Vue.reactive, nextTick: Vue.nextTick,
     onMounted: fn => { hooks.mount = fn }, onBeforeUnmount: fn => { hooks.cleanup = fn }, watch: (get, fn) => watchers.push([get, fn]),
     showToast: text => toasts.push(text), closeToast() {}, showDialog() {}, showConfirmDialog: async () => {}, reviewPending: () => false, reviewStages: {}, evidenceSteps: () => [],
     document, window: { innerWidth: 1280, innerHeight: 720, matchMedia: () => ({ matches: false }), ...host('window') },
@@ -115,6 +116,14 @@ test('登架必须经过抓柱、中层；下架按安全节点反向，小步�
   assert.deepEqual(tree.treeRoute('nest'), ['grip', 'nest'])
   assert.deepEqual(tree.treeDownRoute('top'), ['mid', 'grip'])
   assert.deepEqual(tree.treeDownRoute('nest'), ['grip'])
+  // 任意节点作为起点的最短路径：不绕回地面，同点不跳。
+  assert.deepEqual(tree.treePath('mid', 'top'), ['top'])
+  assert.deepEqual(tree.treePath('grip', 'top'), ['mid', 'top'])
+  assert.deepEqual(tree.treePath('nest', 'top'), ['grip', 'mid', 'top'])
+  assert.deepEqual(tree.treePath('top', 'nest'), ['mid', 'grip', 'nest'])
+  assert.deepEqual(tree.treePath('top', 'top'), [])
+  assert.equal(tree.treePath('top', 'unknown'), null)
+  assert.deepEqual(tree.treeDownRoute('ground'), [])
   const anchor = { x: 500, y: 600 }
   let from = tree.treeGroundExit(anchor)
   for (const node of tree.treeRoute('top')) {
@@ -462,23 +471,105 @@ for (const state of ['recording', 'uploading']) {
   })
 }
 
-test('新邀请先安全下架再替换路线，抓柱无奖励和持久化', async () => {
+test('已在架上点新目标走最短路：不回地面、不重放整条路线，姿态随目标切换', async () => {
   const ui = harness()
   const first = ui.playTree(ui.sceneItems.value[0], 'top')
   await ui.advance(2200)
+  assert.equal(ui.treeSession.value.currentnode, 'top')
+  assert.equal(ui.treeRendered.value, true)
+  const plan = ui.treeSession.value.plan
+  assert.ok(plan.repeats >= 2 && plan.maxDuration === 25000)
+
+  // 从 top 到 grip 应为 top→mid→grip 两跳，而不是先下架回地面再 grip→mid→top。
   const next = ui.playTree(ui.sceneItems.value[0], 'grip')
-  assert.equal(ui.treeLeaving.value, true)
-  await ui.advance(2400)
-  assert.equal(ui.treeSession.value.mode, 'grip')
+  assert.equal(ui.treeLeaving.value, false, '不应触发下架')
+  assert.equal(ui.treeRendered.value, true, '猫应留在架上')
+  assert.equal(ui.treeSession.value.requested, 'grip')
+  await ui.advance(1400)
   assert.equal(ui.treeSession.value.currentnode, 'grip')
   assert.equal(ui.catAnim.value, 'crouch')
-  await ui.advance(5000)
-  await first; await next
-  assert.equal(ui.treeSession.value, null)
-  assert.equal(ui.catPos.y, 600)
+  assert.equal(ui.flipped.value, false, '离开窝后不应保留钻窝朝向')
   assert.equal(ui.requests.length, 0)
   assert.equal(ui.storage.length, 0)
   assert.equal(ui.pet.value.balance, 70)
+  ui.cleanup()
+  await first; await next
+})
+
+test('从窝里点最高处按 nest→grip→mid→top 前进，全程不落地', async () => {
+  const ui = harness()
+  const first = ui.playTree(ui.sceneItems.value[0], 'nest')
+  await ui.advance(2200)
+  assert.equal(ui.treeSession.value.currentnode, 'nest')
+  assert.equal(ui.flipped.value, true)
+  const next = ui.playTree(ui.sceneItems.value[0], 'top')
+  assert.equal(ui.treeLeaving.value, false)
+  await ui.advance(2000)
+  assert.equal(ui.treeSession.value.currentnode, 'top')
+  assert.equal(ui.treeRendered.value, true)
+  assert.equal(ui.flipped.value, false)
+  // 仍在架上最高处，没有被 finishTreeFloor 拉回地面出口
+  assert.deepEqual(plain(ui.catPos), tree.treePoint({ x: 500, y: 600 }, 'top'))
+  ui.cleanup()
+  await first; await next
+})
+
+test('点击当前所在节点原地重播动作，不产生跳跃也不下架', async () => {
+  const ui = harness()
+  const action = ui.playTree(ui.sceneItems.value[0], 'top')
+  await ui.advance(2200)
+  const at = plain(ui.catPos)
+  const again = ui.playTree(ui.sceneItems.value[0], 'top')
+  assert.equal(ui.treeSession.value.requested, 'top')
+  await ui.advance(300)
+  assert.deepEqual(plain(ui.catPos), at)
+  assert.equal(ui.treeSession.value.currentnode, 'top')
+  assert.equal(ui.treeLeaving.value, false)
+  assert.equal(ui.requests.length, 0)
+  ui.cleanup()
+  await action; await again
+})
+
+test('自动连玩会按 profile 换目标，不会一直停在同一个节点', async () => {
+  const ui = harness()
+  const action = ui.playTree(ui.sceneItems.value[0], 'top')
+  await ui.advance(2200)
+  const seen = new Set([ui.treeSession.value.currentnode])
+  for (let i = 0; i < 14; i++) {
+    await ui.advance(2000)
+    if (!ui.treeSession.value) break
+    seen.add(ui.treeSession.value.currentnode)
+  }
+  assert.ok(seen.size >= 2, `自动连玩应换过目标，实得 ${[...seen]}`)
+  ui.cleanup()
+  await action
+})
+
+test('玩球按 profile 连玩多轮，仍只在结束时保存一次球的新位置', async () => {
+  const ui = harness()
+  ui.sceneItems.value = [
+    { id: 8, item_key: 'cat-tree', x: 500, y: 600 },
+    { id: 10, item_key: 'yarn', x: 300, y: 600 },
+  ]
+  ui.interactWith(ui.sceneItems.value[1])
+  await ui.advance(20000)
+  const places = ui.requests.filter(r => r.url.endsWith('/scene/place'))
+  assert.equal(places.length, 1, '连玩多轮不能重复写摆放')
+  assert.equal(places[0].body.key, 'yarn')
+  assert.equal(places[0].body.id, 10)
+  ui.cleanup()
+})
+
+test('连续互动用完或到达总时长兜底后自动下架并恢复房间行为', async () => {
+  const ui = harness()
+  const action = ui.playTree(ui.sceneItems.value[0], 'top')
+  await ui.advance(30000)
+  assert.equal(ui.treeSession.value, null)
+  assert.equal(ui.treeRendered.value, false)
+  assert.equal(ui.catPos.y, 600)
+  assert.equal(ui.requests.length, 0)
+  assert.equal(ui.storage.length, 0)
+  await action
   ui.cleanup()
 })
 
