@@ -487,7 +487,7 @@ test('真实 setup：双向控件按住左半向左、滑到右半换向，松�
   h.api.steerDown(down)
   assert.equal(down.prevented, true)
   assert.equal([...h.api.pointers.values()][0].direction, -1)
-  h.api.steerMove(h.event({ pointerId: 1, clientX: 100, clientY: 50 }))
+  h.api.pointerMove(h.event({ pointerId: 1, clientX: 100, clientY: 50 }))
   assert.equal([...h.api.pointers.values()][0].direction, 1, '滑到右半应换向')
   h.api.cancelPointer(h.event({ pointerId: 1 }))
   assert.equal(h.api.pointers.size, 0)
@@ -510,6 +510,50 @@ test('真实 setup：右下点按跳跃发出 jump 事件，半区兜底热区�
   h.api.cancelPointer(h.event({ pointerId: 4 }))
   h.api.playfieldPointerDown(h.event({ currentTarget: field, target: { closest: () => ({}) }, pointerId: 5, button: 0, clientX: 60, clientY: 300 }))
   assert.equal(h.api.pointers.has(5), false, '按在控件上不应触发兜底热区')
+  h.unmount()
+})
+
+test('真实 setup：兜底热区按住左半滑到右半实时换向，不用抬手重按', async () => {
+  const h = await mountComponent()
+  h.api.start()
+  const field = h.api.playfield.value
+  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: field, pointerId: 7, button: 0, clientX: 60, clientY: 300 }))
+  assert.equal(h.api.pointers.get(7).direction, -1)
+  h.api.pointerMove(h.event({ pointerId: 7, clientX: 300, clientY: 300 }))
+  assert.equal(h.api.pointers.has(7), true, '按住期间不能把滑动误判为松手')
+  assert.equal(h.api.pointers.get(7).direction, 1, '不松手滑到右半应立即换向')
+  h.api.pointerMove(h.event({ pointerId: 7, clientX: 60, clientY: 300 }))
+  assert.equal(h.api.pointers.get(7).direction, -1, '滑回左半应再次换向')
+  h.api.cancelPointer(h.event({ pointerId: 7 }))
+  assert.equal(h.api.pointers.size, 0, '抬手后方向归零')
+  h.unmount()
+})
+
+test('真实 setup：控件按住滑到舞台仍实时跟随，只有彻底滑出场地才归零', async () => {
+  const h = await mountComponent()
+  h.api.start()
+  h.api.steerDown(h.event({ currentTarget: h.steer, pointerId: 8, button: 0, clientX: 20, clientY: 50 }))
+  assert.equal(h.api.pointers.get(8).direction, -1)
+  // 控件 rect 为 [0,120]，中线 60；滑到舞台右侧已出控件，仍按该中线延伸判向，不应取消或突然反向。
+  h.api.pointerMove(h.event({ pointerId: 8, clientX: 300, clientY: 300 }))
+  assert.equal(h.api.pointers.has(8), true, '滑出控件边界不应被当作松手')
+  assert.equal(h.api.pointers.get(8).direction, 1)
+  h.api.pointerMove(h.event({ pointerId: 8, clientX: 10, clientY: 300 }))
+  assert.equal(h.api.pointers.get(8).direction, -1, '滑到分界线左侧应向左')
+  h.api.pointerMove(h.event({ pointerId: 8, clientX: 400, clientY: 300 }))
+  assert.equal(h.api.pointers.size, 0, '彻底滑出游戏场地才归零')
+  h.unmount()
+})
+
+test('真实 setup：分界线随按下元素固定，控件与场地各自判向不串线', async () => {
+  const h = await mountComponent()
+  h.api.start()
+  const field = h.api.playfield.value
+  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: field, pointerId: 11, button: 0, clientX: 100, clientY: 300 }))
+  assert.equal(h.api.pointers.get(11).direction, -1, '场地中线 180，x=100 属左半')
+  h.api.cancelPointer(h.event({ pointerId: 11 }))
+  h.api.steerDown(h.event({ currentTarget: h.steer, pointerId: 12, button: 0, clientX: 100, clientY: 50 }))
+  assert.equal(h.api.pointers.get(12).direction, 1, '控件中线 60，同一个 x=100 属右半')
   h.unmount()
 })
 
@@ -564,4 +608,43 @@ test('真实 setup：Escape 退出、卸载清理监听与焦点归还', async (
   assert.equal(h.document.activeElement, h.external)
   assert.equal(h.isDisconnected(), true)
   assert.ok(h.targets.every((target) => [...target.listeners.values()].every((set) => set.size === 0)))
+})
+
+test('真实 setup：游戏期间拦截捏合缩放手势，单指不拦，卸载后移除', async () => {
+  const h = await mountComponent()
+  const listeners = h.document.listeners
+  for (const type of ['gesturestart', 'gesturechange', 'touchmove']) {
+    assert.ok(listeners.get(type)?.size >= 1, `缺少 ${type} 监听`)
+  }
+  const multi = h.event({ touches: [{}, {}] })
+  for (const fn of listeners.get('touchmove')) fn(multi)
+  assert.equal(multi.prevented, true, '多指手势应被拦截')
+  const single = h.event({ touches: [{}] })
+  for (const fn of listeners.get('touchmove')) fn(single)
+  assert.equal(single.prevented, undefined, '单指不应拦截，避免影响正常操作')
+  const gesture = h.event({})
+  for (const fn of listeners.get('gesturestart')) fn(gesture)
+  assert.equal(gesture.prevented, true)
+  h.unmount()
+  for (const type of ['gesturestart', 'gesturechange', 'touchmove']) {
+    assert.equal(listeners.get(type)?.size ?? 0, 0, `卸载后应移除 ${type}`)
+  }
+})
+
+test('真实 setup：页面捏合缩放时容器固定布局尺寸且不暂停游戏', async () => {
+  const h = await mountComponent()
+  h.api.start()
+  const vv = h.window.visualViewport
+  Object.assign(vv, { scale: 1.5, width: 240, height: 373, offsetTop: 12, offsetLeft: 8 })
+  h.api.updateViewport()
+  assert.equal(h.api.viewport.value.width, 360, '缩放时固定用布局视口宽度')
+  assert.equal(h.api.viewport.value.height, 560)
+  assert.equal(h.api.viewport.value.top, 0)
+  assert.equal(h.api.state.value.phase, 'running', '缩放不应暂停游戏')
+  h.api.resize()
+  assert.equal(h.api.state.value.phase, 'running')
+  Object.assign(vv, { scale: 1, width: 360, height: 560, offsetTop: 0, offsetLeft: 0 })
+  h.api.resize()
+  assert.equal(h.api.state.value.phase, 'running', '缩放恢复也不应暂停')
+  h.unmount()
 })

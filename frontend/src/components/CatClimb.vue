@@ -194,43 +194,39 @@ function cancelPointer(event) {
   }
   syncDirection()
 }
+// 按住期间方向只由手指当前 x 决定：以「按下元素的中线」为分界，左半向左、右半向右。
+// 分界线随按下位置固定并延伸到整块场地，手指滑出控件也不会突然反向，不用抬手再按。
+function directionAt(element, clientX) {
+  const r = element.getBoundingClientRect()
+  return clientX < r.left + r.width / 2 ? -1 : 1
+}
 function pointerMove(event) {
   const active = pointers.get(event.pointerId)
   if (!active) return
   event.preventDefault()
-  const r = active.element.getBoundingClientRect()
-  if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) cancelPointer(event)
-}
-// 兜底热区：舞台左右半屏都能按住控制，孩子按不到方向控件时照样能玩。
-function playfieldPointerDown(event) {
-  if (event.target?.closest?.('button, .climb-overlay, .climb-controls')) return
-  const r = playfield.value?.getBoundingClientRect()
-  if (!r || !r.width) return
-  pointerDown(event, event.clientX < r.left + r.width / 2 ? -1 : 1)
-}
-// 左下单个双向控件：按住左半向左、右半向右，滑过去直接换向，不用抬手再按。
-function steerDirection(event, element) {
-  const r = element.getBoundingClientRect()
-  return event.clientX < r.left + r.width / 2 ? -1 : 1
-}
-function steerDown(event) {
-  syncClock()
-  if (event.button !== 0 || closing || state.value.phase !== 'running') return
-  event.preventDefault()
-  const element = event.currentTarget
-  pointers.set(event.pointerId, { direction: steerDirection(event, element), element, steer: true })
-  try { element.setPointerCapture(event.pointerId) } catch { pointers.delete(event.pointerId) }
-  syncDirection()
-}
-function steerMove(event) {
-  const active = pointers.get(event.pointerId)
-  if (!active || !active.steer) return pointerMove(event)
-  event.preventDefault()
-  const direction = steerDirection(event, active.element)
+  const field = playfield.value?.getBoundingClientRect()
+  // 只有彻底滑出游戏场地才当作松手；在控件与舞台之间移动始终实时跟随。
+  if (field && field.width && (event.clientX < field.left || event.clientX > field.right
+    || event.clientY < field.top || event.clientY > field.bottom)) {
+    cancelPointer(event)
+    return
+  }
+  const direction = directionAt(active.element, event.clientX)
   if (direction !== active.direction) {
     active.direction = direction
     syncDirection()
   }
+}
+// 兜底热区：舞台左右半屏都能按住控制，孩子按不到方向控件时照样能玩。
+function playfieldPointerDown(event) {
+  if (event.target?.closest?.('button, .climb-overlay, .climb-controls')) return
+  const field = playfield.value
+  if (!field?.getBoundingClientRect().width) return
+  pointerDown(event, directionAt(field, event.clientX))
+}
+// 左下双向控件与兜底热区共用同一套实时判向逻辑。
+function steerDown(event) {
+  pointerDown(event, directionAt(event.currentTarget, event.clientX))
 }
 function jumpDown(event) {
   event.preventDefault()
@@ -351,13 +347,37 @@ function fitStage() {
   stageMeasured = true
   stageSize.value = { width, height }
 }
+// iOS Safari 忽略 viewport 里的 user-scalable / maximum-scale，双指操作（方向＋跳跃）
+// 会被识别成整页捏合缩放。只在游戏全屏期间拦截，退出即移除，不影响主应用滚动。
+let removeZoomGuard = null
+function installZoomGuard() {
+  const blockGesture = (event) => event.preventDefault()
+  const blockMultiTouch = (event) => {
+    if (event.touches?.length > 1) event.preventDefault()
+  }
+  const guards = [
+    ['gesturestart', blockGesture], ['gesturechange', blockGesture], ['touchmove', blockMultiTouch],
+  ]
+  for (const [type, fn] of guards) document.addEventListener(type, fn, { passive: false })
+  return () => { for (const [type, fn] of guards) document.removeEventListener(type, fn) }
+}
+let lastScale = 1
 function updateViewport() {
   const v = window.visualViewport
-  viewport.value = { width: v?.width ?? window.innerWidth, height: v?.height ?? window.innerHeight,
-    top: v?.offsetTop ?? 0, left: v?.offsetLeft ?? 0 }
+  // 页面已被捏合缩放时固定按布局视口尺寸，游戏容器不跟着缩小。
+  const scaled = typeof v?.scale === 'number' && Math.abs(v.scale - 1) > 0.01
+  viewport.value = scaled
+    ? { width: window.innerWidth, height: window.innerHeight, top: 0, left: 0 }
+    : { width: v?.width ?? window.innerWidth, height: v?.height ?? window.innerHeight,
+        top: v?.offsetTop ?? 0, left: v?.offsetLeft ?? 0 }
   nextTick(fitStage)
 }
 function resize() {
+  const scale = window.visualViewport?.scale ?? 1
+  const zooming = Math.abs(scale - 1) > 0.01 || Math.abs(lastScale - 1) > 0.01
+  lastScale = scale
+  // 缩放引起的 visualViewport 变化不暂停游戏；真实窗口尺寸变化才走原有暂停逻辑。
+  if (zooming) { updateViewport(); return }
   suspend()
   updateViewport()
 }
@@ -379,6 +399,7 @@ onMounted(() => {
   window.visualViewport?.addEventListener('scroll', resize)
   document.addEventListener('visibilitychange', visibilityChanged)
   document.addEventListener('focusin', retainFocus)
+  removeZoomGuard = installZoomGuard()
   observer = new ResizeObserver(fitStage)
   observer.observe(scene.value)
   if (document.hidden) suspend()
@@ -397,6 +418,7 @@ onBeforeUnmount(() => {
   window.visualViewport?.removeEventListener('scroll', resize)
   document.removeEventListener('visibilitychange', visibilityChanged)
   document.removeEventListener('focusin', retainFocus)
+  removeZoomGuard?.()
   if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true })
 })
 </script>
@@ -486,7 +508,7 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="state.phase === 'running'" class="climb-controls">
         <div class="climb-steer" role="group" aria-label="左右移动"
-          @pointerdown.stop="steerDown" @pointermove="steerMove" @pointerup="cancelPointer"
+          @pointerdown.stop="steerDown" @pointermove.stop="pointerMove" @pointerup="cancelPointer"
           @pointercancel="cancelPointer" @lostpointercapture="cancelPointer" @contextmenu.prevent>
           <svg class="climb-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M30 10 L14 24 L30 38 Z" /></svg>
           <span class="climb-steer-divider"></span>
@@ -548,7 +570,7 @@ onBeforeUnmount(() => {
 button { min-height: 44px; min-width: 44px; border: 2px solid #c6a47e; border-radius: 8px; padding: 8px 12px;
   background: #ffecd5; color: inherit; font: inherit; font-weight: 700; font-size: 13px; cursor: pointer;
   user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
-  -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+  -webkit-tap-highlight-color: transparent; touch-action: none; }
 button:disabled { opacity: .55; cursor: default; }
 button:focus-visible { outline: 3px solid #527d66; outline-offset: 2px; }
 .climb-stage:focus-visible { outline: 2px solid #d9c7a8; outline-offset: -2px; }
@@ -565,7 +587,7 @@ button:focus-visible { outline: 3px solid #527d66; outline-offset: 2px; }
 .climb-caption { font-size: 11px; line-height: 14px; color: #8d765e; white-space: nowrap; }
 .climb-header-actions { margin-left: auto; flex-shrink: 0; }
 .climb-header-actions button { min-height: 36px; padding: 4px 12px; }
-.climb-playfield { position: relative; flex: 1 1 auto; min-height: 0; display: grid; place-items: center; }
+.climb-playfield { position: relative; flex: 1 1 auto; min-height: 0; display: grid; place-items: center; touch-action: none; }
 .climb-scene { display: grid; place-items: center; min-width: 0; min-height: 0; overflow: hidden;
   width: calc(100% - 2 * clamp(116px, 20vw, 190px)); height: 100%; }
 .climb-stage { position: relative; overflow: hidden; background: #fff2df; border-radius: 3px; touch-action: none; }

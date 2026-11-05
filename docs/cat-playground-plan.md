@@ -496,3 +496,65 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - 截图确认高难度 HUD（第36/37层、难度4、↑60px/s、跨半周、已到难度上限）不被暂停按钮遮挡；蓝色冰面白色反光、蜜色黏点、棕色普通、蓝色传送带箭头四种外观可区分；柱面接缝虚线与猫的三份环绕副本可见。
 - 边界：真实 iPad Safari 与孩子试玩手感仍待反馈；若过难，优先下调 `surfaceChance` 或放宽减速类地面的可达性余量，不建议取消地面材质。本地 5173 与 8600 假数据服务仍在运行，生产不开放 DEV 预览路由。
 - 19:57用户明确「提交push」：本地提交 `ef248ee`（8 files，+1000/-1457，含玩法引擎/组件/测试、embed产物与本节记录）并推送 origin/main，远端 head 核对一致；提交前已确认仓库不含真实部署域名、密钥或账号密码，`backend/.deploy.local` 与 `frontend/dist` 仍被忽略。工作区干净。
+
+## 二十五、方向输入改为按住实时判向（2026年11月4日21:05，本地未发布）
+
+### 用户反馈与诊断
+
+- 用户反馈「按住向左时不松手滑到右边，猫仍向左走，必须抬手重按」；确认诉求是**按住期间方向跟着手指当前 x 实时生效**。
+- 本地 dev 与线上均用 CDP 真实 touch 事件复现：左下双向控件 `.climb-steer` 按住左半 −183px/s、不松手滑到右半 +170px/s，本来就会换向；**整屏左右半区兜底热区 `.climb-playfield` 按住左半 −192px/s、滑到右半仍 −177px/s，方向被写死**。iPad 屏幕大、左下控件仅百余像素，按屏幕左侧大块区域更容易命中这条路径。
+- 根因：`playfieldPointerDown` 按下时把 `direction` 固定，`pointerMove` 只判断手指是否移出按下元素并 `cancelPointer`，不重新判向；控件走 `steerMove` 才有换向。此前六视口验收用鼠标测了「控件滑向另一半」，兜底热区只测了「按左/按右各自生效」，**漏了「按住热区后滑到另一侧」这条触屏路径**。
+- 用户拍板方案 B：不只修热区，还要「不管按在哪、滑到哪都实时生效」，手指滑出控件不再被当作松手。
+
+### 实现（只改 CatClimb.vue 与测试）
+
+- 新增 `directionAt(element, clientX)`：以**按下元素的中线 x** 为分界，左侧 −1、右侧 +1。控件与兜底热区共用；`steerDown` 与 `playfieldPointerDown` 都用它算初始方向。
+- `pointerMove` 改为按住期间按当前 `clientX` 实时重判方向，变化时 `syncDirection()`；**只有彻底滑出整块 `.climb-playfield`（含向上滑进 header）才 `cancelPointer` 归零**，在控件与舞台之间移动不再取消。删除 `steerMove` / `steerDirection` 与 `steer` 标记，模板控件 `@pointermove` 统一为 `@pointermove.stop="pointerMove"`。
+- 与 B 字面描述的差异（透明记录）：滑出控件后仍按**控件中线延伸线**判向，而不是改按整块场地中线。若改用场地中线，手指从控件右半（x≈100）滑出控件的瞬间会因 x 小于场地中线而突然反向，反而破坏「实时生效」的手感；分界线随按下元素固定并延伸可避免跳变。两套基准各自独立，新增单测断言同一个 x 在控件与场地按下会得到不同方向。
+
+### 验证证据
+
+- 前端 `node --test src/*.test.js` 226/226 通过（新增 3 条：兜底热区按住滑到反向并松手归零、控件按住滑出控件仍跟随且滑出场地才归零、分界线随按下元素固定不串线）；`npm run build` 通过（仅既有约 518kB 体积警告）；`git diff --check` 通过。
+- 六视口 1024×768、1180×820、1280×800、390×844、320×568、844×390 用 CDP 真实 touch 事件跑 19 个场景全通过：控件/兜底热区按住左半约 −176px/s → 不松手滑到右半约 +185px/s → 滑回约 −185px/s → 松手约 −7px/s；控件右半按住后滑到舞台右侧仍 +185px/s（不取消、不突然反向），滑到最左 −168px/s；桌面额外验证滑出场地顶部自动归零（+176 → +4px/s）。无页面报错。
+- 截图逐张确认改动后 running 态（含按住控件高亮）与 ended 态：桌面/手机/320小屏/横屏两控件完整、互不重叠、不遮舞台、不超屏底；320 小屏 `↑32px/s` 与材质标签均在暂停按钮左侧不重叠；结束态软垫卡片完整。
+
+### 边界
+
+- 只改 `CatClimb.vue` 与 `cat-climb.test.js` 两个文件；**未运行 `frontend/build.sh`、未改 embed、未部署、未commit、未push**，线上仍是 19:28 版本（不含本次交互修复）。本地 5173 预览可刷新直接试玩。该行为当时状态，以第二十六节为准。
+
+## 二十六、方向输入实时判向修复发布（2026年11月4日21:11）
+
+- 用户明确「部署下」，沿用原站点、服务器、认证与数据库，只发布第二十五节的交互修复；**未commit、未push**。
+- 发布前：前端 226/226 单测通过；`frontend/build.sh` 重建并同步 embed，新产物 `index-BpAf_rsd.js`（SHA256 `2409ca45…`）/ `index-BSkOqJpG.css`（`b2f2b086…`）/ `index.html`（`96669694…`）；Go `go build ./...` 与 `git diff --check` 通过；交叉编译 release SHA256 `45e935651d363f67e8f7eca9e1466f762a3b4de1de6f8525104abba6f156e727`。
+- 备份：服务器私有目录 `/home/ubuntu/meowquest/backup-steer-realtime-20261104_211112/`，含 `meowquest.prev`（SHA256 `f3e9b3d3…`，与19:28线上版一致）与 `database.dump`（66785B，mode 600）；容器内 `pg_restore -l` 读取 185 行 TOC 验证可读。回滚优先恢复旧二进制，不盲目恢复数据库覆盖上线后合法购买。
+- 部署：`backend/deploy.sh` 于 21:11:39 重启 active，首页 200，本次启动日志无 error/panic/fatal/warn。线上二进制 SHA256 与本地 release 一致；线上 `index.html`、js、css 与本地 embed 逐字节相同，HTML 引用指向新文件名。
+- 业务数据：发布前后指纹均 `4|189|478|0|10|258|13|9`（宠物数/余额合计/累计收益合计/连击合计/结算流水笔数与合计/已购记录/场景记录）。与19:28记录相比余额少70、已购与场景各多1，属期间真实用户活动，未做任何手工修正；上线验收请求全部被浏览器模拟 API 拦截，无业务 POST，未登录或消费真实账号。
+- 线上真实触摸验收：六视口 1024×768、1180×820、1280×800、390×844、320×568、844×390 共 19 个 CDP touch 场景全通过。控件与兜底热区按住左半约 −168～−176px/s → 不松手滑到右半 +176～+194px/s → 滑回约 −176～−185px/s → 松手约 −7px/s；控件右半按住滑到舞台右侧仍 +176～+194px/s（不取消、不突然反向），滑到最左约 −168px/s；桌面额外验证滑出场地顶部自动归零（+168 → +4px/s）。无页面报错。
+- 回归：线上六视口 ready/running/paused/ended 四态布局全屏无溢出、42 个平台副本带材质/动效标记、双向控件与跳跃键 ≥96px 不遮舞台、暂停动效冻结、失败态软垫结果均通过；页面内控制器实爬 36 层、难度 4 封顶、37 次跳跃且仍 running，四种地面机制未受影响。截图逐张确认桌面/手机/320小屏 running 态与 ready 卡片无重叠、裁切或文字截断。
+- 边界：真实 iPad Safari 与孩子试玩手感仍待反馈；本地 5173 与 8600 假数据服务仍在运行，生产不开放 DEV 预览路由。工作区含 3 个源码/文档改动与 embed 产物增删，**未commit/push**（本轮用户只要求部署）。
+
+## 二十七、游玩界面防捏合缩放（2026年11月4日22:10，本地未发布）
+
+### 用户反馈与证据链
+
+- 用户反馈「游玩界面又出现误触导致整个画面缩放」。用 CDP `Emulation.setPageScaleFactor` 模拟浏览器整页捏合缩放（scale 1 → 1.5）实测：`.cat-climb` 根容器 inline style 从 `1024×768` 变成 **`682.667×512`**，`data-phase` 从 `running` 变 **`paused`**；缩回 scale 1 后尺寸恢复但**仍是 paused**，需手动点继续。即用户看到的「整个画面缩放」是浏览器页面缩放把游戏容器一起缩了，并附带自动暂停。
+- 三层原因：①`index.html` 虽有 `maximum-scale=1.0, user-scalable=no`，但 **iOS 10+ Safari 为无障碍明确忽略这两项**，`touch-action: none` 也只管 pan/scroll，挡不住页面级 pinch；全项目此前没有 `gesturestart` / `gesturechange` 或多指 `touchmove` 的 `preventDefault`（`main.js` 与两个游戏组件都查过）。②`CatClimb.vue` 的 `updateViewport()` 直接用 `visualViewport.width/height` 设根容器尺寸，`resize()` 还会先 `suspend()`。③新版玩法是**左手按住方向＋右手点跳**的双指操作，两指间距稍变天然像捏合；旧版自动起跳是单指，所以这个坑在新玩法上线后才明显。主档/记忆中没有既有的防缩放处理记录。
+- 用户「好 都改」明确授权：A＋B 一起做，逗猫羽毛也一起加。
+
+### 实现（只改两个组件与两个测试文件）
+
+- A 源头拦截：新增 `installZoomGuard()`，游戏挂载期间在 `document` 上以 `{ passive: false }` 注册 `gesturestart` / `gesturechange`（iOS 专有捏合事件）与 `touchmove`（仅 `event.touches.length > 1` 才 `preventDefault`，单指不拦），卸载时按同一函数引用移除；`CatClimb.vue` 与 `CatPlayground.vue` 各一份，只影响游戏全屏期间，不碰主应用滚动与家长端「放大看细节」。CSS 加固：爬高 `button` 的 `touch-action: manipulation` 改为 `none`、`.climb-playfield` 补 `none`，羽毛 `button` 补 `none`。
+- B 兜底：`updateViewport()` 在 `visualViewport.scale !== 1` 时固定用 `window.innerWidth/innerHeight` 与 `top/left = 0`，容器不跟着缩；`resize()` 用 `lastScale` 判断「本次变化是否由缩放引起」，是则只刷新视口、不 `suspend()`，真实窗口尺寸变化才走原暂停逻辑。缩放开始、进行、恢复三个阶段都不暂停。
+
+### 验证证据
+
+- 前端 `node --test src/*.test.js` 229/229 通过（新增 3 条：爬高手势监听注册/多指拦截/单指放行/卸载移除、缩放时固定布局尺寸且不暂停，羽毛同样断言）；`npm run build` 通过（仅既有约 519kB 体积警告）；`git diff --check` 通过。
+- 六视口 1280×800、1024×768、1180×820、390×844、320×568、844×390 实测：强制 scale 1.5 后各视口容器宽高均保持原值（如桌面仍 `1280×800`、小屏仍 `320×568`），`phase` 始终 `running`，恢复 scale 1 后仍 `running`。
+- 双指真实触摸（CDP 两点 touchStart/touchMove）：左手按方向左半约 −185px/s、右手点跳跃后猫立刻离地；不松手把方向指滑到右半约 +182～+189px/s，证明**多指 `touchmove` 的 preventDefault 没有阻断 pointermove**，双指同时操作完好。羽毛游戏单指拖动羽毛仍正常。
+- 既有六视口 19 个触摸场景（控件/热区按住换向、跨区域跟随、滑出场地归零）全部回归通过。截图逐张确认桌面/手机/320小屏 running 态与羽毛面板：控件完整、互不重叠、不遮舞台、HUD 无重叠或裁切。
+
+### 边界
+
+- `gesturestart` / `gesturechange` 是 iOS Safari 专有事件，Chromium 不触发，本地只能验证多指 `touchmove` 拦截、监听注册移除、双指输入不丢与缩放兜底；**最终仍需在真实 iPad Safari 上捏一下确认**。
+- 本轮只改 `CatClimb.vue`、`CatPlayground.vue`、`cat-climb.test.js`、`cat-play.test.js`；**未运行 `frontend/build.sh`、未改 embed、未部署**，线上仍是 21:11 版本（不含本次防缩放修复）。注意仓库内 embed 产物仍是 21:11 发布版（含方向实时判向、不含防缩放），与最新源码存在版本差；**后续部署前必须重跑 `frontend/build.sh`**，否则从仓库直接构建的二进制不会带上本次防缩放修复。
+- 用户随后明确「提交push」，本轮改动与 21:11 发布记录一并提交并推送 origin/main；`backend/.deploy.local` 与 `frontend/dist` 仍被忽略，仓库不含真实部署域名、密钥或账号密码。

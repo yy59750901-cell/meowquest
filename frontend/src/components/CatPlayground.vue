@@ -344,6 +344,21 @@ function retainFocus(event) {
   if (!closing && dialog.value && !dialog.value.contains(event.target)) closeButton.value?.focus({ preventScroll: true })
 }
 
+// iOS Safari 忽略 viewport 的 user-scalable / maximum-scale，多指手势可能被识别成整页捏合缩放。
+// 只在游戏挂载期间拦截，退出即移除，不影响主应用滚动与家长端放大看图。
+let removeZoomGuard = null
+function installZoomGuard() {
+  const blockGesture = (event) => event.preventDefault()
+  const blockMultiTouch = (event) => {
+    if (event.touches?.length > 1) event.preventDefault()
+  }
+  const guards = [
+    ['gesturestart', blockGesture], ['gesturechange', blockGesture], ['touchmove', blockMultiTouch],
+  ]
+  for (const [type, fn] of guards) document.addEventListener(type, fn, { passive: false })
+  return () => { for (const [type, fn] of guards) document.removeEventListener(type, fn) }
+}
+
 onMounted(() => {
   mounted = true
   previousFocus = document.activeElement
@@ -355,6 +370,7 @@ onMounted(() => {
   window.addEventListener('orientationchange', stageResized)
   document.addEventListener('visibilitychange', visibilityChanged)
   document.addEventListener('focusin', retainFocus)
+  removeZoomGuard = installZoomGuard()
   resizeObserver = new ResizeObserver(() => syncBounds())
   resizeObserver.observe(stage.value)
   if (document.hidden) suspend('visibilitychange')
@@ -374,6 +390,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('orientationchange', stageResized)
   document.removeEventListener('visibilitychange', visibilityChanged)
   document.removeEventListener('focusin', retainFocus)
+  removeZoomGuard?.()
   if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true })
 })
 </script>
@@ -547,7 +564,7 @@ onBeforeUnmount(() => {
 .play-header { position: sticky; top: 0; z-index: 2; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: #fffaf0; }
 .play-eyebrow { display: block; font-size: 12px; color: #946d4c; letter-spacing: .04em; }
 h2 { margin: 5px 0 0; font-size: 22px; line-height: 1.25; }
-button { font: inherit; color: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+button { font: inherit; color: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: none; }
 button:focus-visible { outline: 3px solid #527b66; outline-offset: 3px; }
 .play-close, .play-controls button {
   min-height: 44px;

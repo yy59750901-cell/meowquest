@@ -1508,3 +1508,24 @@ test('组件较早的 RAF 时间戳不回退事件时钟，也不重复推进 re
   assert.ok(next.readySeconds > afterEvent.readySeconds)
   assert.ok(next.readySeconds - afterEvent.readySeconds <= 0.02)
 })
+
+test('游玩界面拦截捏合缩放手势，单指不受影响，退出后移除', () => {
+  const ui = componentHarness()
+  for (const type of ['gesturestart', 'gesturechange', 'touchmove']) {
+    assert.ok(ui.listeners.get(`document:${type}`), `缺少 ${type} 监听`)
+  }
+  const evt = (touches) => ({ touches, prevented: false, preventDefault() { this.prevented = true } })
+  const multi = evt([{}, {}])
+  ui.listeners.get('document:touchmove')(multi)
+  assert.equal(multi.prevented, true, '多指手势应被拦截')
+  const single = evt([{}])
+  ui.listeners.get('document:touchmove')(single)
+  assert.equal(single.prevented, false, '单指不应拦截，避免影响拖动羽毛')
+  const gesture = evt([])
+  ui.listeners.get('document:gesturestart')(gesture)
+  assert.equal(gesture.prevented, true)
+  ui.cleanup()
+  for (const type of ['gesturestart', 'gesturechange', 'touchmove']) {
+    assert.equal(ui.listeners.get(`document:${type}`), undefined, `卸载后应移除 ${type}`)
+  }
+})
