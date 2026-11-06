@@ -918,3 +918,13 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - **浏览器**：`/climb-preview` 是 `import.meta.env.DEV` 才注册的路由，生产 build 不含，所以交互验收走 Vite dev server（5173，实时读当前源码，已核验返回内容含 `DEAD_IN`/`relativeDirection`/`climb-knob-cap`），生产 embed 另做静态核验。新写 `/tmp/meow-climb-steer-verify.py`，真实 pointer 按下/拖动序列在 **1024×768 iPad 横 / 820×1180 iPad 竖 / 390×844 手机** 三视口各 16 项，**FAILURES 0**：按下=0、dx=10 不出方向、dx=18 向右、dx=11 滞回保持、dx=5 回正、dx=-18 向左、dx=60 帽限位 20px、抬手帽消失、场地中部按下不产生摇杆（幽灵方向消除）、控件右缘外 20px 仍可接管且同为 0、无 pageerror。逐张看图 8 张：帽偏移/虚线环留原点/抬手消失/扩展区按下帽落在控件右缘外，三档视口控件与跳跃键完整无裁切、顶部信息栏无溢出。截图 `climb-steer-check/`。
 - **取舍（如实记录）**：帽在两箭头之间水平滑动，右/左偏时会盖住同侧箭头约一半，方向主要靠**帽偏移 + 留在原点的虚线环**表达，箭头高亮只作辅助；`NEAR_PAD=36` 全平台统一、未按视口分档，手机上「全舞台任意位置按住」的旧能力也一并收窄了。若日后觉得帽盖箭头不好看，可缩小 `KNOB_RANGE` 或把箭头再往两侧挪，本轮未外扩。
 - **边界**：未 commit / 未 push / 未部署；HEAD 仍 `83ab991`，线上仍是 19:23 版。工作区有 2 个源码修改 + embed 换 hash + 主档/日志补记。（此句描述本节验收时的状态；随后已部署并提交，见第四十七节。）
+
+## 四十七、线上部署与提交推送（11/06 16:0x）
+
+- 用户明确「部署一下吧，然后提交push代码。部署不用备份以前的服务和数据库」。
+- **部署前置核对**：`backend/deploy.sh` 只有交叉编译 linux/amd64 → scp `meowquest.new` → `systemctl stop / mv / start` → 健康检查四步，**无备份步骤、不触碰数据库**，与用户要求一致；`backend/.deploy.local` 由 `.gitignore:22` 忽略、未入库。首次 SSH 连通性检查用 grep/cut 取别名取到空值，误报 `ssh: connect to host  port 22: Connection refused`；改为 `source .deploy.local` 解析 `MEOW_SERVER` 后确认线上 `systemctl is-active meowquest` = `active`。
+- **部署结果**：`bash deploy.sh` 四步全过，`systemd active`、`https://meow.keepthinking.me` → 200。线上真实产物核验：首页引用 `assets/index-p0wJMGBA.js` / `assets/index-BS2idrri.css`，JS 200（552236B）、CSS 200（281361B）；CSS 含 `climb-knob-cap` / `climb-knob-ring` / `climb-arrow-left` / `nest-bubble-follow` / 热区 `pointer-events:none` 规则，JS 含 `climb-knob-cap`、`keepCamera` 4 次 → 本轮相对摇杆，以及前几轮热区修复、出窝气泡与跟随镜头**全部已上线**，线上不再是 19:23 版。
+- **提交**：`git fetch origin main` 后本地/远端 `0 0` 无分叉；暂存 7 项（旧 embed CSS 识别为 rename、旧 JS 删除、新 JS 新增、`index.html`、两个源码文件、主档），**192 行**新增文本做 URL / IPv4 / 凭据赋值样式扫描 **0 命中**，暂存清单无 `.env` / `.deploy.local` / 私钥 / 凭据文件误入。**commit `a165887`** `feat: 无限爬高方向控件改为相对摇杆（滞回 + 摇杆帽 + 收窄热区）`，7 文件 +202 / −84。
+- `git push origin main` 成功 `83ab991..a165887`，推后 HEAD 与 `origin/main` 同步。随后把部署/提交状态补记为本节，并按历史惯例做 docs 小提交保持工作区干净。
+- **本机**：8600 已是同一份产物（`index-p0wJMGBA.js` / `index-BS2idrri.css`）；Vite dev server 5173 服务当前源码，供 DEV-only 的 `/climb-preview` 交互验收。
+- **边界**：C 方案（墙/地板分界线）未实施；390/320 小屏窗户残余、320 展开态工具条溢出、`cat-tree` 缩略图、摇杆帽盖箭头与 `NEAR_PAD` 全平台统一取舍，均按第四十六节如实保留，本轮未外扩。`backend/internal/web/dist` 仍按既有约定入库供 Go embed。
