@@ -6,7 +6,9 @@ import * as Vue from 'vue'
 import { parse, compileScript, compileTemplate } from '@vue/compiler-sfc'
 import * as tree from './cat-tree-room.js'
 import * as interaction from './room-interaction.js'
+import * as catalog from './nest-catalog.js'
 import { decorArt, getSceneLighting, isWallpaper } from './scene-art.js'
+import { getShopDisplay } from './shop-display.js'
 
 const source = readFileSync(new URL('./views/KidHome.vue', import.meta.url), 'utf8')
 const { descriptor } = parse(source)
@@ -28,7 +30,7 @@ function harness() {
   const focusable = name => Vue.markRaw({ name, isConnected: true, focus() { document.activeElement = this }, getBoundingClientRect: () => ({ left: 350, top: 260, width: 192, height: 192 }), querySelector: () => null })
   const trigger = focusable('爬架'), close = focusable('关闭'), action = focusable('动作')
   const context = {
-    ...tree, ...interaction, decorArt, getSceneLighting, isWallpaper, ref: Vue.ref, computed: Vue.computed, reactive: Vue.reactive, nextTick: Vue.nextTick,
+    ...tree, ...interaction, ...catalog, decorArt, getSceneLighting, isWallpaper, getShopDisplay, ref: Vue.ref, computed: Vue.computed, reactive: Vue.reactive, nextTick: Vue.nextTick,
     onMounted: fn => { hooks.mount = fn }, onBeforeUnmount: fn => { hooks.cleanup = fn }, watch: (get, fn) => watchers.push([get, fn]),
     showToast: text => toasts.push(text), closeToast() {}, showDialog() {}, showConfirmDialog: async () => {}, reviewPending: () => false, reviewStages: {}, evidenceSteps: () => [],
     document, window: { innerWidth: 1280, innerHeight: 720, matchMedia: () => ({ matches: false }), ...host('window') },

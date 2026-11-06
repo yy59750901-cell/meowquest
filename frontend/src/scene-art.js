@@ -39,6 +39,22 @@ export function getSceneLighting(date = new Date()) {
 // 注册新装饰只需追加原始 key，不改已有存储结构。
 export const DECOR_ART = {
   nest: { name: '暖橘猫窝', size: 96, surface: 'floor' },
+  'nest-apple': { name: '切面苹果窝', size: 192, surface: 'floor' },
+  'nest-lace-square': { name: '花边方窝', size: 192, surface: 'floor' },
+  'nest-tent': { name: '三角帐篷', size: 192, surface: 'floor' },
+  'nest-petal-cylinder': { name: '粉色花瓣圆筒窝', size: 178.4, surface: 'floor' },
+  'nest-stripe-handle': { name: '条纹提手窝', size: 192, surface: 'floor' },
+  'nest-knit-drop': { name: '针织水滴窝', size: 192, surface: 'floor' },
+  'nest-dot-u': { name: '波点U形窝', size: 192, surface: 'floor' },
+  'nest-quilt-u': { name: '绗缝U形垫', size: 192, surface: 'floor' },
+  'nest-greyblue-round': { name: '灰蓝椭圆围合窝', size: 192, surface: 'floor' },
+  'nest-leaf-apple': { name: '带叶圆苹果', size: 192, surface: 'floor' },
+  'nest-banana': { name: '香蕉船', size: 192, surface: 'floor' },
+  'nest-catear': { name: '猫耳拱形窝', size: 192, surface: 'floor' },
+  'nest-house': { name: '绿色方屋', size: 192, surface: 'floor' },
+  'nest-blue-yellow': { name: '蓝壳黄内衬半开放窝', size: 192, surface: 'floor' },
+  'nest-red-dots': { name: '红口波点椭圆洞', size: 192, surface: 'floor' },
+  'nest-green-monster': { name: '绿色小怪兽窝', size: 192, surface: 'floor' },
   // 沿用 PixelItem 的 48 单位画布与底部中心锚点 (24, 48)。
   'cat-tree': { name: '猫爬架', size: 192, surface: 'floor' },
   yarn: { name: '紫色毛线球', size: 72, surface: 'floor' },

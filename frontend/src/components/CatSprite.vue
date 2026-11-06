@@ -8,6 +8,9 @@ const props = defineProps({
   anim: { type: String, default: 'sit' }, // auto | walk | sit | sleep | eat | crouch | pounce | catch | recover
   size: { type: Number, default: 110 },
   paused: { type: Boolean, default: false },
+  // 进窝跳跃按 demo 逐帧控制（crouchA / pounceA / pounceB / walkA / walkB）；
+  // 不传时完全走原有 SEQ 动画，其它玩法不受影响。
+  poseFrame: { type: String, default: '' },
 })
 
 const PAL = {
@@ -48,6 +51,7 @@ const SEQ = {
   catch: [[PLAY_FR.catchA, 170], [PLAY_FR.catchB, 170]],
   recover: [[PLAY_FR.recoverA, 150], [PLAY_FR.recoverB, 150]],
 }
+const POSE_FRAMES = { ...FR, ...PLAY_FR }
 const AUTO_IDLE = ['idle', 'idle', 'idle', 'wag', 'idle', 'idle']
 const AUTO_WALK = ['walkA', 'walkB', 'walkA', 'walkB']
 
@@ -62,6 +66,10 @@ function currentSeq() {
 function play() {
   clearTimeout(timer)
   if (props.paused) return
+  if (props.poseFrame && POSE_FRAMES[props.poseFrame]) {
+    frame.value = POSE_FRAMES[props.poseFrame]
+    return
+  }
   const seq = currentSeq()
   let idx = 0
   const tick = () => {
@@ -73,7 +81,7 @@ function play() {
   tick()
 }
 onMounted(play)
-watch(() => [props.anim, props.species, props.paused], play)
+watch(() => [props.anim, props.species, props.paused, props.poseFrame], play)
 onBeforeUnmount(() => clearTimeout(timer))
 
 const rects = computed(() => {

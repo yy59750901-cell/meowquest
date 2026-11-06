@@ -6,6 +6,7 @@ import PixelRoom from '../components/PixelRoom.vue'
 import PixelItem from '../components/PixelItem.vue'
 import GardenBackdrop from '../components/GardenBackdrop.vue'
 import { decorArt, getSceneLighting, isWallpaper } from '../scene-art.js'
+import { getShopDisplay } from '../shop-display.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
 import CatPlayground from '../components/CatPlayground.vue'
 import CatClimb from '../components/CatClimb.vue'
@@ -14,6 +15,16 @@ import { TREE_CAT_SIZE, TREE_SPRITE_UNITS, GROUND_CAT_FOOT_GAP, treeRoute, treeP
 import { planInteractionSession, pickInteractionNode, dwellForNode } from '../room-interaction.js'
 import { evidenceSteps } from '../task-evidence.js'
 import { reviewPending, reviewStages } from '../ai-review.js'
+import { NEST_ENTRY_TIME, NEST_WALK_FRAME_MS, NEST_MOTION, NEST_PAD, isJumpNest, nestProfile, nestArt, nestRoute, nestFlightPoint, nestLandingPoint, nestOpeningClip, nestHandoff, nestSleepPos } from '../nest-catalog.js'
+
+// 切面苹果窝维持上一代实现（沿地板三段进场 + CSS 椭圆阴影），不随新 15 款改动。
+// 新 15 款走 nest-catalog.js 的 gallery 确认稿：每款 PNG 阴影 + 七阶段跳跃进场，两套链路互不干扰。
+const APPLE_NEST_KEY = 'nest-apple'
+const APPLE_NEST_WIDTH = 192
+const APPLE_NEST_HEIGHT = APPLE_NEST_WIDTH * 783 / 939 // 160.1，与确认稿同比例
+// D 档（11/06）：B 把窝缩到 0.8，进窝猫同步 ×0.8（110→88），猫/窝比例与 demo 的 110/240 严格相等。
+// 只在渲染层用 transform 等比缩放、以元素中心为原点；坐标体系仍按 110 口径，demo 参数与落点一字节不动。
+const NEST_CAT_SCALE = 0.8
 
 const API = '/api'
 
@@ -290,9 +301,22 @@ function onDocumentVisibility() {
 }
 const activeWallpaper = computed(() => sceneItems.value.filter(it => isWallpaper(it.item_key)).at(-1)?.item_key || '')
 const placedDecor = computed(() => sceneItems.value.filter(it => !isWallpaper(it.item_key)))
+// 苹果窝常驻一层透明前片，猫走到洞口里时自然被前沿挡住。
+const appleNests = computed(() => placedDecor.value.filter(it => it.item_key === APPLE_NEST_KEY))
+// 新 15 款：背片/前片/每款专属 PNG 阴影都按 catalog 参数渲染。
+const jumpNests = computed(() => placedDecor.value.filter(it => isJumpNest(it.item_key)))
 // 图层按地面锚点排序：未来新增装饰沿用同一坐标与注册表。
 const decorDepth = it => decorArt(it.item_key).surface === 'wall' ? 2 : 10 + Math.floor(it.y)
-const catDepth = computed(() => treeRendered.value && treeSession.value ? 11 + Math.floor(treeSession.value.anchor.y) : 10 + Math.floor(catPos.y))
+// 进窝时以窝锚点算层级，保证 back(10+y) < cat(11+y) < front(12+y)；
+// 沿地板走向洞口的阶段猫必须在前片之上（demo 的 walker z=4），否则会穿过窝体。
+const nestActive = ref(null) // 窝里趴睡
+const nestWalking = ref(null) // 沿地板走近洞口
+const catDepth = computed(() => {
+  if (treeRendered.value && treeSession.value) return 11 + Math.floor(treeSession.value.anchor.y)
+  if (nestActive.value) return 11 + Math.floor(nestActive.value.y)
+  if (nestWalking.value) return 13 + Math.floor(nestWalking.value.y)
+  return 10 + Math.floor(catPos.y)
+})
 const rootEl = ref(null)
 const statusToggleEl = ref(null)
 const statusPanelEl = ref(null)
@@ -466,8 +490,12 @@ const treeSession = ref(null)
 const treeRendered = ref(false)
 const treeMoving = ref(false)
 const treeLeaving = ref(false)
+// 爬架会话缩到 64px；进窝会话按 NEST_CAT_SCALE 等比缩小（中心不变）；房间地面猫恒 110px。
+const nestCatActive = computed(() => Boolean(nestWalking.value || nestActive.value || nestEntry.value))
 const treeCatSize = computed(() => treeRendered.value ? TREE_CAT_SIZE : 110)
 const catRoomStyle = computed(() => ({ left: `${catPos.x}px`, top: `${catPos.y}px`, zIndex: catDepth.value,
+  visibility: nestEntry.value ? 'hidden' : 'visible',
+  transform: nestCatActive.value && !treeRendered.value ? `scale(${NEST_CAT_SCALE})` : undefined,
   ...(treeRendered.value ? { width: `${TREE_CAT_SIZE}px`, marginLeft: `${-TREE_CAT_SIZE / 2}px`, marginTop: `${-Math.round(TREE_CAT_SIZE * .75)}px` } : {}) }))
 let treeEpoch = 0, treeRAF = null, treeWalkResolve = null, leavePromise = null
 let disposed = false, walkRAF = null, bubbleTimer = null, initTimer = null
@@ -699,8 +727,8 @@ async function walkTo(target, done, opts = {}) {
   const speed = opts.speed || (pet.value && pet.value.hunger < 30 ? 55 : 100)
   const dur = Math.max(200, (dist / speed) * 1000)
   el.style.transition = `left ${dur / 1000}s linear, top ${dur / 1000}s linear`
-  // 相机跟猫同步走（follow 模式）
-  if (camMode.value === 'follow') centerOn(target.x, target.y - 48, dur / 1000)
+  // 相机跟猫同步走（follow 模式）；进窝入场按 demo 的固定舞台镜头，不跟着平移。
+  if (camMode.value === 'follow' && !opts.keepCamera) centerOn(target.x, target.y - 48, dur / 1000)
   walkRAF = requestAnimationFrame(() => { walkRAF = null; if (!playOpen.value && !playOpening.value && !document.hidden && epoch === walkEpoch) { catPos.x = target.x; catPos.y = target.y } })
   clearTimeout(stateTimer)
   stateTimer = setTimeout(() => { if (playOpen.value || playOpening.value || document.hidden || disposed || epoch !== walkEpoch) return; catAnim.value = 'sit'; walking = false; done && done() }, dur + 60)
@@ -716,7 +744,7 @@ function behaviorTick() {
   const hungry = pet.value && pet.value.hunger < 30
   const r = Math.random()
   // 道具互动：饱腹时 35% 概率找植物/毛线球/猫窝玩（饿了没力气玩）
-  const playables = sceneItems.value.filter((it) => ['plant', 'yarn', 'nest', 'cat-tree'].includes(it.item_key))
+  const playables = sceneItems.value.filter((it) => ['plant', 'yarn', 'nest', APPLE_NEST_KEY, 'cat-tree'].includes(it.item_key) || isJumpNest(it.item_key))
   if (!hungry && playables.length && r < 0.35) {
     const item = playables[Math.floor(Math.random() * playables.length)]
     if (item.item_key === 'cat-tree') playTree(item, ['top', 'nest', 'grip'][Math.floor(Math.random() * 3)])
@@ -726,11 +754,16 @@ function behaviorTick() {
   if (r < 0.55) {
     walkTo(randTarget(), () => behaviorNext())
   } else if (r < 0.8) {
-    // 睡觉是一次长停留（不是连续多次互动），时长走统一的随机 profile。
-    const nest = sceneItems.value.find((it) => it.item_key === 'nest')
+    // 睡觉是一次长停留；老窝走到旁边躺，苹果窝沿用旧进场，新 15 款按 demo 跳跃进窝。
+    const nestItems = sceneItems.value.filter((it) => it.item_key === 'nest' || it.item_key === APPLE_NEST_KEY || isJumpNest(it.item_key))
+    const target = nestItems.length ? nestItems[Math.floor(Math.random() * nestItems.length)] : null
     const nap = planInteractionSession('nest')
-    if (nest) {
-      walkTo({ x: nest.x, y: nest.y }, () => { lieDown(); behaviorNext(nap.dwell) })
+    if (target && target.item_key === APPLE_NEST_KEY) {
+      enterNest(target)
+    } else if (target && isJumpNest(target.item_key)) {
+      jumpIntoNest(target)
+    } else if (target) {
+      walkTo({ x: target.x, y: target.y }, () => { lieDown(); behaviorNext(nap.dwell) })
     } else {
       lieDown()
       behaviorNext(nap.dwell)
@@ -744,9 +777,202 @@ function behaviorTick() {
 // ===== 道具互动 =====
 const shakeId = ref(0) // 被咬的植物晃动
 function facePoint(px) { flipped.value = px > catPos.x } // 面向目标
+
+// 苹果窝会话，按确认稿 demo 的三段：走近洞口 → 沿地板入场 → 趴到软垫上。
+// 走路阶段猫是最高层（不穿窝体），到位后才夹进 PNG 前后片之间做真遮挡。
+let nestToken = null
+let nestTimer = null
+function cancelNest() {
+  cancelJumpNest() // 新 15 款的 rAF 动画与 dwell 定时器；苹果窝逻辑保持原样
+  nestToken = null
+  if (nestWalking.value) {
+    interrupt()
+    if (catEl.value) catEl.value.style.transition = 'none'
+    catAnim.value = 'sit'
+  }
+  nestWalking.value = null
+  nestActive.value = null
+  if (nestTimer) { clearTimeout(nestTimer); nestTimer = null }
+}
+// 确认稿 939×783、展示宽 192（B 档 0.8 缩放）；软垫脚点按 demo 的 scale 换算到世界坐标。
+// .cat-wrap 宽 110 / margin -55,-100，猫精灵高 83 → 脚点比猫底低 17px。
+function appleNestFoot(it) {
+  const scale = APPLE_NEST_WIDTH / 939
+  return {
+    x: it.x - APPLE_NEST_WIDTH / 2 + 490 * scale - 9 + 55,
+    y: it.y - APPLE_NEST_WIDTH * 783 / 939 + 565 * scale + 17,
+  }
+}
+function enterNest(it) {
+  if (roomLocked()) return
+  cancelNest()
+  const token = {}
+  nestToken = token
+  nestWalking.value = it
+  const pad = appleNestFoot(it) // 软垫上的趴睡脚点
+  const groundY = it.y + 17 // demo 的 groundY：窝底 - 猫高，猫走在地板线上
+  // demo 的 Math.max(6, target-170)：世界左边界保护，猫半宽 55 保证整只可见；
+  // clamp 后按实际距离重算速度，仍保持 1.35s 匀速入场。
+  const approachX = Math.max(55, pad.x - 170)
+  const walkDist = Math.max(1, pad.x - approachX) // 窝贴世界左边缘时兜底，避免 speed 为 0
+  const approach = { x: approachX, y: groundY } // 从洞口左侧沿地板起走
+  const mouth = { x: pad.x, y: groundY }
+  const dwell = (planInteractionSession('nest') || { dwell: 8000 }).dwell
+  // 第一段：从当前位置正常走到入场起点；猫在窝前地板上，不会被窝挡。
+  walkTo(approach, () => {
+    if (nestToken !== token) return
+    // 第二段：1.35s 匀速沿地板走进洞口；walkTo 的 anim='walk' 由 CatSprite 按 180ms 交替 walkA/walkB，
+    // 向右走时 flipped=true 即 scaleX(-1)，与 demo 的 walker 一致。
+    walkTo(mouth, () => {
+      if (nestToken !== token) return
+      // 第三段：关掉过渡瞬间切到软垫，猫回到 back(10+y) < cat(11+y) < front(12+y)。
+      if (catEl.value) catEl.value.style.transition = 'none'
+      catPos.x = pad.x
+      catPos.y = pad.y
+      nestWalking.value = null
+      nestActive.value = it
+      catAnim.value = 'sleep'
+      flipped.value = false
+      say('呼…呼…')
+      nestTimer = setTimeout(() => {
+        if (nestToken !== token) return
+        cancelNest() // 会话结束必须还原层级，否则猫走到别处还挂在窝的 zIndex 上
+        catAnim.value = 'sit'
+        behaviorNext()
+      }, dwell)
+    }, { speed: walkDist / 1.35, keepCamera: true })
+  }, { keepCamera: true })
+}
+
+// ===== 15 款新猫窝：按 gallery 确认稿 demo（SHA 818a959f…）的七阶段跳跃进场 =====
+// demo 的 walker(z4) / cat-plane(z2) 是两只同世界坐标的猫副本；游戏只有一只全局猫，
+// 所以动画期间隐藏主猫，用动画层渲染 outer + inner 两个副本做补集 clip（洞口款头先进入）。
+const nestEntry = ref(null)
+let nestRAF = null
+let nestEntryToken = null
+let nestEntryTimer = null
+function stopNestEntry() {
+  if (nestRAF !== null) cancelAnimationFrame(nestRAF)
+  nestRAF = null
+  nestEntry.value = null
+}
+function cancelJumpNest() {
+  const wasJump = Boolean(nestEntry.value) ||
+    (nestActive.value && isJumpNest(nestActive.value.item_key))
+  nestEntryToken = null
+  stopNestEntry()
+  if (nestEntryTimer) { clearTimeout(nestEntryTimer); nestEntryTimer = null }
+  if (wasJump) {
+    nestActive.value = null
+    interrupt()
+    if (catEl.value) catEl.value.style.transition = 'none'
+    catAnim.value = 'sit'
+  }
+}
+// 苹果窝仍用固定的 200.13，新窝按各自 display 高度，气泡始终在窝顶上方。
+function nestBubbleHeight(it) {
+  if (it.item_key === APPLE_NEST_KEY) return APPLE_NEST_HEIGHT
+  const p = nestProfile(it.item_key)
+  return p ? p.display[1] : APPLE_NEST_HEIGHT
+}
+function renderNestEntry(p, it, route, elapsed) {
+  const T = NEST_ENTRY_TIME
+  const jumpStart = T.walk + T.prepare
+  const jumpEnd = jumpStart + route.jumpTime
+  const planeClip = nestOpeningClip(p)
+  // 动画层两个副本与趴睡主猫同尺度；facing 与等比缩放合成一个 transform，避免互相覆盖。
+  const facing = (route.direction === 1 ? 'scaleX(-1) ' : '') + `scale(${NEST_CAT_SCALE})`
+  let point, frame, progress = 0, phase
+  if (elapsed < T.walk) {
+    const t = elapsed / T.walk
+    point = { left: route.start + (route.launch - route.start) * t, top: route.groundTop }
+    frame = Math.floor(elapsed / NEST_WALK_FRAME_MS) % 2 ? 'walkB' : 'walkA'
+    phase = 'walking'
+  } else if (elapsed < jumpStart) {
+    point = { left: route.launch, top: route.groundTop }
+    frame = NEST_MOTION.anticipate
+    phase = 'anticipating'
+  } else if (elapsed < jumpEnd) {
+    const t = (elapsed - jumpStart) / route.jumpTime
+    point = nestFlightPoint(route, t)
+    frame = t < .58 ? NEST_MOTION.takeoff : NEST_MOTION.entering
+    progress = t
+    phase = t < .12 ? 'takeoff' : t < .64 ? 'airborne' : 'entering'
+  } else if (elapsed < jumpEnd + T.land) {
+    point = nestLandingPoint(route, (elapsed - jumpEnd) / T.land)
+    frame = NEST_MOTION.land
+    progress = 1
+    phase = 'landing'
+  } else {
+    return false
+  }
+  // demo 在 walking/anticipating 阶段 plane 全隐、walker 无裁切。
+  const handoff = (phase === 'walking' || phase === 'anticipating')
+    ? { outerHidden: false, innerHidden: true, outerClip: 'none', innerClip: 'none' }
+    : nestHandoff(route, progress)
+  nestEntry.value = {
+    it, route, planeClip, facing, frame, phase,
+    outer: { left: point.left, top: point.top, clip: handoff.outerClip, hidden: handoff.outerHidden },
+    inner: { left: point.left - route.nestLeft, top: point.top - route.nestTop,
+      clip: handoff.innerClip, hidden: handoff.innerHidden },
+  }
+  return true
+}
+function settleNest(p, it, token) {
+  if (nestEntryToken !== token) return
+  stopNestEntry()
+  // walkTo 给主猫留着 left/top 过渡；不关掉会让猫从起跳点慢慢滑向软垫，趴睡时还挂在窝外。
+  // 与苹果窝旧链路第三段一致：瞬间切到最终脚点，动画层最后一帧与主猫位置严格重合。
+  if (catEl.value) catEl.value.style.transition = 'none'
+  const pos = nestSleepPos(p, it)
+  catPos.x = pos.x
+  catPos.y = pos.y
+  nestActive.value = it
+  catAnim.value = 'sleep'
+  flipped.value = false
+  say('呼…呼…')
+  const dwell = (planInteractionSession('nest') || { dwell: 8000 }).dwell
+  nestEntryTimer = setTimeout(() => {
+    if (nestEntryToken !== token) return
+    cancelJumpNest() // 还原层级，否则猫走到别处还挂在窝的 zIndex 上
+    behaviorNext()
+  }, dwell)
+}
+function startNestEntry(p, it, route, token) {
+  let started = null
+  const step = now => {
+    if (nestEntryToken !== token || disposed) return
+    nestRAF = null
+    if (started === null) started = now
+    if (!renderNestEntry(p, it, route, now - started)) {
+      settleNest(p, it, token)
+      return
+    }
+    nestRAF = requestAnimationFrame(step)
+  }
+  nestRAF = requestAnimationFrame(step)
+}
+function jumpIntoNest(it) {
+  if (roomLocked()) return
+  cancelNest()
+  const p = nestProfile(it.item_key)
+  if (!p) return
+  const token = {}
+  nestEntryToken = token
+  const route = nestRoute(p, it)
+  // 先从当前位置走到 demo 的 start 点；固定舞台镜头，不触发相机跟随。
+  walkTo(route.groundPos, () => {
+    if (nestEntryToken !== token) return
+    startNestEntry(p, it, route, token)
+  }, { keepCamera: true })
+}
+
 function interactWith(it) {
   if (!it || !it.item_key || roomLocked()) return
+  cancelNest()
   if (it.item_key === 'cat-tree') return playTree(it, 'top')
+  if (it.item_key === APPLE_NEST_KEY) return enterNest(it)
+  if (isJumpNest(it.item_key)) return jumpIntoNest(it)
   // 每个道具的连续次数与停留时长都走同一份可复用 profile。
   const plan = planInteractionSession(it.item_key)
   const beside = it.item_key === 'yarn' ? 44 : 52
@@ -807,7 +1033,8 @@ const catEl = ref(null)
 const narrowMedia = window.matchMedia('(max-width: 900px)')
 const isNarrow = ref(narrowMedia.matches)
 const hudOpen = ref(false)
-const toolsOpen = ref(false)
+const toolsOpen = ref(false)   // 窄屏「陪伴」2×2 操作
+const invOpen = ref(false)     // 全平台「物品栏」开关：点商店「摆放」或刚买完时展开，点空白/摆好后收起
 const sheet = ref('') // '' / 'task' / 'wish' / 'shop'
 const desktopPanel = ref('task')
 const taskCompleted = computed(() => today.value.tasks.filter(t => t.status === 'approved').length)
@@ -824,12 +1051,14 @@ function openSheet(name) {
   sheet.value = sheet.value === name ? '' : name
   hudOpen.value = false
   toolsOpen.value = false
+  invOpen.value = false
   if (sheet.value === 'task') refreshTasks()
 }
 function toggleCompanion() {
   if (roomLocked()) return
   closeGamePicker(false)
   toolsOpen.value = !toolsOpen.value
+  invOpen.value = false
   sheet.value = ''
   hudOpen.value = false
 }
@@ -1065,8 +1294,10 @@ function onRoomTap(e) {
   if (!adopted.value || roomLocked() || e.button !== 0) return
   cancelCameraDrag?.()
   if (e.target.closest('button, input, .cat-wrap, .scene-item, .inv-bar')) return
+  cancelNest()
   hudOpen.value = false
   toolsOpen.value = false
+  invOpen.value = false
   const r = roomEl.value.getBoundingClientRect()
   // 视角拖动：按下后移动超阈值 → 拖动视角（不点地）
   dragCam = { sx: e.clientX, sy: e.clientY, camx: cam.value.x, camy: cam.value.y, moved: false }
@@ -1671,6 +1902,9 @@ async function buyItem(it) {
   if (!ok) return showToast(data.error || '购买失败')
   showToast(it.key === 'cat-tree' ? '猫爬架解锁啦！「和猫玩」里多了无限爬高，反复玩不耗星星' : `买到${it.name}啦！从下面的物品栏拖进房间～`)
   await loadAll()
+  // 刚买完就是摆放意图：全平台自动展开一次物品栏；点空白或摆好后自动收起。
+  invOpen.value = true
+  if (isNarrow.value) { sheet.value = ''; toolsOpen.value = false }
 }
 
 // 已购未摆放的道具（物品栏）
@@ -1774,7 +2008,9 @@ async function shopAction(it) {
       showToast('爬架摆好啦！点它选择爬高、钻窝、抓柱或爬架游戏')
       return
     }
-    if (isNarrow.value) { sheet.value = ''; toolsOpen.value = true }
+    // 从商店点「摆放」：全平台只展开物品栏，不弹出陪伴 2×2 按钮（两者会互相盖住）。
+    invOpen.value = true
+    if (isNarrow.value) { sheet.value = ''; toolsOpen.value = false }
     showToast('从物品栏拖进房间；不想要了可以在商店点「收回」')
   } catch { showToast('商店操作没有保存，请稍后再试') }
   finally { shopActionBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
@@ -1828,7 +2064,7 @@ function onItemPointerDown(e, it, sceneId) {
         playTree(it, mode)
         return
       }
-      if (drag.id && ['plant', 'nest', 'yarn'].includes(drag.key)) interactWith(it)
+      if (drag.id && (['plant', 'nest', 'yarn', APPLE_NEST_KEY].includes(drag.key) || isJumpNest(drag.key))) interactWith(it)
       else showToast('按住拖动来摆放，拖到房间边缘可以收回')
       return
     }
@@ -1855,6 +2091,7 @@ function onItemPointerDown(e, it, sceneId) {
       } else result = await jpost('/scene/place', { id: drag.id, key: drag.key, x, y })
       if (!result.ok) return showToast(result.data.error || '摆放没有保存，请再试一次')
       await loadAll()
+      if (!drag.id) invOpen.value = false // 从物品栏拖入房间：摆好即收起，左下角恢复空白
     } catch { showToast('网络暂时不通，原来的装饰没有丢失') }
     finally { shopActionBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
   }
@@ -1946,6 +2183,7 @@ watch(() => sceneItems.value.map(it => [it.id, it.item_key, it.x, it.y]), () => 
 }, { flush: 'sync' })
 onBeforeUnmount(() => {
   disposed = true
+  cancelNest()
   cancelFeeding()
   closeGamePicker(false)
   resetTreeToFloor()
@@ -2060,8 +2298,57 @@ onBeforeUnmount(() => {
       @keydown.enter.prevent.stop="it.item_key === 'cat-tree' && playTree(it, 'top')"
       @keydown.space.prevent.stop="it.item_key === 'cat-tree' && playTree(it, 'top')"
       @pointerdown="(e) => onItemPointerDown(e, it, it.id)">
-      <PixelItem :item-key="it.item_key" :size="decorArt(it.item_key).size" />
+      <img v-if="it.item_key === 'nest-apple'" class="nest-img" src="/art/nest-apple.png" :style="{ width: decorArt(it.item_key).size + 'px' }" :alt="decorArt(it.item_key).name">
+      <img v-else-if="isJumpNest(it.item_key)" class="nest-img" :src="nestArt(nestProfile(it.item_key), 'back')" :style="{ width: nestProfile(it.item_key).display[0] + 'px' }" :alt="decorArt(it.item_key).name">
+      <PixelItem v-else :item-key="it.item_key" :size="decorArt(it.item_key).size" />
     </div>
+
+    <!-- 苹果窝窝底椭圆投影（上一代实现，维持原样） -->
+    <div v-for="it in appleNests" :key="'nest-shade-' + it.id" class="nest-shade"
+      :style="{ left: it.x + 'px', top: it.y + 5 + 'px', zIndex: 9 + Math.floor(it.y) }"></div>
+
+    <!-- 15 款新窝：每款专属 PNG 接触投影，按 demo .shade 的 inset:-8px 铺满窝 bbox 外扩 8px -->
+    <div v-for="it in jumpNests" :key="'nest-shadow-' + it.id" class="nest-shadow-img"
+      :style="{ left: it.x + 'px', top: it.y + NEST_PAD + 'px', zIndex: 9 + Math.floor(it.y),
+        width: nestProfile(it.item_key).display[0] + 2 * NEST_PAD + 'px',
+        height: nestProfile(it.item_key).display[1] + 2 * NEST_PAD + 'px',
+        backgroundImage: 'url(' + nestArt(nestProfile(it.item_key), 'shadow') + ')' }"></div>
+
+    <!-- 苹果窝前片：zIndex 高于猫，把猫夹在前后片之间做真遮挡，不需要缩小猫 -->
+    <div v-for="it in appleNests" :key="'nest-front-' + it.id" class="nest-front"
+      :style="{ left: it.x + 'px', top: it.y + 'px', zIndex: 12 + Math.floor(it.y) }">
+      <img class="nest-img" src="/art/nest-apple-front.png" :style="{ width: decorArt(it.item_key).size + 'px' }" alt="">
+    </div>
+
+    <!-- 15 款新窝前片：同样夹在前后片之间 -->
+    <div v-for="it in jumpNests" :key="'nest-front-jump-' + it.id" class="nest-front"
+      :style="{ left: it.x + 'px', top: it.y + 'px', zIndex: 12 + Math.floor(it.y) }">
+      <img class="nest-img" :src="nestArt(nestProfile(it.item_key), 'front')" :style="{ width: nestProfile(it.item_key).display[0] + 'px' }" alt="">
+    </div>
+
+    <!-- 窝里说话时气泡挪到窝顶上方并提到最高层，避免压在窝上（高度按各款 display） -->
+    <div v-if="showBubble && nestActive" class="bubble nest-bubble"
+      :style="{ left: nestActive.x + 'px', top: nestActive.y - nestBubbleHeight(nestActive) - 10 + 'px', zIndex: 13 + Math.floor(nestActive.y) }">{{ bubble }}</div>
+
+    <!-- 15 款新窝进窝动画：demo 的 cat-plane(z2) + walker(z4) 双副本补集 clip -->
+    <template v-if="nestEntry">
+      <div class="nest-entry-plane" :data-phase="nestEntry.phase" :data-frame="nestEntry.frame"
+        :style="{ left: nestEntry.route.nestLeft + 'px', top: nestEntry.route.nestTop + 'px',
+          width: nestEntry.route.w + 'px', height: nestEntry.route.h + 'px',
+          clipPath: nestEntry.planeClip, zIndex: 11 + Math.floor(nestEntry.it.y) }">
+        <div v-if="!nestEntry.inner.hidden" class="nest-entry-cat"
+          :style="{ left: nestEntry.inner.left + 'px', top: nestEntry.inner.top + 'px',
+            clipPath: nestEntry.inner.clip, transform: nestEntry.facing }">
+          <CatSprite :species="species" :pose-frame="nestEntry.frame" :size="110" />
+        </div>
+      </div>
+      <div v-if="!nestEntry.outer.hidden" class="nest-entry-cat nest-entry-walker"
+        :style="{ left: nestEntry.outer.left + 'px', top: nestEntry.outer.top + 'px',
+          clipPath: nestEntry.outer.clip, transform: nestEntry.facing,
+          zIndex: 13 + Math.floor(nestEntry.it.y) }">
+        <CatSprite :species="species" :pose-frame="nestEntry.frame" :size="110" />
+      </div>
+    </template>
 
     <!-- 食物碗（放大，猫低头吃时可见） -->
     <svg v-if="showBowl" class="bowl" :style="{ left: bowlPos.x + 'px', top: bowlPos.y + 'px', zIndex: 10 + Math.floor(bowlPos.y) }" width="72" height="42" viewBox="0 0 48 28" shape-rendering="crispEdges">
@@ -2075,7 +2362,7 @@ onBeforeUnmount(() => {
     <!-- 猫 -->
     <div class="cat-wrap" ref="catEl" :class="{ sad: moodColor === 'sad', 'room-paused': roomHidden, 'tree-cat': treeRendered, 'tree-peek': treeRendered && treeSession?.currentnode === 'nest' && !treeMoving, 'tree-scratch': treeRendered && treeSession?.mode === 'grip' && !treeMoving }"
       :style="catRoomStyle" :data-tree-node="treeRendered ? treeSession?.currentnode : undefined" @click.stop="petCat">
-      <div class="bubble" v-if="showBubble">{{ bubble }}</div>
+      <div class="bubble" v-if="showBubble && !nestActive">{{ bubble }}</div>
       <span class="zzz" v-if="catAnim === 'sleep' && zzz">💤</span>
       <div class="cat-inner" :class="{ flip: flipped }">
         <CatSprite :species="species" :anim="catAnim" :size="treeCatSize" :paused="playOpen || roomHidden" />
@@ -2187,10 +2474,14 @@ onBeforeUnmount(() => {
     </nav>
 
     <!-- 物品栏：已购未摆放的道具，拖入房间 -->
-    <div v-if="inventory.length && (!isNarrow || toolsOpen)" class="inv-bar">
+    <div v-if="inventory.length && invOpen" class="inv-bar">
       <span class="lbl">拖我进房间→</span>
       <div v-for="it in inventory" :key="it.key" class="inv-item" :title="it.name"
-        @pointerdown="(e) => onItemPointerDown(e, it, 0)"><PixelItem :item-key="it.key" :size="40" /></div>
+        @pointerdown="(e) => onItemPointerDown(e, it, 0)">
+        <img v-if="String(getShopDisplay(it.key).icon).startsWith('/')" class="inv-item-image"
+          :src="getShopDisplay(it.key).icon" :alt="it.name" draggable="false">
+        <PixelItem v-else :item-key="getShopDisplay(it.key).icon" :size="40" />
+      </div>
     </div>
 
     <div class="actions" v-show="!isNarrow || toolsOpen">
@@ -2377,8 +2668,10 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .ui-icon { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .camera-hint { font-size: 11px; color: #88786A; white-space: nowrap; }
 /* 美术分层：庭院在视口外；固定世界内仅基础墙地纹理，装饰独立持久化。 */
-.room { --sidebar-width: 300px; --sidebar-gap: calc(var(--sidebar-width) + 48px); position: fixed; inset: 0; overflow: hidden; color: #5D493B; background: #617a4f; cursor: default; touch-action: manipulation; }
-.scene-viewport { position: absolute; top: clamp(112px, 14vh, 152px); bottom: 132px; left: clamp(68px, 7vw, 132px); right: var(--sidebar-gap); max-width: 1280px; max-height: 720px; overflow: hidden; z-index: 1; border: 8px solid #8b6547; border-top-color: #c8a778; border-left-color: #b18b61; border-radius: 6px; background: #dbb27b url('/art/wood-floor.png') center bottom / 1280px 320px repeat; image-rendering: pixelated; box-shadow: 0 0 0 4px #e0d1b4, 0 8px 0 4px #74644d, 0 14px 0 4px rgb(48 58 34 / 35%); touch-action: none; }
+/* 宽屏内容区与侧栏共用一套坐标：左缩进同时是右侧留白，上下边界同一对变量，避免各区块各自漂移。
+   900px 以下有独立的绝对定位规则，会覆盖这里的 left/right/top/bottom。 */
+.room { --sidebar-width: 300px; --content-left: clamp(68px, 7vw, 132px); --content-gap: 24px; --sidebar-gap: calc(var(--content-left) + var(--sidebar-width) + var(--content-gap)); --content-max: 1280px; --content-top: clamp(112px, 14vh, 152px); --content-bottom: 108px; /* 卡片高度受 720 世界高度限制；超高屏多出的空间留给卡片下方，工具栏仍贴卡片底边而非屏幕底。 */ --card-height: min(720px, calc(100dvh - var(--content-top) - var(--content-bottom))); --card-gap: calc(100dvh - var(--content-top) - var(--card-height)); --actions-bottom: calc(var(--card-gap) - 78px); --tools-bottom: calc(var(--card-gap) - 70px); position: fixed; inset: 0; overflow: hidden; color: #5D493B; background: #617a4f; cursor: default; touch-action: manipulation; }
+.scene-viewport { position: absolute; top: var(--content-top); bottom: var(--content-bottom); left: var(--content-left); right: var(--sidebar-gap); max-width: var(--content-max); max-height: 720px; margin-inline: auto; overflow: hidden; z-index: 1; border: 8px solid #8b6547; border-top-color: #c8a778; border-left-color: #b18b61; border-radius: 6px; background: #dbb27b url('/art/wood-floor.png') center bottom / 1280px 320px repeat; image-rendering: pixelated; box-shadow: 0 0 0 4px #e0d1b4, 0 8px 0 4px #74644d, 0 14px 0 4px rgb(48 58 34 / 35%); touch-action: none; }
 .world { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; background: #e9c891; will-change: transform; }
 .cat-wrap { position: absolute; width: 110px; margin-left: -55px; margin-top: -100px; cursor: pointer; z-index: 5; }
 .cat-inner { transition: transform .3s; transform-origin: 50% 90%; }
@@ -2387,6 +2680,18 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .bubble { position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); width: max-content; max-width: 300px; background: #FFFCF6; border: 1.5px solid #CBB49A; border-radius: 12px; padding: 8px 12px; font-size: 12px; line-height: 1.5; font-weight: 600; white-space: normal; overflow-wrap: anywhere; box-shadow: 0 4px 12px rgba(103, 75, 47, .12); pointer-events: none; }
 .zzz { position: absolute; top: -20px; right: 0; }
 .scene-item { position: absolute; transform: translate(-50%, -100%); line-height: 0; cursor: grab; user-select: none; touch-action: none; }
+.nest-front { position: absolute; transform: translate(-50%, -100%); line-height: 0; pointer-events: none; }
+.nest-img { display: block; height: auto; image-rendering: pixelated; }
+/* 确认稿 demo 的 .shade：窝宽 240 配 220x13 椭圆投影，底边比窝底低 5px，压在窝体下层。
+   demo 是纯色地板用 #886747/.28；游戏是木纹地板（纹理明暗 ±20 会吃掉浅影），
+   按等效贴地观感加深到 #5b3d22/.45 并柔化边缘，几何与层级仍与 demo 一致。 */
+.nest-shade { position: absolute; width: 176px; height: 10.4px; transform: translate(-50%, -100%); border-radius: 50%; background: #5b3d22; opacity: .45; filter: blur(2px); pointer-events: none; }
+/* 15 款新窝：每款下轮廓接触阴影 PNG，几何=demo 的 inset:-8px，拉伸铺满 */
+.nest-shadow-img { position: absolute; transform: translate(-50%, -100%); background-size: 100% 100%; background-repeat: no-repeat; pointer-events: none; }
+/* demo 的 cat-plane / walker 双副本：同世界坐标、补集 clip；坐标按 110 口径，渲染层 scale(.8) 等比缩小 */
+.nest-entry-plane { position: absolute; pointer-events: none; }
+.nest-entry-cat { position: absolute; width: 110px; line-height: 0; pointer-events: none; }
+.nest-bubble { bottom: auto; transform: translate(-50%, -100%); z-index: 13; }
 .scene-item:focus-visible { outline: 3px solid #9C8BC5; outline-offset: 4px; }
 .tree-peek { clip-path: inset(20px 16px 0 24px); }
 .tree-peek .cat-inner { translate: -12px 0; }
@@ -2417,7 +2722,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .room:has(.place-banner) .scene-viewport { cursor: crosshair; }
 
 /* 标题与默认收起的状态浮层，开关交给 v-show */
-.room-header { position: absolute; top: 20px; left: clamp(68px, 7vw, 132px); right: var(--sidebar-gap); min-height: 64px; z-index: 16; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; background: #fff8e8; border: 2px solid #b29870; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; }
+.room-header { position: absolute; top: 20px; left: var(--content-left); right: var(--sidebar-gap); max-width: var(--content-max); margin-inline: auto; min-height: 64px; z-index: 16; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; background: #fff8e8; border: 2px solid #b29870; border-radius: 6px; box-shadow: 0 4px 0 #766b4b; }
 .room-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .room-identity > :first-child { flex-shrink: 0; }
 .room-name { min-width: 0; }
@@ -2450,7 +2755,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 @keyframes tipin { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 
 /* 侧栏与任务、愿望、商店 */
-.sidebar { position: fixed; top: 106px; right: 24px; bottom: 24px; width: var(--sidebar-width); display: flex; flex-direction: column; gap: 8px; z-index: 25; min-height: 0; }
+.sidebar { position: fixed; top: var(--content-top); right: var(--content-left); bottom: var(--content-bottom); max-height: 720px; width: var(--sidebar-width); display: flex; flex-direction: column; gap: 8px; z-index: 25; min-height: 0; }
 .desktop-tabs { flex: 0 0 42px; display: flex; gap: 4px; padding: 4px; border: 2px solid #b59d76; border-radius: 6px; background: #fff9eb; }
 .desktop-tabs button { flex: 1; min-width: 0; padding: 4px 3px; border: 0; border-radius: 3px; background: transparent; color: #796653; font-size: 12px; font-weight: 700; white-space: nowrap; cursor: pointer; }
 .desktop-tabs button[aria-selected='true'] { background: #e8e0f2; color: #69518f; }
@@ -2467,6 +2772,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .sheet-close svg { width: 16px; height: 16px; }
 .panel-body { padding: 10px; }
 .sidebar .panel .panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; }
+/* 只有一行空态提示时面板按内容收短，不再拉出大片空白；有内容或商店仍保持 flex 拉伸与滚动。 */
+.sidebar .panel:has(.panel-body > .empty:only-child) { flex: 0 1 auto; }
 .sheet-scrim { position: fixed; inset: 0; z-index: 19; background: rgba(88, 69, 51, .2); }
 .sheet-nav { display: none; }
 .task { display: flex; align-items: center; gap: 7px; border: 1px solid #E4D6C4; border-radius: 10px; padding: 8px; background: #fff; margin-bottom: 8px; }
@@ -2508,7 +2815,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .pbtn { font-size: 14px; font-weight: 600; cursor: pointer; padding: 10px 14px; color: #70543C; background: #FFF1DB; border: 1.5px solid #D8BFA1; border-radius: 12px; box-shadow: 0 3px 8px rgba(103, 75, 47, .08); }
 .pbtn:active { transform: translateY(1px); box-shadow: none; }
 .pbtn small { display: block; font-size: 10px; line-height: 1.4; font-weight: 400; color: #88786A; }
-.actions { position: absolute; bottom: 30px; left: 24px; max-width: calc(100% - var(--sidebar-gap) - 32px); display: flex; gap: 10px; z-index: 17; }
+/* 宽屏底部两组共用同一内容区边界：左组靠左、右组靠右，视觉是一条统一工具栏。
+   不包模板容器，900px 以下的原有两行绝对定位规则完全不受影响。 */
+.actions { position: absolute; bottom: var(--actions-bottom); left: var(--content-left); right: var(--sidebar-gap); max-width: var(--content-max); margin-inline: auto; display: flex; gap: 10px; z-index: 17; }
 .actions .pbtn { display: flex; align-items: center; gap: 10px; min-width: 0; height: 52px; padding: 8px 14px; }
 .actions .playground-entry { background: #E9F1DD; color: #526646; border-color: #B9CAA7; }
 .actions .feed { background: #FFF0D9; border-color: #DABF9B; }
@@ -2519,7 +2828,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .action-copy { min-width: 0; text-align: left; }
 .action-copy b { display: block; font-size: 13px; line-height: 1.4; white-space: nowrap; }
 .action-copy small { margin-top: 2px; white-space: nowrap; }
-.room-tools { position: absolute; right: var(--sidebar-gap); bottom: 38px; z-index: 18; display: flex; align-items: center; gap: 10px; }
+.room-tools { position: absolute; left: var(--content-left); right: var(--sidebar-gap); bottom: var(--tools-bottom); max-width: var(--content-max); margin-inline: auto; z-index: 18; display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 .mobile-companion { display: none; }
 .mailbox-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .mailbox-btn svg { flex-shrink: 0; width: 18px; height: 18px; }
@@ -2541,10 +2850,11 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .camera-reset { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .camera-reset svg, .mobile-companion svg { flex-shrink: 0; width: 18px; height: 18px; }
 .camera-reset.free, .camera-reset.on { background: #EEEBF7; color: #75609D; border-color: #CFC2E3; }
-.inv-bar { position: fixed; height: 64px; bottom: 126px; left: 40px; max-width: min(70vw, calc(100% - var(--sidebar-gap) - 64px)); z-index: 17; background: rgba(255, 252, 246, .94); border: 1px solid #D5C1A8; border-radius: 14px; box-shadow: 0 4px 12px rgba(103, 75, 47, .1); padding: 6px 10px; display: flex; gap: 8px; align-items: center; overflow-x: auto; overscroll-behavior-x: contain; touch-action: pan-x; scrollbar-width: thin; }
+.inv-bar { position: fixed; height: 64px; bottom: 126px; left: var(--content-left); max-width: min(70vw, calc(100% - var(--content-left) - var(--sidebar-gap))); z-index: 17; background: rgba(255, 252, 246, .94); border: 1px solid #D5C1A8; border-radius: 14px; box-shadow: 0 4px 12px rgba(103, 75, 47, .1); padding: 6px 10px; display: flex; gap: 8px; align-items: center; overflow-x: auto; overscroll-behavior-x: contain; touch-action: pan-x; scrollbar-width: thin; }
 .scene-viewport .inv-bar { bottom: 16px; left: 16px; max-width: min(580px, calc(100% - 32px)); }
 .inv-bar .lbl { flex-shrink: 0; font-size: 11px; color: #88786A; white-space: nowrap; }
 .inv-item { flex: 0 0 44px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; border: 2px dashed #b39b73; border-radius: 4px; cursor: grab; user-select: none; touch-action: none; background: #fff1d8; }
+.inv-item-image { display: block; width: 40px; height: 40px; object-fit: contain; image-rendering: pixelated; }
 .wallpaper-swatch { display: block; width: 100%; height: 100%; background-repeat: repeat; background-position: center; image-rendering: pixelated; }
 .drop-retrieve { position: absolute; z-index: 40; bottom: 14px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border: 2px dashed #b4584f; border-radius: 12px; background: rgba(255, 246, 238, .96); color: #8d453c; font-size: 13px; font-weight: 500; white-space: nowrap; pointer-events: none; box-shadow: 0 4px 10px rgba(80, 50, 40, .18); }
 :global(.drag-ghost) { position: fixed; width: 72px; height: 72px; opacity: 0; pointer-events: none; z-index: 999; image-rendering: pixelated; }
@@ -2653,6 +2963,22 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .sidebar { top: 16px; bottom: 16px; }
   .room-tools .camera-hint { display: none; }
 }
+/* 窄一点的宽屏（含 iPad）放不下四个带副标题的按钮＋右侧工具：
+   精简为图标＋主文字，隐藏纯说明性相机提示，避免两组互相压住。
+   左右留白对称后内容区变窄，1280 一档也会挤到重叠，因此上限放到 1400。 */
+@media (min-width: 901px) and (max-width: 1400px) {
+  .actions .action-copy small { display: none; }
+  .actions .pbtn { padding: 6px 10px; gap: 8px; }
+  .action-icon svg { width: 20px; height: 20px; }
+  .room-tools .camera-hint { display: none; }
+}
+/* 刚过 900px 断点时内容区不足约 550px，两组改成上下两行；取景框同步抬高避免压住工具。 */
+@media (min-width: 901px) and (max-width: 980px) {
+  /* 只改共享变量，视口与侧栏的 bottom 一起联动；这里两组是上下两行，需写回各自的 bottom。 */
+  .room { --content-bottom: 150px; }
+  .actions { bottom: 30px; }
+  .room-tools { bottom: 96px; }
+}
 @media (min-width: 600px) and (max-width: 900px) and (max-height: 500px) {
   .room .sidebar.narrow { top: 12px; bottom: calc(90px + env(safe-area-inset-bottom, 0px)); height: auto; max-height: none; }
   .room .actions { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -2690,7 +3016,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .action-copy b { font-size: 13px; }
   .action-copy small { font-size: 10px; }
   .actions .chatbtn { display: flex; }
-  .inv-bar, .scene-viewport .inv-bar { bottom: calc(214px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; width: max-content; max-width: 70vw; }
+  /* 移到陪伴 2×2 按钮上方，避免同 z-index 时被后渲染的 actions 盖住 */
+  .inv-bar, .scene-viewport .inv-bar { bottom: calc(292px + env(safe-area-inset-bottom, 0px)); left: 16px; right: 16px; width: max-content; max-width: calc(100% - 32px); z-index: 19; }
   .sidebar.narrow { top: auto; bottom: calc(90px + env(safe-area-inset-bottom, 0px)); left: 12px; right: 12px; width: auto; height: calc(100dvh - 180px); max-height: 70dvh; display: none; gap: 0; }
   .sidebar.narrow.open { display: flex; }
   .sidebar.narrow .panel { flex: 1 1 0; max-height: none; }

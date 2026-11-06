@@ -89,6 +89,7 @@ const emptyMessage = computed(() => {
                 class="shop-wallpaper"
                 :style="wallStyle(item.builtin || item.key === 'wall-default' ? '' : item.key, 64)"
               ></span>
+              <img v-else-if="String(display.icon).startsWith('/')" class="shop-item-image" :src="display.icon" alt="">
               <PixelItem v-else :item-key="display.icon" :size="64" />
             </span>
             <div class="shop-card-title">
@@ -317,6 +318,14 @@ const emptyMessage = computed(() => {
   justify-content: center;
   width: 64px;
   min-height: 64px;
+}
+
+.shop-item-image {
+  display: block;
+  width: 64px;
+  height: 64px;
+  object-fit: contain;
+  image-rendering: pixelated;
 }
 
 .shop-wallpaper {

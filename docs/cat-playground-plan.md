@@ -587,3 +587,279 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - 本轮改 `room-interaction.js`(新)、`room-interaction.test.js`(新)、`cat-tree-room.js`、`cat-tree-room.test.js`、`KidHome.vue`；**未运行 `frontend/build.sh`、未改 embed、未部署**，线上仍是 21:11 版本。仓库 embed 仍落后于最新源码（差防缩放与本轮房间互动两轮改动），部署前必须重跑 `frontend/build.sh`。
 - 用户随后明确「提交push代码」，本轮改动已提交并推送 origin/main；`backend/.deploy.local` 与 `frontend/dist` 仍被忽略，仓库不含真实部署域名、密钥或账号密码。
 - 自动连玩的次数与时长是随机有界的，真机上不同道具的实际节奏仍需用户试玩确认；25s 兜底保证猫不会一直挂在架上把房间自动行为卡死。
+
+## 二十九、宽屏布局对齐修正（2026年11月5日11:35，本地未发布）
+
+### 用户反馈与实测证据
+
+- 用户附 iPad/宽模式截图反馈「对齐方式很诡异，看着很难看」。用浏览器逐视口实测（CSS px）定位到三处真实错位：
+  | 视口 | 内容区左/右 | `.actions` 左 | 偏差 | 底部两组 |
+  |---|---|---|---|---|
+  | 1024×768 | 72 / 676 | **24** | 48px | **重叠 74px**（聊聊天 411–554 vs 信箱 409–483） |
+  | 1180×820 | 83 / 832 | 24 | 59px | 仅剩 11px 间隙 |
+  | 1280×800 | 90 / 932 | 24 | 66px | 间隔 111px 但上下不齐 |
+  | 1920×1080 | 132 / 1572 | 24 | 108px | 视口被 `max-width:1280` 截到 1412，比标题卡窄 160px |
+- 根因：宽屏用了两套坐标系——`.room-header` / `.scene-viewport` / `.room-tools` / `.sidebar` 统一 `left: clamp(68px,7vw,132px)` + `right:348px`；左下 `.actions` 却 `left:24px`、`.inv-bar` `left:40px` 贴屏幕边；右下 `.room-tools` 固定约 267px 右对齐，视口越窄越往左，撞上固定约 530px 的左按钮组。
+- 用户「好」确认按方案 A+C：底部统一工具栏 + 超宽屏一起收口；侧栏 `top:106` 比视口 `top:112` 高 6px 按建议保留，截图最左蓝色圆钮非页面 DOM 元素、不动。
+
+### 实现（只改 `KidHome.vue` 的 CSS，不动模板）
+
+- 评估后**没有包一层模板容器**：`.room-tools` 与 `.actions` 中间隔着状态层/物品栏，包层会牵动 900px 以下的移动端两行布局。改为让两个兄弟层都锚到同一内容区，按钮分别靠左右两端，视觉等价一条统一工具栏，且移动端规则零改动。
+- `.room` 新增共享变量 `--content-left: clamp(68px,7vw,132px)`、`--content-max: 1280px`；`.room-header` / `.scene-viewport` / `.actions` / `.room-tools` 统一 `left: var(--content-left); right: var(--sidebar-gap); max-width: var(--content-max); margin-inline: auto`，超宽屏所有区块一起居中，不再出现视口单独被截断；`.inv-bar` 的 left 也对齐。
+- `.actions` 保持 flex 默认靠左、`.room-tools` 加 `justify-content: flex-end` 靠右；`.actions` 不显式写 `justify-content`，避免影响移动端 `display:grid` 的两列分布。
+- 空间适配：`@media (min-width:901px) and (max-width:1200px)` 隐藏按钮副标题与纯说明性相机提示、收紧 padding/图标；`@media (min-width:901px) and (max-width:980px)`（刚过断点、内容区不足约 550px）把两组改成上下两行并把 `.scene-viewport` 的 `bottom` 抬到 150px，避免压住工具。`@media (max-width:900px)` 原有规则完全未改，陪伴操作默认收起、四项导航、2×2 展开网格保持原样。
+
+### 验证证据
+
+- 240/240 单测、`npm run build`、`git diff --check` 通过（纯 CSS 改动，SFC 编译与现有断言不受影响）。
+- 12 个视口实测（901/1024/1180/1200/1280/1440/1600/1920 宽屏 + 900/844×390/390/320 窄屏，窄屏另测陪伴展开态）：宽屏四个区块左右边缘**差 0**；1024 两组间隔从 −74px 变 **+60px**，其余宽屏 +46～+483px，全部 `overlap=False`；1920 一起居中到 **212–1492**；全部无页面溢出、无运行时错误。窄屏展开态 2×2 网格完整、不与工具/导航重叠。
+- 截图逐张确认 1024 iPad、1920 超宽屏、390×844 与 320×568 展开态：标题卡/视口/底部按钮对齐，超宽屏左右留白对称，手机网格无裁切。
+
+### 边界
+
+- 移动端工具条里「相机提示」文字在 320/390 小屏仍会把「回猫」按钮挤到只剩图标，属**既有**问题，本轮只授权改宽屏，未擅自扩大范围。
+- 本轮只改 `KidHome.vue` 的 CSS；**未运行 `frontend/build.sh`、未改 embed、未部署、未commit、未push**，线上仍是 21:11 版。仓库 embed 仍落后最新源码（防缩放、房间互动、本轮布局共三轮），部署前必须重跑 `frontend/build.sh`。
+
+## 三十、宽屏侧栏与垂直节奏对齐（方案 A，2026年11月5日14:28，本地未发布）
+
+### 用户反馈与拍板
+
+- 用户附截图反馈「还是没对齐呢，右侧的栏目对齐很奇怪，最底部也感觉过长」。第二十九节只修了底部左侧按钮组，右侧栏与垂直节奏完全没动。
+- 按用户截图尺寸 1080×675 实测（CSS px）：标题卡 76–732 / 20–92，房间视口 76–732 / **112–543**，右侧栏 756–1056 / **106–651**，底部按钮工具 76–732 / 593–645。三处错位叠加：侧栏顶部差 6px、底部比视口**长 108px**；面板被 `flex:1` 拉到 495px 却只有「今天没有任务」一行；左右留白 76 vs 24；视口底 543 到按钮组顶 593 有 50px 花园带。页面无溢出（`scrollH=innerH`），不是内容被裁。
+- 用户「A」拍板 1+2+3+4 全做：①侧栏与视口共用上下边界；②左右留白对称；③花园带收紧；④空态面板不强行拉满、保留商店滚动结构（按确认：只做空态收短，flex 滚动结构不动）。
+
+### 实现（仍只改 `KidHome.vue` 的 CSS，不动模板、不动 900px 以下规则）
+
+- `.room` 抽共享变量：`--content-left`（左缩进，同时作为右侧留白）、`--content-gap:24px`、`--sidebar-gap: calc(content-left + sidebar-width + content-gap)`、`--content-top: clamp(112px,14vh,152px)`、`--content-bottom: 108px`。`.scene-viewport` / `.sidebar` / `.room-header` / `.actions` / `.room-tools` / `.inv-bar` 全部引用同一组变量，以后不会再各自漂移。
+- `.sidebar` 改为 `top: var(--content-top); right: var(--content-left); bottom: var(--content-bottom)`，与视口并排等高、左右对称；补 `max-height: 720px` 与视口同上限。`@media (min-width:901px) and (max-width:980px)` 只重定义 `--content-bottom: 150px`，让视口与侧栏 bottom 一起联动；矮屏（高<599px）原有「侧栏 16/16 全高」规则保留不动。
+- 底部工具栏不再贴屏幕底：`.room` 派生 `--card-height`（`min(720px, 100dvh − top − bottom)`）、`--card-gap`、`--actions-bottom`、`--tools-bottom`，让按钮与工具紧贴卡片底边。普通视口算出来仍是原来的 30px / 38px，只有超高屏（视口被 720 上限截住）才自动上移，花园带 127→26px；901–980 两行布局的 bottom 写回 30/96。
+- 第 4 点用 `.sidebar .panel:has(.panel-body > .empty:only-child) { flex: 0 1 auto }`：只有一行空态时面板按内容收短；有内容的任务/愿望/商店面板仍 `flex:1` 且 `panel-body` 滚动不变。项目已有 `.room:has(.place-banner)` 先例。
+- **实施中发现并一并修正两处**：左右对称后内容区窄约 50px，1280×800 带副标题的 4 键(529px)＋工具组(267px) 超出 776px 内容区，产生**本轮新重叠 20px**，把按钮精简媒体查询上限 1200→1400px（1401px 起内容区宽 881px，余量 85px）；1920×1080 视口受 `max-height:720` 限制而侧栏没有，底部差 101px，给侧栏补同样上限后齐平。
+
+### 验证证据
+
+- 最终代码重跑：240/240 单测、`npm run build`、`git diff --check` 通过。
+- `/tmp/meow-room-align-a-check.py` 实测 **15 个视口**（901/1024/1080/1180/1200/1280/1440/1600/1920 宽屏 ＋ 1200×400 / 901×560 矮屏 ＋ 900/844×390/390/320 窄屏，窄屏另测陪伴展开态），`FAILURES 0`：共享 top/bottom 变量一致、左右留白差 0、中间间隙 24px（1920 居中后 50px）、底部两组 `overlap=False`、无溢出。1080×675 关键值：左右 **76/76**、侧栏与视口 **112/112 与 567/567**、花园带 **50→26**、空态面板 **495→109px**；1280 底部间隙 **−20→232px**；1920 侧栏底 **972→871** 与视口齐平、花园带 **127→26**。商店页签在 1024/1080/1280/1920 下仍存在可滚动容器且面板不超出侧栏。
+- 截图逐张确认 1080×675、1024×768、1280×800、1920×1080、901×700 两行态、1200×400 矮屏、390×844 与 320×568 展开态：无重叠、无裁切、无溢出；空态面板收短后下方是庭院草地而非大白板。
+
+### 边界
+
+- 只改 `KidHome.vue` 的 CSS；`@media (max-width:900px)` 与侧栏模板结构零改动。320/390 小屏「相机提示」挤压「回猫」只剩图标仍是**既有**问题，未扩大范围。
+- **未运行 `frontend/build.sh`、未改 embed、未部署、未commit、未push**；线上仍是 21:11 版，仓库 embed 落后源码四轮（防缩放、房间互动、宽屏第一版、本轮侧栏对齐），部署前必须重跑 `frontend/build.sh`。
+
+## 三十一、16 款猫窝、随机露出姿态与「猫不再缩小」（2026年11月5日15:35，本地未发布）
+
+### 用户反馈与拍板
+
+- 用户闺女提新需求：按参考图加入更多猫窝，像素化、保留每款特点、按不同价格放像素商店；形状不同要考虑猫进去后的互动效果。
+- 追加：现有猫爬架互动会把猫缩小以适应道具（`TREE_CAT_SIZE=64` vs 地面 110），新窝要避免；每个窝还要随机「有时露头、有时露屁股尾巴」。
+- 最终拍板：①尺寸 A（窝 160／开放垫与半围合 144，洞口放大，猫恒定 110＋前后双片）②美术分级（造型款 35–45 条 path、基础款 20–25 条）③随机＝进窝抽姿态＋停留中 30% 中途翻身 ④价格按族阶梯 ⑤爬架 64px 本轮不碰 ⑥多窝＝不同款可同时摆放。
+
+### 证据链（缩放问题的根因）
+
+- `CatSprite.vue:9,98`：猫精灵 16×12 像素网格按 `size` 整体缩放，默认 **110px**（110×83）。
+- `KidHome.vue:469`：`treeCatSize = treeRendered ? TREE_CAT_SIZE : 110`；`cat-tree-room.js:5` `TREE_CAT_SIZE=64` → 爬架互动时猫缩到 **58%**；`:471` 同步把 `.cat-wrap` 从 `110/-55/-100` 改成 `64/-32/-48`，脚点锚点也换一套；`cat-tree-room.test.js:41` 把这套值锁死。
+- 反向落差：旧猫窝 `scene-art.js:41` `size:96` 比猫还小，`interactWith`(`:753`) 只让猫走到旁边 `±52` 切 `sleep`，压根没「进去」。
+
+### 实现
+
+- 新增 `nest-profiles.js`：`CAT_ROOM_SIZE=110` 单一真源、`CAT_FOOT_OFFSET`、4 形状族的 `FAMILY_REVEALS`（open/rim/cave/tent 各自可用姿态）、`REVEAL_STYLE`（只改 dx/anim/flip，不改尺寸）、16 款配置（family/size/entry/cover/reveals/flipChance）、`pickReveal`（可注入随机加权）、`flipReveal`、`nestCatFoot`、`pickNapNest`。**配置里不含任何缩放字段**，单测逐字段断言。
+- 新增 `nest-sprites.js`：与 `PixelItem.vue` 的 `sprites` 同结构（48×48 整数台阶 path＋10 色阶 palette＋`shadowWidth` 落地阴影），按 4 个族骨架＋16 个特征函数生成；每款拆 `backShapes`/`frontShapes`，`shapes` 是两者拼合。分级（实测条数）：开放垫 11–13（扁垫有意不堆重复纹理）、半围合 21–23、洞穴 32–33、帐篷 34；参数化生成器复用族骨架，条数低于最初按逐款手写估算的 20–25／35–45，但色阶分层、落地阴影、双片结构与爬架一致，且视觉逐款确认。保留参考图特点（白果肉切面/果柄、绿叶黄标签、香蕉绿蒂翻皮、怪兽大眼鹿角粉骨头、帐篷网兜、花瓣顶盖、波点绿提手等）。
+- `PixelItem.vue` 加 `layer` prop（full/back/front）；`layer=front` 不画阴影只画前片。精灵查找合并 `NEST_SPRITES`。
+- `KidHome.vue`：`treeCatSize` 地面值改用 `CAT_ROOM_SIZE`；`.scene-item` 对新窝渲染 `layer=back`，新增常驻 `.nest-front` 层（`zIndex=11+floor(y)`，高于猫）渲染 `layer=front`；开放垫 `cover='none'` 不渲染前片。`enterNest()` 按配置抽姿态、走到 `nestCatFoot`、切 `catAnim`/`flipped`，停留中按 `flipChance` 翻身（`nest-wiggle` 用独立 `translate` 动画，不覆盖 `flip` 的 `scaleX(-1)`）。`interactWith`/点击白名单/`playables` 改配置驱动；自主睡觉从**所有已摆放的窝**随机挑一个，不再 `.find('nest')`。
+- `scene-art.js` / `shop-display.js` 从配置表生成 16 款 `DECOR_ART` 与商店描述；`backend/internal/api/api_wish.go` 的 `ITEM_REGISTRY` 加 16 款，价格 25–48 按族阶梯，原窝 30／爬架 50 不动。后端无 DDL、无新接口。
+- `cat-tree-room.test.js` 的 SFC harness 注入 `nest-profiles.js`（否则编译后的 setup 拿不到 `CAT_ROOM_SIZE`、模板拿不到 `isNest`）。
+
+### 验证证据
+
+- 新增 `nest-profiles.test.js` 10 项：配置完整性、**无任何缩放字段**、按族限定姿态、加权抽取边界、翻身换姿态、脚点只含位置朝向、多窝随机挑、16 款精灵结构（色阶/阴影/双片/整数台阶 path）、分级细节量、前后端 16 key 与价格对齐。全量 **250/250** 单测通过；`npm run build`、`go build ./...`、`git diff --check` 通过。
+- 本地浏览器（`/tmp/meow-nest-acceptance.py`，浏览器层拦截 `/api/*` 注入假数据，绕开占用 8600 的本地 Go 后端）：**5 视口**（1280/1024/1920/390/320，含手机展开态）`FAILURES 0`——4 个不同款窝同时在场、3 层前片（开放垫无前片）、`CatSprite width=110` 且点击进窝后仍是 110、商店页签含全部 16 款名称、无页面报错、无溢出。
+- 独立精灵预览（16 款 SVG 网格截图）逐款确认形状与辨识配件。首轮发现洞口被特征大色块盖住（苹果/番茄只剩一条横杠），已修：前片下沿下移、去掉覆盖洞口的大块，复看后洞口清楚。**（此处原记录有误：当时把房间截图里的棕色大方框误判为「房间自带柜子背景」，实为 PixelItem 的 front 层误入小鱼挂画分支，见第三十二节。）**
+
+### 边界
+
+- 本轮**未运行 `frontend/build.sh`、未改 embed、未部署、未commit、未push**；线上仍是 21:11 版，仓库 embed 落后源码五轮，部署前必须重跑 `frontend/build.sh`。
+- 爬架 64px 缩放按拍板本轮不碰；真机 iPad Safari 的随机姿态观感、孩子试玩节奏仍待确认。
+- 320/390 小屏相机提示挤压「回猫」按钮仍是既有问题，未扩大范围。
+
+## 三十二、本地部署后用户实测发现两处 bug（2026年11月5日16:00，已修）
+
+### 用户反馈
+
+- 竖屏购买完点「摆放」，弹出来的是陪伴 2×2 操作，而不是物品栏。
+- 宽屏猫窝「左边三个像悬空，右边两个莫名其妙有个大方块，跟你展示的样子完全不一样」，并质问验收怎么做的。
+
+### 根因（本地真实环境复现，非猜测）
+
+- **大方块**：改 `PixelItem.vue` 时把落地阴影的 `v-if` 收窄成 `itemKey !== 'fish' && layer !== 'front'`，却**漏改了配对的 `<g v-else>`**。`layer="front"` 时条件为假 → 走进「小鱼挂画」分支，画出 `#78533d` 棕底 + `#d6e2d6` 淡青矩形 + `#d3af7b` 棕边的方框。DOM 探针实锤：修复前 `.nest-front` 第一个 fill 正是 `#d3af7b`。这块矩形又盖住猫窝下半截，造成「悬空」。**一个 bug 解释了两个现象**。
+- **物品栏被盖**：`toolsOpen` 一个开关同时控制「陪伴」`.actions` 和「物品栏」`.inv-bar`；`shopAction` 的窄屏摆放分支只设 `toolsOpen=true`。实测两者 `top` 同为 566、`z-index` 同为 17，`.actions` 在 DOM 中更靠后 → 完全盖住物品栏。另外「摆放」语义本来就该展开物品栏，不该弹陪伴按钮。
+- **验收失职**：此前只断言 DOM 里的 path 数量/层数/猫宽 110，没有逐像素比对渲染结果，且把截图里的大方框主观解释成房间背景家具并写进主档。已修正该错误记录。
+
+### 修复
+
+- `PixelItem.vue`：`<g v-else>` → `<g v-else-if="props.itemKey === 'fish'">`，front 层只画 `frontShapes`。
+- `KidHome.vue`：新增 `invOpen` 独立开关；点「摆放」时 `sheet='' ; invOpen=true ; toolsOpen=false`；`openSheet`/`toggleCompanion`/`onRoomTap` 同步收起 `invOpen`；`.inv-bar` 的 `v-if` 加入 `invOpen`；移动端物品栏上移到 `bottom: calc(292px + env(...))`、`max-width: calc(100% - 32px)`、`z-index:19`，与陪伴按钮错开。
+- 回归断言：`nest-profiles.test.js` 新增 2 项（front 层不得用裸 `v-else`、窄屏摆放只开物品栏）；`/tmp/meow-nest-acceptance.py` 的探针增加 `rects`/`fills`，断言前片不含 fish 分支四色且 `rects===0`。
+
+### 验证
+
+- 全量 **252/252** 单测、`npm run build`、`git diff --check` 通过。
+- 5 视口端到端 `FAILURES 0`（含新 `noFishRect`/`frontNoRects` 断言）；竖屏点摆放实测：`.inv-bar` `t=488 z=19 可见`、`.actions display:none`、4 个物品图标、无报错。
+- 修复后截图逐张确认：棕色大方块消失，红苹果为完整圆形带洞口与绿柄，4 个窝都有落地阴影且贴地不再悬空；竖屏物品栏清楚可见，底部导航与工具条完整。
+
+### 边界
+
+- 仅修上述两处；本地后端仍为 15:44 编译的二进制（含 16 款商品），**未重新部署线上、未提交、未 push、未改 embed**。
+- 左侧一个窝在截图里被视口边缘裁切，是用户拖动摆放位置，非渲染缺陷。
+
+## 三十三、猫窝贴地与「猫真的在洞口里」（2026年11月5日16:30，已修）
+
+### 用户第三轮反馈
+
+- 「所有的猫窝都跟悬空一样放在地上」「猫咪互动猫咪完全被遮挡在了猫窝后面」「你自己截图验证一下好吗」。
+
+### 根因
+
+- **悬空**：`PixelItem.vue` 的通用 `shadowPath` 在画布 y44–48，而猫窝精灵底边只到约 y42，中间露出一截地板色，形成「窝浮在独立椭圆阴影上方」的观感。
+- **猫被完全遮挡**：`decorDepth(it)=10+floor(it.y)` 给窝 back 层；进窝时 `nestCatFoot` 把猫脚点设为 `it.y-30`，于是 `catDepth=10+floor(it.y-30)` **低于 back 层**。虽然设计了 back/front 双片，但猫实际落在 back 后面 → 整只被挡。DOM 实测修复前 `catZ=600`、进窝后 `catZ=498`，而 back=497/front=499 是修复后才成立的。
+- 此外 cave 族的 `frontShapes` 只有洞口下沿，没有洞口四周的正面框，无法把猫限制在洞口里。
+
+### 修复
+
+- `KidHome.vue` 新增 `nestActive` ref；进窝时 `catDepth = 11 + floor(nest.y)`，`.nest-front` 提到 `12 + floor(it.y)`，back 保持 `10 + floor(it.y)` → 严格 `back < cat < front`。会话结束 `cancelNest()` 还原层级与裁切，避免猫走到别处仍挂在窝的 zIndex。
+- `nest-sprites.js` 的 `buildSprite` 给每款 back 最底层加一条 `S` 色接触带延伸到 y48，与落地阴影连成一体；cave 族 `front` 增加洞口上沿、左右柱的正面框，猫只能从 `x12..36 / y21..36` 露出。
+- **随机姿态方案迭代**（三次试错，均有截图）：①按上下 `clip-path` 分段 → 猫 `sleep/crouch` 帧内容集中在 y5..11，上半裁切把猫裁没了；②按左右固定裁切 → 与正面框叠加后洞口只剩一条细线；③放大 `dx` 位移不裁切 → 猫从窝侧面露到框外。最终采用 **按洞口相对猫的边界动态计算 `inset()`**：洞口约 60px、猫 110px，中心重合时左右各留 25px，`dx` 位移后窗口随之左右移动，`clip = inset(30px max(0,25+dx)px 0 max(0,25-dx)px)`。`head(dx=+38)` 露出左半的头/眼睛，`butt/tail(dx<0)` 露出右半的身体尾巴，猫不会溢出窝体。开放垫 `cover=none` 不裁切。
+
+### 验证（这次全部按真实截图比对）
+
+- 全量 **253/253** 单测（新增/更新：三层严格递增、接触带延伸到 y48、洞口正面框、姿态位移与裁切窗口互不相同）、`npm run build`、`git diff --check` 通过。
+- 真实本地环境点击红苹果窝的连续截图（`/tmp/meow-interact-check.py`）：`back=497 < cat=498 < front=499`，洞口里能看到橘猫的头与绿眼睛；窝底深色接触带与阴影相连，不再悬空。
+- 固定随机源分别抽 `head`/`butt`/`tail` 各截图一张（`add_init_script` 覆盖 `Math.random`）：三张 clip 值与露出范围不同，`butt` 只露一小块身体且**没有猫露到窝外**。
+- 5 视口端到端 `FAILURES 0`、竖屏点摆放物品栏 `t=488 z=19` 可见、陪伴按钮 `display:none`。
+
+### 已知局限与边界
+
+- 猫精灵是 16×12 低分辨率帧表，「露头 / 露屁股尾巴」靠同一帧的左右段落区分，观感有限；若要更拟人化，需要给 `CatSprite.vue` 增加专门的探头/尾巴帧（会引入新帧表，本轮未做，待用户拍板）。
+- 仅本地修复，**未重新部署线上、未提交/push、未改 embed**；本地后端仍是 15:44 编译的二进制。
+
+## 三十四、16 款猫窝方案作废，改接切面苹果确认稿单款（2026年11月5日17:35，本地未发布）
+
+### 用户拍板
+
+- 先用清单核对「别删错」：`ITEM_REGISTRY` 16 款（nest-cloud…nest-house，25–48 星）全是未提交改动；`KidHome.vue` 同一批改动里还混着宽屏响应式 CSS（第二十九/三十节）与 `invOpen` 窄屏物品栏修复（第三十二节），**不能整文件回退**。
+- 「按你说的改」＝按推荐项执行：🅰 保留精简进窝骨架（不做随机姿态）、① 复用 `nest-apple` 并改名「切面苹果窝」／40 星、③ 工作区美术原档目录保留、④ 主档只增量记本节，第三十一/三十三节作为历史记录保留但方案作废。
+
+### 实现
+
+- 删除 `frontend/src/nest-profiles.js`、`nest-sprites.js`、`nest-profiles.test.js`；整文件回退 `PixelItem.vue`（去掉 `layer` prop 与 `NEST_SPRITES`）、`cat-tree-room.test.js`（去掉 nestProfiles 注入）；`api_wish.go` 的 16 款注册收敛为 `nest` + `nest-apple` 两条；`scene-art.js` / `shop-display.js` 从动态生成改回静态表。
+- **保留未动**：`KidHome.vue` 的 `--content-left` 等共享变量与 901–1400 / 901–980 媒体查询、空态面板收短、`invOpen` 及 `.inv-bar` 上移 `z-index:19`、旧 `nest` 的 sleep 分支、爬架 64px 缩放、第二十九/三十节与第三十二节的 invOpen 记录。
+- 苹果确认稿素材（与 `cat-nest-layer-check/back.png`、`cat-nest-skill-demo` 两份 md5 一致）拷为 `frontend/public/art/nest-apple.png`（939×783 完整/背片）与 `nest-apple-front.png`（透明前片）。`DECOR_ART` 注册 `size:240`；`SHOP_DISPLAY` 单条描述去掉「随机露屁股尾巴」，`getShopDisplay` 允许 `config.icon`，`PixelShop.vue` 对 URL 型图标走 `<img>` 64px。
+- `KidHome.vue` 的 `.scene-item` 与 `.nest-front` 改渲染 PNG 双片，`appleFronts` 只认这一款；`appleNestFoot()` 按 demo 的 `scale = 240/939` 把洞口软垫脚点（490/565）换算到世界坐标；`enterNest()` 固定 `sleep` 帧、无 `clipPath`／翻身／`nest-wiggle`，`cancelNest()` 同时挂在卸载钩子上；`treeCatSize` 地面值回写 `110`。三层 Z 序仍是 `back(10+y) < cat(11+y) < front(12+y)`。
+- 新增 `apple-nest.test.js` 7 项：前后端 key/名/价一致、PNG 图标与描述、双片素材尺寸、双片渲染与三层 Z 序、固定趴睡且猫恒 110、抢占/卸载清理、配套文件已删且布局标记未丢。
+
+### 验证
+
+- **247/247** 单测、`npm run build`、`go build ./...`、`git diff --check` 通过。
+- 浏览器真实渲染 5 视口（1280×800 / 1024×768 / 1920×1080 / 390×844 / 320×568，手机另测陪伴展开态与商店页签）`FAILURES 0`：双片 PNG 均加载 939×783、两层 box 完全重合、宽 240、无页面溢出/报错；商店含「切面苹果窝 / 40 星星」且 16 款旧名称全无；点击进窝后 `catZ=631` 夹在 `630/632` 之间、猫宽仍 110、精灵为 sleep 帧。截图逐张确认：商店卡片图标为清晰的切面苹果 PNG、进窝时猫头与黄眼露在洞口、窝完整贴地无棕色大方块、超宽屏与手机导航/陪伴 2×2 无重叠裁切。
+- 截图路径：`/Users/yangyong/WorkBuddy/2026-10-28-15-18-39/apple-nest-check/`。空闲截图里猫被窝挡住是假数据把窝放在 `y=620`、按地面锚点透视本就该挡住 `y=590` 的猫，非渲染缺陷。
+
+### 边界
+
+- 16 款从未提交/部署，线上无影响；本地若已买过旧款，删注册后旧记录会兜底成「像素装饰 + 礼物图标」，需手动收回或清本地测试数据，未加兼容层。
+- **未运行 `frontend/build.sh`、未改 embed、未部署、未 commit、未 push**；线上仍是 21:11 版，仓库 embed 落后源码多轮，部署前必须重跑 build.sh。工作区美术原档（`cat-nest-skill-demo/`、`cat-nest-layer-check/`、`cat-nest-skill-check/`、`meowquest-cat-nest-design/` 与 ZIP）保留在仓库外。
+
+### 追加修复（18:22）：补齐 demo 进场逻辑与窝内气泡
+
+- 用户指出上一版只搬了「趴睡结果」，没搬进窝方式：猫一路夹在前后片之间、斜插到软垫脚点，看着像慢慢穿模；且窝里 `say()` 气泡压在苹果窝上。
+- 逐行对照 demo 的 `play()` / `settle()` / `localFoot()` 与舞台层级（`back z1` / `cat-plane z2` / `front z3` / `walker z4`），确认漏了三件事：①走路猫必须在**最高层**并走**地板线** `groundY = 窝底 − 83`，到洞口才切成窝内猫；②从洞口左 170px 起、`scaleX(-1)` 朝右、1.35s 匀速、180ms 交替 `walkA/walkB`；③走路阶段不弹气泡。
+- 实现：新增 `nestWalking`（走路阶段 `z=13+y`，高于前片 `12+y`）与 `nestActive`（窝内 `11+y`）；`enterNest()` 改三段 —— 当前位置 → 洞口左 170px 地板点（通用 `walkTo`）→ 1.35s 匀速入洞口（`speed: 170/1.35`，`CatSprite` 自动 180ms 交替帧，向右走 `flipped=true`）→ 关掉 transition 瞬移到软垫脚点、切 `sleep`、降层级被前片遮住身体。`cancelNest()` 在走路阶段补 `interrupt()` 与清 transition。`walkTo` 新增 `opts.keepCamera`，进窝两段禁用相机跟随（demo 是固定舞台镜头），顺带避免 320 小屏把窝和气泡挤出视口。
+- 气泡按用户建议「移动位置」：进窝时不渲染普通 `.bubble`，改用独立 `.nest-bubble` 层，`top = 窝锚点 − 窝高 − 10`、`translate(-50%,-100%)`、`zIndex = 13 + floor(y)`；气泡整体落在窝顶上方且高于前片，既不压窝也不会被前片裁掉。
+- 验证：**249/249** 单测（新增 3 项：三段进场与固定镜头、气泡独立层、几何断言）、`npm run build`、`go build ./...`、`git diff --check`；浏览器时间线探针 `CHECKS 全 true`：`walk z=633 > front 632`、walk 帧 `minY=0`、朝右 `flip=true`，`inside z=631`、sleep 帧 `minY=5`、猫宽恒 110；气泡 box 底 ≤ 窝顶且 `z=633 > 632`。桌面走路/进窝、390 与 320 小屏逐张截图确认猫头黄眼露在洞口、气泡「呼…呼…」在窝顶上方不压窝、320 小屏窝与气泡均无裁切。切换瞬间会有一帧过渡，稳定态正确，与 demo 的 `settle()` 瞬间切换一致。
+
+## 三十五、19:04 发布与 19:1x 阴影补漏、全量自检
+
+### 发布（19:04，用户「发布一下我看看」明确授权）
+
+- 沿用原站点、服务器、认证、配置与数据库，不新建分享应用、不接额外云服务、不 commit/push。上线范围是 11/4 21:11 之后累计 8 轮本地改动（防缩放、房间互动最短路、iPad 宽屏两轮对齐、invOpen、苹果窝与进场/气泡修复），源码只有一份工作区，无法只挑单款上线。
+- 发布前：249/249 单测、`frontend/build.sh` 重建并同步 embed（`index-nleku4QS.js` / `index-6wIUPVKQ.css`）、`go build ./...`、`git diff --check` 通过；敏感信息扫描确认真实部署配置仍在 gitignore 的 `backend/.deploy.local`。
+- 部署前备份 `/home/ubuntu/meowquest/backup-apple-nest-20261105_190415/`：旧二进制 SHA `45e93565…`（与 21:11 版一致）、`database.dump` 67191B、`pg_restore -l` 185 行 TOC 可读。
+- 19:04:52 systemd 重启 active，首页 200，启动日志无错误。线上二进制 SHA `a4936e41…` 与本地 release 一致；线上 `index.html`、js、css、`nest-apple.png`、`nest-apple-front.png` 与本地 embed 逐字节相同。业务指纹发布前后均 `4|160|489|1|11|269|14|10`。
+- **本次发布不含下面的阴影修复**；线上 CSS 无 `.nest-shade`。
+
+### 用户反馈与逐项自检（19:1x）
+
+用户指出「从 demo 搬过来又漏了窝底阴影，显得很假」，要求自行全面检查。逐行对照确认稿 `meowquest-cat-nest-design/assets/approved-apple/demo.html` 的样式与 `play()/settle()/localFoot()`：
+
+| demo 要素 | 结论 |
+|---|---|
+| `.shade` 窝底椭圆投影（220×13、`#886747`、opacity .28、底边比窝底低 5px、压窝体下层） | ❌ **漏搬**，即「显得很假」的根因 |
+| `Math.max(6, target-170)` 走路起点左边界保护 | ❌ **漏搬**，窝贴世界左边缘时猫会走出可见区 |
+| 三层 z back1/cat2/front3 + walker4 | ✅ 已搬 `9+y 阴影 < 10+y back < 11+y 窝内猫 < 12+y front < 13+y 走路猫` |
+| 窝 240×200.13、939×783 双片、pixelated、猫恒 110×83、固定 sleep 无翻身 | ✅ |
+| `localFoot` 490/565 换算、`groundY = 窝底 − 83`（游戏 `it.y+17`） | ✅ |
+| 三段进场、1.35s `linear`、180ms 交替 walk 帧、朝右 `scaleX(-1)`、到洞口瞬切 | ✅ `walkTo` 确为 linear，`CatSprite.vue:58` 为 180ms |
+| 猫 sprite `drop-shadow(2px 2px 0 …)` | ✅ `CatSprite.vue:99` 已有 |
+| `cat-plane overflow:hidden` 保底裁切 | ⚠️ 未搬，靠前片遮挡；浏览器实测窝内猫 box 未越出窝体，暂不加裁切容器 |
+| 舞台墙/地板/踢脚线、baseline 对照猫、品种切换、按钮 | ✅ demo 展示件，游戏有等价物，合理不搬 |
+
+- 修复①：新增 `.nest-shade` 层（`appleNests` 复用筛选，阴影与前片同源），`left=it.x`、`top=it.y+5`、`zIndex=9+floor(y)`，几何与层级严格按 demo。demo 是纯色地板，游戏是木纹地板（纹理明暗 ±20 会吃掉浅影），实测原参数阴影区 RGB 191/143/90 与地板 212/159/97 仅差 ~20，几乎看不见；故按等效贴地观感加深为 `#5b3d22/.45` 并 `blur(2px)`，加深后阴影中心 157/114/68，与地板差 ~45，几何与层级不变。
+- 修复②：`enterNest()` 加 `approachX = Math.max(55, pad.x-170)`（猫半宽 55 保证整只可见）与 `walkDist = Math.max(1, pad.x-approachX)` 兜底，入场 `speed = walkDist/1.35` 保持 1.35s 匀速。
+- 验证：**251/251** 单测（新增阴影层、猫投影、clamp 共 2 项）、`npm run build`、`go build ./...`、`git diff --check` 通过。浏览器全场景 `FAILURES 0`：空窝/走路/窝内时间线、单窝与双窝、可见靠左窝与贴世界左边缘极端值、1280/1024/1920/390/320 五视口、320 手机展开态、商店卡片；断言覆盖阴影尺寸/颜色/居中/低于窝底且低于前片、猫恒 110、走路 `z=633>front 632`、窝内 `z=631` 且不越出窝体、气泡在窝顶、无 pageerror 与业务 POST。截图逐张查看，目录 `/Users/yangyong/WorkBuddy/2026-10-28-15-18-39/apple-nest-shade-check/`。
+- 自检另发现未处理项：线上两张 PNG 各 624KB，直连约 5.8s，首屏窝出现偏慢（上一轮线上验收实测 `complete:false/naturalWidth:0`）；是否压缩或转 WebP 需用户拍板，本轮未改素材。
+- **19:23 发布（用户明确「不用备份老的服务，直接发」）**：重跑 `frontend/build.sh` 重建 embed → `backend/deploy.sh` 替换重启，跳过旧二进制与数据库备份。新产物 `index-B-gu7ENf.js` / `index-BHkdKDT5.css`；线上 CSS 已含 `.nest-shade`，两张 PNG 均 200（624049B / 624369B）；线上二进制 SHA `4638f47d…` 与本地 release 逐字节一致，systemd active、首页 200。线上真实 bundle 浏览器实测：阴影 1 层 `z=629` < back 630 < 窝内猫 631 < 前片 632，色值 `rgb(91,61,34)/.45/blur(2px)`，阴影中心 RGB 164/119/72 对地板 211/157/96 差 ~47；双片 939×783 全部 `complete && naturalWidth>0`；进窝后猫头黄眼露在洞口、气泡 box `[437,338,511,374]` 在窝顶 384 之上不压窝；无 pageerror。截图目录 `/Users/yangyong/WorkBuddy/2026-10-28-15-18-39/apple-nest-live-shade-check/`。**未 commit、未 push**；PNG 首屏加载慢（624KB×2）仍未处理，待拍板。
+
+## 三十六、15 款新猫窝接入（gallery 确认稿，11/06）
+
+- **决策**：用户拍板「1.A 全 16 款 / 2.A 授权压缩 / 3.苹果窝维持现状不动 / 4.按建议的 key 与价格」。即新接入 15 款（demo 第 1–14、16 款），第 15 款 `cut-apple` 对应线上已有的 `nest-apple`，**旧素材、旧三段沿地板进场、CSS 椭圆阴影、旧气泡高度全部原样保留**，两套链路互不干扰。
+- **权威版本**：只认 `cat-nest-gallery-fixed/index.html`（SHA `818a959f…`，`jump-check/verify.cjs` 398 检查 0 失败）；`approved-apple/`、`approved-monster/` 单款 demo 是上一代沿地板走+CSS 椭圆影，照搬会回到老问题。
+- **素材压缩**：从 34.2MB 的 gallery assets 提取 15 款 back/front/shadow，用 Pillow FASTOCTREE 256 色 RGBA 量化（保留 alpha 0–255、分辨率不变，目视并排对比轮廓/颜色无损），back+front **20.8MB → 1.96MB**，另生成 64px 缩略图；`frontend/public/art/nests/` 共 60 文件、2.4MB。商店只用缩略图，房间按需加载。
+- **实现**：新增 `frontend/src/nest-catalog.js`（15 款 display/sprite/catCenter/opening/rim/价格 + 纯函数 `nestRoute` / `nestFlightPoint` / `nestLandingPoint` / `nestOpeningClip` / `nestHandoff` / `nestSleepPos`，数据源 measurements.json，可直接单测）；`api_wish.go` +15 条、`scene-art.js` DECOR_ART +15、`shop-display.js` +15 文案与缩略图图标（`PixelShop.vue` 已支持 URL 图标，未改）；`CatSprite.vue` 加可选 `poseFrame` 单帧 prop（复用已有 crouchA/pounceA/pounceB/walkA/walkB，其它玩法不受影响）。
+- **进窝动画**：`KidHome.vue` 新增独立动画层，按 demo 的 `cat-plane(z2)` + `walker(z4)` 双副本同世界坐标补集 clip：cave/half 用 `opening` 多边形裁窝内猫 + `entered=clamp((p-.58)/.34)` 让头先进入；open 用 `progress≥.64` 越沿后整只交接。七阶段原生 rAF：`walk900 → prepare150(crouchA) → jump(open650/door480, pounceA/B 抛物线) → land220(crouchA) → settle(sleep)`，走路 180ms 交替帧、`direction=1/-1` 决定 flip、起跳点 `clamp(6, WORLD_W-116)`；`keepCamera` 固定镜头。主猫在动画期间 `visibility:hidden`，settle 后切回并置 `z=11+y`。阴影按 demo `.shade` 的 `inset:-8px`（窝 bbox 外扩 8px、`background-size:100% 100%`）、`z=9+y`；层级仍 `9 < 10 < 11 < 12 < 13 + y`。气泡按各款 `display[1]` 算高度。
+- **自检发现并修复**：首轮逐款联系图显示趴睡时猫挂在窝外——`walkTo` 给主猫留着 `left/top` CSS 过渡，settle 直接改 `catPos` 导致猫从起跳点滑过去。已在 `settleNest()` 显式 `catEl.style.transition='none'`（与苹果窝旧链路第三段一致），重拍 15 款全部猫在窝里。
+- **验证**：**258/258** 单测（新增 `nest-catalog.test.js` 7 组：参数与前后端注册、60 张素材、时序常量、两类 route 与抛物线、opening 多边形与补集 clip、模板层级、抢占清理与苹果窝未变；更新 `apple-nest.test.js` 4 条过时断言、`cat-tree-room.test.js` harness 注入 catalog）、`npm run build`、`go build ./...`、`git diff --check` 全过。浏览器 15 款逐款时间线 `FAILURES 0`：全部 6 阶段 + sleep 气泡，无 pageerror；DOM 断言覆盖素材加载、阴影层级与几何、抛物线先升后降、帧名、双副本 clip 互补、猫恒 110、气泡不压窝。阴影 A/B（隐藏阴影层对比）每款 1300–1500 像素受影响、平均差 35–38（苹果窝 CSS 阴影 32.9），差异图为窝底左右渐弱的接触窄带、无脏块。另验 1280/1024/1920/390/320 五视口、320 展开态、商店 16 图标全加载、三窝并存、靠左 `x=360` clamp 进场、`x=120` 极端值不崩、苹果窝旧链路回归（CSS 阴影仍在、无动画层、气泡正常）。截图目录 `/Users/yangyong/WorkBuddy/2026-10-28-15-18-39/nest-gallery-game-check/`（联系图 `contact-1..5.png`、逐款阶段图、视口/商店/多窝/回归图、report.json）。
+- **边界**：`nest-apple` key 未变、线上已购不受影响；新 15 个 key 全新无历史包袱。**未跑 `frontend/build.sh`、未改 embed、未部署、未 commit / push**；线上仍是 19:23 版。用户未授权发布，要上线须重跑 build.sh 同步 embed 再走原流程。
+
+## 三十七、运行时猫窝素材统一压缩（11/06）
+
+- **决策**：用户「号 就按你说的来吧」→ 采纳 A 档：苹果窝双片 256 色量化、保持 939×783 与二值 alpha；新 15 款保持不动（本来就是压缩图）；不加静态缓存头（`public/art` 文件名无内容 hash，长缓存有更新不生效风险，压缩后收益已不明显）。目标是把交互速度优先于源图精度。美术原稿仍在 `meowquest-cat-nest-design/assets/approved-apple/` 与 gallery assets，运行时不再使用；替换前的两张 624KB 原图备份在 `/tmp/meow-apple-orig-backup/`。
+- **逐文件体积变化**（仅 2 改 1 增，其余 66 个文件一字节未动）：`nest-apple.png` 609.4K→**67.4K**、`nest-apple-front.png` 609.7K→**62.3K**、新增 `nest-apple-thumb.png` **7.9K**（64×64 商店图标）。房间双片 1219.2K→129.7K；`public/art` 68 文件 3.66MB→69 文件 2.60MB，最大单文件降到 104.5K。商店 16 卡 718.3K→116.8K，房间摆 1 个苹果窝 1219.2K→129.7K，摆 3 个窝 1550.7K→461.3K；线上单张 624KB 实测 4.515s（TTFB 0.41s），按同带宽压缩后约 0.9s。
+- **改动文件**：`frontend/public/art/` 三张 PNG；`shop-display.js` 苹果窝 icon 改指缩略图；`apple-nest.test.js` 同步 icon 断言并新增「所有猫窝运行时素材都是压缩图」防回归断言（双片 <80K、缩略图 64×64 <12K、15 款 back/front 各 <120K）。**未改** `KidHome.vue`、`nest-catalog.js`、15 款素材、几何/进场链路、`nest-apple` key。
+- **画质证据**：压缩试样按浏览器 240px 显示口径评估，256 色量化渲染平均 RGB 差 1.02–1.24/255、>8 差像素 0.11–0.14%、alpha 差异 0%，放大并排图与 8x 差异热图确认差异只在轮廓抗锯齿边缘、无块状色偏。浏览器 canvas 解码后 alpha 逐像素一致：back 透明 181640 / 不透明 553597 / 半透明 0；front 264981 / 470256 / 0，与原稿完全相同。
+- **验证**：**259/259** 单测（新增 1 条）、`npm run build`、`go build ./...`、`git diff --check` 全过。本地浏览器 `FAILURES 0`：1280/1920/1024/390/320 五视口、320/390 手机展开态、单窝/双窝、走路 `z≥633` 与窝内 `630<z<632`、阴影参数与层级、气泡在窝顶且猫不越窝体、无 pageerror / 无业务 POST；商店 16 张卡片全加载且都是 64px、苹果窝走 `-thumb.png` 不再拉全图；网络实测 `nest-apple.png` 68983B、`nest-apple-front.png` 63839B、thumb 8072B、16 张 thumb 共约 116.8K。压缩前后同场景实拍并排 + 差异热图：窝内部果肉/洞口/阴影纯黑（完全一致），差异只在轮廓细边与猫动画帧。截图目录 `/Users/yangyong/WorkBuddy/2026-10-28-15-18-39/apple-compress-check/`。
+- **本地重新部署（11:5x，用户「我本地服务重新部署下」）**：只更新本地、不碰线上。跑 `frontend/build.sh` 重建 embed（74 文件 3.7MB，含压缩苹果窝三图 + 15 款 60 图），`go build -o /tmp/meowquest-server` 编译本机二进制（SHA `699e7ea…`），停掉旧 PID 48687 后以 `backend/` 为 cwd 重启（自动读 `.env`：PG 5433 / `MEOW_ADDR` 8600），新 PID 17100。**没有执行 `backend/deploy.sh`**（该脚本会 scp 到线上 kiki），线上仍是 19:23 版。
+- **本地 8600 真实 embed 验收**：HTTP 首页 200、`/art/nest-apple.png` 68983B / `front` 63839B / `thumb` 8072B、15 款 back/front/thumb 均 200、`/api/pet` 401 鉴权正常；浏览器 `FAILURES 0`（五视口、320/390 展开态、单/双窝、苹果窝走路与窝内 Z 序、阴影、气泡、商店 16 卡全 64px 且苹果走 thumb、无 pageerror / 无业务 POST）。另抽 cave 款 `nest-tent` 与 open 款 `nest-lace-square` 做进窝 smoke：`walking/anticipating/takeoff/airborne/entering/landing` 阶段齐全、back/front/shadow 三图均 200、阴影层与气泡正常、猫恒 110px、`FAILURES 0`，逐张看图确认猫在窝里。截图 `local-8600-check/`。
+- **边界**：本地 embed 与服务已更新，**线上未部署、未 commit / push**；`git status` 中 `backend/internal/web/dist` 的 D/M/?? 是新旧构建产物差异，发布时随代码一并处理。
+
+## 三十八、室内比例 A+B 落地与验收（11/06，进行中）
+
+- **决策**：用户「那先改AB吧」→ A 改窗户与地板纹理、B 把 16 款窝整体缩到 0.8；C（墙/地板分界线）不碰。
+- **改动**：A 只改 `PixelRoom.vue` 5 个数值（窗 `top:98 left:535 210×196`、地板 `background-size:640px 160px`）；B 改 `nest-catalog.js`（`display`/`catCenter`/`rim` ×0.8，`sprite`/`opening` 保持源图像素坐标，`NEST_FLOOR_OFFSET 75→60`）、`scene-art.js`（240→192 共 15 条、223→178.4）、`KidHome.vue`（`APPLE_NEST_WIDTH 192`、`.nest-shade 176×10.4`）、两个测试断言。猫仍恒 110px，爬架 64px 特例不变。
+- **验证**：**259/259** 单测、`npm run build`、`go build ./...`、`git diff --check` 全过；`frontend/build.sh` 重建 embed（74 文件 3.7MB）、本机重编译并重启 8600（当前 PID 89099，返回 CSS `index-CV2zq1e5.css`，二进制与 dist 均含 A+B 关键值）。浏览器：新窝 smoke `FAILURES 0`、五视口 / 320&390 手机展开态 / 商店 16 卡全部 OK；修掉验收脚本把 CSS `10.4px` 硬比字符串、而浏览器 `getComputedStyle` 返回 `10.3906px` 的误报后，只剩 `single-1280` 的 `catNotOutsideNest` 一条真实失败。截图 `ab-room-check/`、`ab-room-check2/`。
+- **自检发现、待用户拍板（均未擅自改源码）**：
+  1. **窗户贴边**：A 的 `top:98` 是按完整 1280×720 世界画的示意图，但真实相机跟随猫时 `transform: matrix(1,0,0,1,-323.5,-156)`，桌面窗顶距视口上沿仅 62px、窗帘上沿几乎贴住边框，目视像被切头；390 手机实际被裁 36px。用 CSS 注入预览（不改源码）实测：`top:150` 桌面留白 114px / 窗台离地 58px、390 手机裁切 0（留白 16px）；`top:165` 桌面留白 129px / 离地 43px、390 手机留白 31px。两者目视都明显好于现状，**推荐 165**。320 小屏相机 `y=-374.4` 使世界顶部被裁 288px，任何 top 都看不到窗，是原版既有行为，A 未使之恶化。3 视口 × 4 候选截图在 `ab-window-probe/`。
+  2. **B 的猫窝比例副作用**：16 款逐款量化趴睡态，3 款猫 bbox 越出窝 PNG bbox >6px：`nest-apple` 右 9、`nest-knit-drop` 右 12、`nest-dot-u` 上 7。实拍确认 `nest-knit-drop` 尾巴确实露在针织窝右侧外（真穿模），`nest-dot-u` 是 U 型枕上方本来就空（bbox 假越界、视觉正常），苹果窝猫在洞口内仅贴右。修法需拍板：微调这 1–2 款 `catCenter` 落点 / 进窝时缩猫（违背「猫恒 110px」与 demo 参数）/ 放宽 bbox 断言容差接受现状 / 回退 B 缩窝幅度。
+- **边界**：C 未实施；线上仍是 19:23 版，未部署、未 commit / push。
+
+## 三十九、A 修正与 D 进窝缩猫（11/06 13:4x，已验收）
+
+- **决策**：用户拍板「1.按你说的改 / 2.D 吧 进窝的时候缩小下猫」。即窗户按推荐值落地，猫越界用「进窝缩猫」而非挪落点或回退 B。
+- **A 修正**：`PixelRoom.vue` 窗户 `top:98→165`，其余 4 个 A 档数值（left 535 / 210×196 / 地板 `640px 160px`）不动。桌面窗顶留白 129px、窗台离地 43px，窗户完整居中、不再贴视口上沿。
+- **D 实现（渲染层缩放，坐标体系零改动）**：新增 `NEST_CAT_SCALE = 0.8`。B 把窝 240→192，猫同步 110→88，`88/192 === 110/240`，与 demo 的猫/窝比例严格相等，越界靠等比而非挪位置消除。
+  - `nestCatActive = computed(() => Boolean(nestWalking || nestActive || nestEntry))`，覆盖苹果窝全程与新窝起跳后全程；`catRoomStyle` 仅在其为真且非爬架时加 `transform: scale(0.8)`（以元素中心为原点，猫中心不偏移）；爬架 64px、地面 110px 均不变。
+  - `renderNestEntry()` 把 `facing` 与缩放合成一个 transform：`(direction===1 ? 'scaleX(-1) ' : '') + 'scale(0.8)'`，动画层两个副本与趴睡主猫同尺度。
+  - `nest-catalog.js` **一字节未改**：`CAT_W=110` / `CAT_H=83` / `CAT_FOOT_OFFSET=17`、`measurements.json` 派生参数、route / flight / landing / sleep / handoff clip 全部保持 demo 口径；`appleNestFoot` 的 55/17 换算也不用改（缩放以中心为原点）。
+- **验证**：**260/260** 单测（新增 A 档窗户 5 值断言、`NEST_CAT_SCALE` / `nestCatActive` / `transform` / `facing` 防回归断言）、`npm run build`、`go build ./...`、`git diff --check` 全过。`frontend/build.sh` 重建 embed（74 文件，CSS `index-1MgSFNUE.css` 含 `top:165px`），本机二进制 SHA `801b27b4…`，kill 旧 PID 89099 后重启 8600（PID 32220）；首页 200、苹果窝双片 68983B/63839B、thumb 8072B、新窝素材均 200。
+- **浏览器三套验收 `FAILURES 0`**：①五视口 + 320/390 展开态 + 商店 16 卡 + 苹果窝走路与趴睡；新断言 `catGround110`（地面视觉 110、无缩放）、`catScaledInNest` / `catScaledWhileWalking`（视觉 88）、`catNotOutsideNest`、`shadeParams`、`bubbleAboveNest` 全 True。②cave `nest-tent` / open `nest-lace-square` smoke：七/六阶段齐全、`catIs110`（SVG 坐标口径）、`catScaled88`、`entryLayerScaled` 全 True。③16 款趴睡比例复测：`catBoxW=88`，越界 >6px **从 3 款降到 0**；`nest-apple` 9→0、`nest-dot-u` 7→0、`nest-knit-drop` 12→1（仅 1px 边缘，实拍几乎不可见）。截图 `ab-final-check/`，逐张目视确认桌面窗户留白正常、苹果窝/帐篷/针织窝猫比例协调、手机小屏与展开态与商店无重叠溢出、气泡不压窝、阴影仍在。
+- **已知残余（未擅自改）**：390 手机相机 `translate(-523,-220)` 裁掉世界顶部约 220px，窗帘上沿仍有轻微裁切（比 `top:98` 时明显改善，窗台与大部分玻璃可见）；320 小屏看不到窗是相机既有行为。可见墙区只有约 184px 而窗高 196px，单改 `top` 无法两全；要彻底解决需按视口分档改窗高或相机，属新方案，等拍板。桌面主视角完全正常。
+- **边界**：C 未实施；线上仍是 19:23 版，未部署、未 commit / push。
+
+## 四十、物品栏按需展开、真实缩略图与旧数据清理（11/06 14:0x，已验收）
+
+- **决策**：用户「按你的推荐的改」→ 1.A 全平台点摆放才展开 / 2.买完自动展开一次 / 3.① 复用商店缩略图 / 4.清掉旧 16 款残留。
+- **根因**：①`KidHome.vue` 原 `v-if="inventory.length && (!isNarrow || toolsOpen || invOpen)"`，桌面 `!isNarrow` 恒真 → 只要有未摆放道具就常驻；窄屏其实已有 `invOpen` 开关与商店「摆放」触发，桌面没接。②`inv-bar` 用 `<PixelItem :item-key>`，而 `PixelItem.vue` 只内置 `nest/yarn/plant/fish/gift` 五个 sprite，其余商品 key 一律 fallback 礼物盒；商店卡片 `PixelShop.vue:92` 已支持 URL 图标且 `shop-display.js` 为苹果窝 + 15 款新窝配了 64px thumb，物品栏没复用。③查本地库确认房间地板 4 个礼物盒是旧 16 款残留（`scene_item` 4 条 / `owned_item` 7 条），物品栏 2 件恰好是 `nest-apple` + `nest-petal-cylinder`，两款都有现成缩略图。
+- **改动（全在 `KidHome.vue` + 两个测试）**：`v-if` 改 `inventory.length && invOpen`；`shopAction()` 把 `invOpen.value = true` 从 `isNarrow` 分支里提出来（窄屏仍额外关 sheet/toolsOpen）；`buyItem()` 末尾自动展开一次；`onItemPointerDown` 的 `/scene/place` 成功后 `if (!drag.id) invOpen.value = false`（仅从物品栏拖入时收起）。`inv-bar` 每项改用 `getShopDisplay(it.key).icon`：URL 型 `<img class="inv-item-image">`，非 URL 型仍 `<PixelItem>`（新增 import 与 40×40 像素化样式）。收起时机沿用既有 `onRoomTap` 点空白 / `openSheet` / `toggleCompanion`。
+- **范围说明**：方案 ① 不覆盖 `cat-tree`（既无 URL 缩略图也无 PixelItem sprite，仍是礼物图标），补它需新画素材，未按授权范围外扩；`nest/yarn/plant/fish` 仍走像素 sprite，实测新买的 `nest` 显示棕色猫窝而非礼物盒。
+- **数据清理（先备份后精确删）**：全量快照在 `/tmp/meowquest-legacy-backup/scene_item-before-20261106-141051.txt` 与 `owned_item-before-20261106-141051.txt`。单事务按 7 个明确 key（`nest-hex/nest-heart/nest-cloud/nest-quilt/nest-monster/nest-lace/nest-knit`）`DELETE 4`（scene_item）+ `DELETE 7`（owned_item）；删后仅剩 4 个有效 owned 与 2 个有效 scene，**房间 4 个礼物盒消失**。
+- **验证**：**261/261** 单测（新增「物品栏全平台按需展开 + 真实缩略图」断言，`cat-tree-room.test.js` harness 注入 `getShopDisplay`）、`npm run build`、`go build ./...`、`git diff --check` 全过。重建 embed（CSS `index-B2sdBp6w.css` / JS `index-DAT9ann9.js`）、本机二进制 SHA `91e73399…`、kill 32220 后重启 8600。
+- **浏览器**：新写 `/tmp/meow-inventory-check.py` 四视口交互链路 `FAILURES 0`：1280/390/320/1920 常态物品栏隐藏且房间无礼物盒 → 商店点「摆放」展开且两件都是 `-thumb.png`、零礼物 fallback → 点空白收起 → 桌面额外验「购买自动展开（3 件、缩略图保留、无礼物 fallback）」+「拖入房间后 `/scene/place` 发出且物品栏收起」。上一轮猫窝五视口/展开态/商店/苹果窝进窝回归 `FAILURES 0`。逐张看图：桌面常态左下角腾空、展开态两张真实缩略图、买完 3 件、拖完收起、手机常态与展开态均无重叠溢出。截图 `inventory-check/`。
+- **边界**：C 未实施；线上仍是 19:23 版，未部署、未 commit / push。

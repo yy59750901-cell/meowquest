@@ -19,8 +19,8 @@ const wall = computed(() => wallStyle(props.wallpaperKey))
       class="pixel-window"
       src="/art/cottage-window.png"
       alt=""
-      width="162"
-      height="152"
+      width="210"
+      height="196"
       draggable="false"
     >
   </div>
@@ -54,7 +54,7 @@ const wall = computed(() => wallStyle(props.wallpaperKey))
   height: 316px;
   background-image: url('/art/wood-floor.png');
   background-repeat: repeat;
-  background-size: 1280px 320px;
+  background-size: 640px 160px;
   image-rendering: pixelated;
 }
 
@@ -95,11 +95,11 @@ const wall = computed(() => wallStyle(props.wallpaperKey))
 .pixel-window {
   position: absolute;
   z-index: 1;
-  top: 228px;
-  left: 623px;
+  top: 165px;
+  left: 535px;
   display: block;
-  width: 162px;
-  height: 152px;
+  width: 210px;
+  height: 196px;
   image-rendering: pixelated;
 }
 </style>
