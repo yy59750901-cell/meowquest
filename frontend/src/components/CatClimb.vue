@@ -15,13 +15,23 @@ const dialog = ref(null)
 const stage = ref(null)
 const scene = ref(null)
 const playfield = ref(null)
+const steerEl = ref(null)
 const startButton = ref(null)
 const engine = createCatClimbEngine({ seed: 1 })
 const state = shallowRef(engine.snapshot())
 const viewport = shallowRef({ width: 360, height: 560, top: 0, left: 0 })
 const stageSize = shallowRef({ width: 180, height: 280 })
+// 相对摇杆：第一下按住的点就是原点，只看水平位移 dx。
+// 滞回：无方向时要拖过 DEAD_OUT 才出方向；已有方向时要回到 DEAD_IN 内才回正，
+// 避免阈值附近 0/-1/0/-1 抖动（iPad 手指按压形变约 3~6px）。
+const DEAD_IN = 8
+const DEAD_OUT = 14
+const KNOB_RANGE = 20 // 摇杆帽水平限位，手指继续拖帽子也不再跑远
+const NEAR_PAD = 36 // 兜底热区只留方向控件周围一圈，iPad 大屏掌根落在场地中部不再误推猫
 const pointers = new Map()
 const keys = new Set()
+const knob = ref(null) // 摇杆帽：以按下点为圆心，用场地坐标定位
+let knobPointerId = null
 let mounted = false
 let closing = false
 let raf = null
@@ -116,6 +126,11 @@ const viewportStyle = computed(() => ({
 const stageStyle = computed(() => ({ width: `${stageSize.value.width}px`, height: `${stageSize.value.height}px` }))
 const keyDirection = (event) => ({ ArrowLeft: -1, ArrowRight: 1, KeyA: -1, KeyD: 1 }[event.code]
   ?? { ArrowLeft: -1, ArrowRight: 1, a: -1, A: -1, d: 1, D: 1 }[event.key])
+const steerDir = computed(() => knob.value?.dir ?? 0)
+const knobStyle = computed(() => knob.value ? {
+  left: `${knob.value.x}px`, top: `${knob.value.y}px`,
+  '--knob-dx': `${knob.value.dx}px`,
+} : {})
 
 function clockRunning() {
   return mounted && !closing && !document.hidden && state.value.phase === 'running'
@@ -166,6 +181,8 @@ function clearInputs(advance = true) {
   const captures = [...pointers.entries()]
   pointers.clear()
   keys.clear()
+  knob.value = null
+  knobPointerId = null
   state.value = engine.dispatch({ type: 'direction', direction: 0 })
   for (const [id, { element }] of captures) {
     if (element.hasPointerCapture?.(id)) {
@@ -173,13 +190,19 @@ function clearInputs(advance = true) {
     }
   }
 }
-function pointerDown(event, direction) {
+function pointerDown(event) {
   syncClock()
   if (event.button !== 0 || closing || state.value.phase !== 'running') return
   event.preventDefault()
   const element = event.currentTarget
-  pointers.set(event.pointerId, { direction, element })
+  // 按下瞬间方向为 0：任何误触（掌根、第二根手指）都不会立刻推猫，
+  // 只有主动拖出容错区才产生方向；拖回容错区就回正。
+  pointers.set(event.pointerId, {
+    direction: 0, originX: event.clientX, originY: event.clientY, dx: 0, element,
+  })
+  if (knobPointerId === null) knobPointerId = event.pointerId
   try { element.setPointerCapture(event.pointerId) } catch { pointers.delete(event.pointerId) }
+  syncKnob()
   syncDirection()
 }
 function cancelPointer(event) {
@@ -192,13 +215,40 @@ function cancelPointer(event) {
   if (element.hasPointerCapture?.(event.pointerId)) {
     try { element.releasePointerCapture(event.pointerId) } catch { /* 捕获取消与指针结束可同时发生。 */ }
   }
+  syncKnob()
   syncDirection()
 }
-// 按住期间方向只由手指当前 x 决定：以「按下元素的中线」为分界，左半向左、右半向右。
-// 分界线随按下位置固定并延伸到整块场地，手指滑出控件也不会突然反向，不用抬手再按。
-function directionAt(element, clientX) {
-  const r = element.getBoundingClientRect()
-  return clientX < r.left + r.width / 2 ? -1 : 1
+// 按住期间方向只由「相对按下点的水平位移」决定，与落在哪个元素、屏幕绝对 x 无关。
+// 滞回：0 → 有方向要跨过 14px；有方向 → 0 要回到 8px 内，阈值附近不会来回抖。
+function relativeDirection(active) {
+  const dx = active.dx
+  const dead = active.direction === 0 ? DEAD_OUT : DEAD_IN
+  if (Math.abs(dx) <= dead) return 0
+  return dx < 0 ? -1 : 1
+}
+// 兜底热区只保留控件周围一圈，避免 iPad 大屏上手掌/指根落在场地中部产生幽灵方向。
+function nearSteer(clientX, clientY) {
+  const r = steerEl.value?.getBoundingClientRect()
+  if (!r || !r.width) return false
+  return clientX >= r.left - NEAR_PAD && clientX <= r.right + NEAR_PAD
+    && clientY >= r.top - NEAR_PAD && clientY <= r.bottom + NEAR_PAD
+}
+// 摇杆帽跟随第一根方向手指；它抬手后自动切到仍按着的那根。
+function syncKnob() {
+  let active = pointers.get(knobPointerId)
+  if (!active) {
+    const next = pointers.keys().next()
+    knobPointerId = next.done ? null : next.value
+    active = knobPointerId === null ? null : pointers.get(knobPointerId)
+  }
+  const field = playfield.value?.getBoundingClientRect()
+  if (!active || !field) { knob.value = null; return }
+  knob.value = {
+    x: active.originX - field.left,
+    y: active.originY - field.top,
+    dx: Math.max(-KNOB_RANGE, Math.min(KNOB_RANGE, active.dx ?? 0)),
+    dir: active.direction,
+  }
 }
 function pointerMove(event) {
   const active = pointers.get(event.pointerId)
@@ -211,22 +261,24 @@ function pointerMove(event) {
     cancelPointer(event)
     return
   }
-  const direction = directionAt(active.element, event.clientX)
+  active.dx = event.clientX - active.originX
+  const direction = relativeDirection(active)
   if (direction !== active.direction) {
     active.direction = direction
     syncDirection()
   }
+  syncKnob()
 }
-// 兜底热区：舞台左右半屏都能按住控制，孩子按不到方向控件时照样能玩。
+// 控件与「控件附近扩展区」走同一套相对摇杆，不再有两套绝对中线分界。
 function playfieldPointerDown(event) {
   if (event.target?.closest?.('button, .climb-overlay, .climb-controls')) return
+  if (!nearSteer(event.clientX, event.clientY)) return
   const field = playfield.value
   if (!field?.getBoundingClientRect().width) return
-  pointerDown(event, directionAt(field, event.clientX))
+  pointerDown(event)
 }
-// 左下双向控件与兜底热区共用同一套实时判向逻辑。
 function steerDown(event) {
-  pointerDown(event, directionAt(event.currentTarget, event.clientX))
+  pointerDown(event)
 }
 function jumpDown(event) {
   event.preventDefault()
@@ -440,7 +492,7 @@ onBeforeUnmount(() => {
         <span class="climb-surface" :data-surface="state.cat.surface">{{ surfaceShort }}</span>
         <small class="climb-caption">{{ themeLabel }} · {{ difficultyCaption }}</small>
       </div>
-      <span :id="helpId" class="climb-help sr-only">左下控制左右，右下点按跳跃；地面不断上升，别被甩出屏幕。</span>
+      <span :id="helpId" class="climb-help sr-only">左下按住后左右拖动控制方向，拖回中间就停下；右下点按跳跃；地面不断上升，别被甩出屏幕。</span>
       <div class="climb-header-actions">
         <button v-if="state.phase === 'running'" type="button" class="climb-pause" @click="togglePause"><span class="climb-label">暂停</span></button>
       </div>
@@ -507,23 +559,26 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div v-if="state.phase === 'running'" class="climb-controls">
-        <div class="climb-steer" role="group" aria-label="左右移动"
+        <div ref="steerEl" class="climb-steer" :data-dir="steerDir" role="group" aria-label="左右移动"
           @pointerdown.stop="steerDown" @pointermove.stop="pointerMove" @pointerup="cancelPointer"
           @pointercancel="cancelPointer" @lostpointercapture="cancelPointer" @contextmenu.prevent>
-          <svg class="climb-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M30 10 L14 24 L30 38 Z" /></svg>
-          <span class="climb-steer-divider"></span>
-          <svg class="climb-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M18 10 L34 24 L18 38 Z" /></svg>
-          <span class="climb-label">方向</span>
+          <svg class="climb-arrow climb-arrow-left" viewBox="0 0 48 48" aria-hidden="true"><path d="M30 10 L14 24 L30 38 Z" /></svg>
+          <svg class="climb-arrow climb-arrow-right" viewBox="0 0 48 48" aria-hidden="true"><path d="M18 10 L34 24 L18 38 Z" /></svg>
+          <span class="climb-label">按住拖</span>
         </div>
         <button type="button" class="climb-jump" aria-label="点按跳跃" @pointerdown.stop="jumpDown" @contextmenu.prevent>
           <svg class="climb-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 8 L40 30 L8 30 Z" /></svg>
           <span class="climb-label">跳跃</span>
         </button>
+        <div v-if="knob" class="climb-knob" :style="knobStyle" aria-hidden="true">
+          <span class="climb-knob-ring"></span>
+          <span class="climb-knob-cap"></span>
+        </div>
       </div>
       <div v-else-if="state.phase === 'ready'" class="climb-overlay climb-ready" role="group" aria-label="准备开始">
         <div class="climb-overlay-card">
           <strong class="climb-overlay-title">别被地面追上</strong>
-          <p class="climb-help">左下按住控制左右，右下点按跳跃。<br><span>地面一直上升，要不停往上跳；左右走到头会穿到另一边。</span></p>
+          <p class="climb-help">左下按住，左右拖动控制方向，拖回中间停下。<br><span>地面一直上升，要不停往上跳；左右走到头会穿到另一边。</span></p>
           <button ref="startButton" type="button" class="climb-start" @click="start"><span class="climb-label">开始爬高</span></button>
           <div class="climb-modes" role="group" aria-label="选择爬高路线">
             <button type="button" :aria-pressed="state.mode === 'random'" @click="restart('random')"><span class="climb-label">随机爬高</span></button>
@@ -604,12 +659,20 @@ button:focus-visible { outline: 3px solid #527d66; outline-offset: 2px; }
   background: #eaf3de; color: #27500a; font: inherit; font-weight: 700; cursor: pointer;
   touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent; }
-.climb-steer { left: clamp(12px, 3vw, 48px); display: flex; align-items: center; justify-content: center; gap: 2px; }
+.climb-steer { left: clamp(12px, 3vw, 48px); display: flex; align-items: center; justify-content: center; gap: 10px; }
 .climb-jump { right: clamp(12px, 3vw, 48px); display: flex; flex-direction: column; align-items: center;
   justify-content: center; gap: 2px; background: #faeeda; border-color: #ba7517; color: #633806; }
 .climb-steer:active { background: #c0dd97; }
 .climb-jump:active { background: #f5c775; }
-.climb-steer-divider { width: 2px; height: 46%; background: #97c459; border-radius: 2px; }
+.climb-steer[data-dir='-1'] .climb-arrow-left, .climb-steer[data-dir='1'] .climb-arrow-right { fill: #173404; }
+/* 摇杆帽以按下点为圆心：虚线环是容错区，实心帽随手指水平位移（限位 20px）。 */
+.climb-knob { position: absolute; z-index: 5; width: 0; height: 0; pointer-events: none; }
+.climb-knob-ring { position: absolute; left: 0; top: 0; width: 28px; height: 28px;
+  transform: translate(-50%, -50%); border: 2px dashed #639922; border-radius: 50%;
+  background: rgb(99 153 34 / 12%); }
+.climb-knob-cap { position: absolute; left: 0; top: 0; width: 22px; height: 22px;
+  transform: translate(-50%, -50%) translateX(var(--knob-dx, 0px));
+  border: 2px solid #3b6d11; border-radius: 50%; background: #f6fce9; }
 .climb-arrow { width: 38px; height: 38px; fill: #3b6d11; pointer-events: none; }
 .climb-jump .climb-arrow { fill: #ba7517; }
 .climb-steer .climb-label { position: absolute; bottom: 8px; font-size: 11px; }

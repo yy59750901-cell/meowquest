@@ -410,6 +410,12 @@ test('SFC 模板与样式编译通过，含环绕双边渲染、双向控件与�
   assert.match(style.content ?? descriptor.styles[0].content, /user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;/)
   assert.match(descriptor.styles[0].content, /\.climb-steer, \.climb-jump/)
   assert.match(descriptor.styles[0].content, /display: flex; flex-direction: column;\s*padding: 0;/)
+  for (const token of ['DEAD_IN = 8', 'DEAD_OUT = 14', 'NEAR_PAD = 36', 'KNOB_RANGE = 20',
+    'relativeDirection', 'nearSteer', 'syncKnob', 'climb-knob-cap', 'climb-knob-ring',
+    'ref="steerEl"', ':data-dir="steerDir"', '按住拖']) {
+    assert.ok(source.includes(token), `缺少 ${token}`)
+  }
+  assert.ok(!source.includes('directionAt'), '旧的绝对中线判向不应残留')
 })
 
 // 执行真实编译后的 setup；宿主只替换 DOM/RAF，不做浏览器视觉验收。
@@ -470,6 +476,7 @@ async function mountComponent() {
   api.stage.value = stage
   api.scene.value = element('scene', { width: 200, height: 300 })
   api.playfield.value = element('climb-playfield', { left: 0, top: 0, right: 360, bottom: 560, width: 360, height: 560 })
+  api.steerEl.value = steer
   api.startButton.value = start
   mountedCallbacks.forEach((fn) => fn())
   await Promise.resolve()
@@ -480,80 +487,118 @@ async function mountComponent() {
     unmount() { unmountCallbacks.forEach((fn) => fn()) }, isDisconnected: () => disconnected }
 }
 
-test('真实 setup：双向控件按住左半向左、滑到右半换向，松手停', async () => {
+test('真实 setup：相对摇杆按下不出方向，拖过 14px 才出方向，拖回 8px 内回正', async () => {
   const h = await mountComponent()
   h.api.start()
   const down = h.event({ currentTarget: h.steer, pointerId: 1, button: 0, clientX: 20, clientY: 50 })
   h.api.steerDown(down)
   assert.equal(down.prevented, true)
-  assert.equal([...h.api.pointers.values()][0].direction, -1)
-  h.api.pointerMove(h.event({ pointerId: 1, clientX: 100, clientY: 50 }))
-  assert.equal([...h.api.pointers.values()][0].direction, 1, '滑到右半应换向')
+  assert.equal(h.api.pointers.get(1).direction, 0, '按下瞬间方向为 0，不推猫')
+  assert.equal(h.api.pointers.get(1).originX, 20, '按下点就是摇杆原点')
+  h.api.pointerMove(h.event({ pointerId: 1, clientX: 30, clientY: 50 }))
+  assert.equal(h.api.pointers.get(1).direction, 0, 'dx=10 未过出方向阈值 14px')
+  h.api.pointerMove(h.event({ pointerId: 1, clientX: 35, clientY: 50 }))
+  assert.equal(h.api.pointers.get(1).direction, 1, 'dx=15 过阈值应向右')
+  h.api.pointerMove(h.event({ pointerId: 1, clientX: 31, clientY: 50 }))
+  assert.equal(h.api.pointers.get(1).direction, 1, 'dx=11 在滞回区应仍保持向右')
+  h.api.pointerMove(h.event({ pointerId: 1, clientX: 26, clientY: 50 }))
+  assert.equal(h.api.pointers.get(1).direction, 0, 'dx=6 回到 8px 内应回正')
+  h.api.pointerMove(h.event({ pointerId: 1, clientX: 5, clientY: 50 }))
+  assert.equal(h.api.pointers.get(1).direction, -1, '向左拖过 14px 应向左')
   h.api.cancelPointer(h.event({ pointerId: 1 }))
   assert.equal(h.api.pointers.size, 0)
+  assert.equal(h.api.knob.value, null, '抬手后摇杆帽消失')
   h.unmount()
 })
 
-test('真实 setup：右下点按跳跃发出 jump 事件，半区兜底热区按左右屏生效', async () => {
+test('滞回 8/14px 边界：阈值附近不抖动，进入方向与回正都稳定', async () => {
+  const h = await mountComponent()
+  h.api.start()
+  const active = { direction: 0, dx: 0 }
+  const at = (dx) => { active.dx = dx; active.direction = h.api.relativeDirection(active); return active.direction }
+  assert.equal(at(0), 0)
+  assert.equal(at(14), 0, '恰好 14px 仍不出方向')
+  assert.equal(at(15), 1, '15px 才进入向右')
+  assert.equal(at(9), 1, '回到 9px 仍保持向右（滞回）')
+  assert.equal(at(8), 0, '回到 8px 内才回正')
+  assert.equal(at(-10), 0, '回正后 10px 抖动不应立刻出方向')
+  assert.equal(at(-15), -1, '-15px 才进入向左')
+  h.unmount()
+})
+
+test('真实 setup：跳跃可用，兜底热区只剩控件附近一圈且按下不出方向', async () => {
   const h = await mountComponent()
   h.api.start()
   const before = h.api.state.value.cat.vy
   h.api.jumpDown(h.event({ pointerId: 2, button: 0 }))
   assert.ok(h.api.state.value.cat.vy > before, '跳跃应给出起跳速度')
   const field = h.api.playfield.value
-  const at = (x, pointerId) => h.event({ currentTarget: field, target: field, pointerId, button: 0, clientX: x, clientY: 300 })
-  h.api.playfieldPointerDown(at(60, 3))
-  assert.equal(h.api.pointers.get(3).direction, -1)
+  const at = (x, y, pointerId) => h.event({ currentTarget: field, target: field, pointerId, button: 0, clientX: x, clientY: y })
+  // steer rect=[0,120]×[0,100]，NEAR_PAD=36 → 扩展区 x∈[-36,156]、y∈[-36,136]
+  h.api.playfieldPointerDown(at(150, 120, 3))
+  assert.equal(h.api.pointers.get(3)?.direction, 0, '扩展区内能按，但按下不出方向')
   h.api.cancelPointer(h.event({ pointerId: 3 }))
-  h.api.playfieldPointerDown(at(300, 4))
-  assert.equal(h.api.pointers.get(4).direction, 1)
-  h.api.cancelPointer(h.event({ pointerId: 4 }))
-  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: { closest: () => ({}) }, pointerId: 5, button: 0, clientX: 60, clientY: 300 }))
-  assert.equal(h.api.pointers.has(5), false, '按在控件上不应触发兜底热区')
+  h.api.playfieldPointerDown(at(300, 300, 4))
+  assert.equal(h.api.pointers.has(4), false, '场地中部不应再产生幽灵方向')
+  h.api.playfieldPointerDown(at(160, 120, 5))
+  assert.equal(h.api.pointers.has(5), false, '刚出扩展区右边界也不响应')
+  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: { closest: () => ({}) }, pointerId: 6, button: 0, clientX: 60, clientY: 50 }))
+  assert.equal(h.api.pointers.has(6), false, '按在控件上不应触发兜底热区')
   h.unmount()
 })
 
-test('真实 setup：兜底热区按住左半滑到右半实时换向，不用抬手重按', async () => {
+test('真实 setup：扩展区按住左右拖动实时换向，不用抬手重按', async () => {
   const h = await mountComponent()
   h.api.start()
   const field = h.api.playfield.value
-  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: field, pointerId: 7, button: 0, clientX: 60, clientY: 300 }))
-  assert.equal(h.api.pointers.get(7).direction, -1)
-  h.api.pointerMove(h.event({ pointerId: 7, clientX: 300, clientY: 300 }))
+  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: field, pointerId: 7, button: 0, clientX: 100, clientY: 50 }))
+  assert.equal(h.api.pointers.get(7).direction, 0)
+  h.api.pointerMove(h.event({ pointerId: 7, clientX: 120, clientY: 50 }))
   assert.equal(h.api.pointers.has(7), true, '按住期间不能把滑动误判为松手')
-  assert.equal(h.api.pointers.get(7).direction, 1, '不松手滑到右半应立即换向')
-  h.api.pointerMove(h.event({ pointerId: 7, clientX: 60, clientY: 300 }))
-  assert.equal(h.api.pointers.get(7).direction, -1, '滑回左半应再次换向')
+  assert.equal(h.api.pointers.get(7).direction, 1, '右拖 20px 应向右')
+  h.api.pointerMove(h.event({ pointerId: 7, clientX: 80, clientY: 50 }))
+  assert.equal(h.api.pointers.get(7).direction, -1, '左拖 20px 应向左')
   h.api.cancelPointer(h.event({ pointerId: 7 }))
   assert.equal(h.api.pointers.size, 0, '抬手后方向归零')
   h.unmount()
 })
 
-test('真实 setup：控件按住滑到舞台仍实时跟随，只有彻底滑出场地才归零', async () => {
+test('真实 setup：摇杆帽跟随手指（限位 20px），滑出控件仍跟随原点，滑出场地才归零', async () => {
   const h = await mountComponent()
   h.api.start()
   h.api.steerDown(h.event({ currentTarget: h.steer, pointerId: 8, button: 0, clientX: 20, clientY: 50 }))
-  assert.equal(h.api.pointers.get(8).direction, -1)
-  // 控件 rect 为 [0,120]，中线 60；滑到舞台右侧已出控件，仍按该中线延伸判向，不应取消或突然反向。
+  assert.equal(h.api.pointers.get(8).direction, 0)
+  // harness 用 runInNewContext，跨 realm 对象原型不同，逐字段比避免 deepStrictEqual 假失败
+  assert.equal(h.api.knob.value.x, 20, '帽以按下点 x 为圆心')
+  assert.equal(h.api.knob.value.y, 50, '帽以按下点 y 为圆心')
+  assert.equal(h.api.knob.value.dx, 0)
+  assert.equal(h.api.knob.value.dir, 0)
   h.api.pointerMove(h.event({ pointerId: 8, clientX: 300, clientY: 300 }))
   assert.equal(h.api.pointers.has(8), true, '滑出控件边界不应被当作松手')
-  assert.equal(h.api.pointers.get(8).direction, 1)
+  assert.equal(h.api.pointers.get(8).direction, 1, '相对原点大幅右拖仍向右')
+  assert.equal(h.api.knob.value.dx, 20, '帽水平位移限制在 20px')
+  assert.equal(h.api.knob.value.x, 20, '帽圆心锁在按下点，不随手指跑出场地')
   h.api.pointerMove(h.event({ pointerId: 8, clientX: 10, clientY: 300 }))
-  assert.equal(h.api.pointers.get(8).direction, -1, '滑到分界线左侧应向左')
+  assert.equal(h.api.pointers.get(8).direction, -1, '拖回原点左侧应向左')
   h.api.pointerMove(h.event({ pointerId: 8, clientX: 400, clientY: 300 }))
   assert.equal(h.api.pointers.size, 0, '彻底滑出游戏场地才归零')
+  assert.equal(h.api.knob.value, null)
   h.unmount()
 })
 
-test('真实 setup：分界线随按下元素固定，控件与场地各自判向不串线', async () => {
+test('真实 setup：控件与扩展区共用一套相对判向，同一个 x 不再因元素不同而反向', async () => {
   const h = await mountComponent()
   h.api.start()
   const field = h.api.playfield.value
-  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: field, pointerId: 11, button: 0, clientX: 100, clientY: 300 }))
-  assert.equal(h.api.pointers.get(11).direction, -1, '场地中线 180，x=100 属左半')
+  h.api.playfieldPointerDown(h.event({ currentTarget: field, target: field, pointerId: 11, button: 0, clientX: 100, clientY: 50 }))
+  assert.equal(h.api.pointers.get(11).direction, 0, '扩展区按下同样是 0')
+  h.api.pointerMove(h.event({ pointerId: 11, clientX: 80, clientY: 50 }))
+  assert.equal(h.api.pointers.get(11).direction, -1, '左拖 20px 向左')
   h.api.cancelPointer(h.event({ pointerId: 11 }))
   h.api.steerDown(h.event({ currentTarget: h.steer, pointerId: 12, button: 0, clientX: 100, clientY: 50 }))
-  assert.equal(h.api.pointers.get(12).direction, 1, '控件中线 60，同一个 x=100 属右半')
+  assert.equal(h.api.pointers.get(12).direction, 0, '同一个 x 在控件内按下也是 0，不再反向')
+  h.api.pointerMove(h.event({ pointerId: 12, clientX: 80, clientY: 50 }))
+  assert.equal(h.api.pointers.get(12).direction, -1, '同样左拖 20px 同样向左')
   h.unmount()
 })
 
