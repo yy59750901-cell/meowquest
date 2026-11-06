@@ -863,3 +863,11 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - **验证**：**261/261** 单测（新增「物品栏全平台按需展开 + 真实缩略图」断言，`cat-tree-room.test.js` harness 注入 `getShopDisplay`）、`npm run build`、`go build ./...`、`git diff --check` 全过。重建 embed（CSS `index-B2sdBp6w.css` / JS `index-DAT9ann9.js`）、本机二进制 SHA `91e73399…`、kill 32220 后重启 8600。
 - **浏览器**：新写 `/tmp/meow-inventory-check.py` 四视口交互链路 `FAILURES 0`：1280/390/320/1920 常态物品栏隐藏且房间无礼物盒 → 商店点「摆放」展开且两件都是 `-thumb.png`、零礼物 fallback → 点空白收起 → 桌面额外验「购买自动展开（3 件、缩略图保留、无礼物 fallback）」+「拖入房间后 `/scene/place` 发出且物品栏收起」。上一轮猫窝五视口/展开态/商店/苹果窝进窝回归 `FAILURES 0`。逐张看图：桌面常态左下角腾空、展开态两张真实缩略图、买完 3 件、拖完收起、手机常态与展开态均无重叠溢出。截图 `inventory-check/`。
 - **边界**：C 未实施；线上仍是 19:23 版，未部署、未 commit / push。
+
+## 四十一、提交与推送（11/06 14:2x）
+
+- 用户明确「提交push下代码」→ 一次性提交本轮全部改动。提交前核对：分支 `main`、远端 `git@github.com:yy59750901-cell/meowquest.git`，`git fetch origin main` 后本地/远端 `0 0` 无分叉；`.env` 已在 `.gitignore`；对本次新增的 1173 行（705 行 diff + 468 行新文件）做 URL / IP / 凭据样式扫描 **0 命中**，暂存清单也无 `.env` / 私钥 / 日志误入。
+- **commit `8ad80f1`** `feat: 接入 16 款猫窝、房间比例调整与物品栏按需展开`，**142 文件、+1205 / −67**：包含 15 款 60 张素材、苹果窝 3 图、两套 `art/nests/` 与 `public/art/`、embed 产物（旧 CSS/JS 删除或改名、新 `index-B2sdBp6w.css` / `index-DAT9ann9.js`）、`api_wish.go` 注册、`nest-catalog.js` 与两个测试、主档第三十四至四十节。
+- `git push origin main` 成功 `65db0b7..8ad80f1`；推后 `HEAD` 与 `origin/main` **0 0 同步**、`git status --short` 为空。
+- **仅代码入库，线上服务未部署**：线上仍是 19:23 版。要上线须另行跑 `frontend/build.sh` + `backend/deploy.sh`。本节之前的「未 commit / push」描述的是提交前状态。
+- `backend/internal/web/dist` 构建产物仍按既有约定入库供 Go embed；是否移出版本库的待定项未改动。
