@@ -899,4 +899,12 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - **验证**：**263/263** 单测、`build.sh`、`go build`、`git diff --check` 全过。重建 embed（CSS `index-DzZlSoyV.css` / JS `index-CvwBnL_i.js`）、kill 37298 后重启 8600、首页 200 且 index 引用新 hash；真实 minified bundle 里 `keepCamera` 只剩 **4 次**（1 次 `!opts.keepCamera` 读取 + 3 次进场），直接证明出窝已不带固定镜头。未跑 `deploy.sh`。
 - **浏览器**：同一套 `/tmp/meow-nest-exit-verify.py` 五用例重跑，**CORE FAILURES 0 / OPEN ISSUES 0**（上一轮手机用例 `avg visRatio 0.14` 的 OPEN 项已消除，桌面四项核心断言仍全绿、气泡跟随与尺寸恢复无回归）。逐张看图 390 手机 +000/+400/+800/+1400/+2200/+2600 与 1280 桌面 +400：出窝起点猫在窝里、+400ms 猫完整走到窝左侧且镜头平滑跟随、+800/+1400 猫完整居中可见、+2200 下一轮进窝、+2600 趴回窝里，**全程无猫消失、无重叠溢出、无 pageerror**。
 - **取舍（如实记录）**：窄屏出窝 0.8s 内镜头跟猫平移，期间香蕉窝会被视口右缘裁掉约一半；这是 follow 镜头的正常表现，换来的是猫始终完整可见。桌面镜头平移幅度小，窗户/窝都保持完整。若日后更看重「镜头完全不动」，可回头评估 B 档，本轮未做。
-- **边界**：线上仍是 19:23 版，未部署；热区修复、B 档出窝、A 档跟随镜头**均未 commit / 未 push**，HEAD 仍 `3f1e32c`。
+- **边界**：线上仍是 19:23 版，未部署；热区修复、B 档出窝、A 档跟随镜头**均未 commit / 未 push**，HEAD 仍 `3f1e32c`。（此句描述提交前状态，已于第四十五节提交。）
+
+## 四十五、提交与推送（11/06 15:4x）
+
+- 用户明确「提交push」→ 一次性提交本轮全部改动。提交前核对：分支 `main`、远端 `git@github.com:yy59750901-cell/meowquest.git`，`git fetch origin main` 后本地/远端 `0 0` 无分叉；`.env` 与 `backend/.env` 均已 gitignore；对本次 **143 行**新增文本做 URL / IP / 凭据赋值样式扫描 **0 命中**，暂存清单无 `.env` / 私钥 / 日志 / credential 文件误入。
+- **commit `192d8fc`** `fix: 修复底部按钮热区、出窝遮挡与窄屏猫出视口`，**8 文件 +175 / −60**：`KidHome.vue`（热区 2 行 CSS + B 档出窝链路 + A 档去掉出窝 keepCamera）、`apple-nest.test.js` / `nest-catalog.test.js` 防回归断言、embed 产物换 hash（`index-CvwBnL_i.js` / `index-DzZlSoyV.css`，旧 `index-DAT9ann9.js` 删除、旧 CSS 识别为 rename）、主档第四十二至四十四节。
+- `git push origin main` 成功 `3f1e32c..192d8fc`；推后 HEAD 与 `origin/main` 同步。随后把提交状态补记为本节，并照仓库历史惯例再做一个 docs 小提交保持工作区干净。
+- **仅代码入库，线上服务未部署**：线上仍是 19:23 版，未跑 `backend/deploy.sh`；本机 8600 已是最新版（PID 61880，`index-CvwBnL_i.js` / `index-DzZlSoyV.css`）。要上线须另行跑 `frontend/build.sh` + `backend/deploy.sh`。
+- `backend/internal/web/dist` 构建产物仍按既有约定入库供 Go embed；是否移出版本库的待定项未改动。
