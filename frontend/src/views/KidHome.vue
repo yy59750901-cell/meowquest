@@ -311,9 +311,14 @@ const decorDepth = it => decorArt(it.item_key).surface === 'wall' ? 2 : 10 + Mat
 // 沿地板走向洞口的阶段猫必须在前片之上（demo 的 walker z=4），否则会穿过窝体。
 const nestActive = ref(null) // 窝里趴睡
 const nestWalking = ref(null) // 沿地板走近洞口
+const nestExiting = ref(null) // 出窝会话：猫还在窝体范围内时保持最高层，避免层级瞬时掉档
+let nestExitTimer = null
 const catDepth = computed(() => {
   if (treeRendered.value && treeSession.value) return 11 + Math.floor(treeSession.value.anchor.y)
   if (nestActive.value) return 11 + Math.floor(nestActive.value.y)
+  // 出窝时猫仍在窝的像素范围内，不能用 10+猫.y（会掉到 back 10+窝.y 之下被整只盖住）；
+  // 沿用沿地板进场的 walker 层 13+窝.y，直到走出窝体或被兜底定时器还原。
+  if (nestExiting.value) return 13 + Math.floor(nestExiting.value.y)
   if (nestWalking.value) return 13 + Math.floor(nestWalking.value.y)
   return 10 + Math.floor(catPos.y)
 })
@@ -491,7 +496,7 @@ const treeRendered = ref(false)
 const treeMoving = ref(false)
 const treeLeaving = ref(false)
 // 爬架会话缩到 64px；进窝会话按 NEST_CAT_SCALE 等比缩小（中心不变）；房间地面猫恒 110px。
-const nestCatActive = computed(() => Boolean(nestWalking.value || nestActive.value || nestEntry.value))
+const nestCatActive = computed(() => Boolean(nestWalking.value || nestActive.value || nestEntry.value || nestExiting.value))
 const treeCatSize = computed(() => treeRendered.value ? TREE_CAT_SIZE : 110)
 const catRoomStyle = computed(() => ({ left: `${catPos.x}px`, top: `${catPos.y}px`, zIndex: catDepth.value,
   visibility: nestEntry.value ? 'hidden' : 'visible',
@@ -782,7 +787,39 @@ function facePoint(px) { flipped.value = px > catPos.x } // 面向目标
 // 走路阶段猫是最高层（不穿窝体），到位后才夹进 PNG 前后片之间做真遮挡。
 let nestToken = null
 let nestTimer = null
-function cancelNest() {
+// 出窝尺寸：苹果窝固定 192×160.1，新 15 款用各自 display；两套共用同一条出窝链路。
+function nestExitSize(it) {
+  if (it.item_key === APPLE_NEST_KEY) return { w: APPLE_NEST_WIDTH, h: APPLE_NEST_HEIGHT }
+  const p = nestProfile(it.item_key)
+  return p ? { w: p.display[0], h: p.display[1] } : { w: APPLE_NEST_WIDTH, h: APPLE_NEST_HEIGHT }
+}
+// 从趴睡态退出时猫仍在窝的像素范围内，若立刻把层级从 11+窝.y 降到 10+猫.y，
+// 会被 back(10+窝.y)/front(12+窝.y) 整只盖住。这里保持 13+窝.y 并播一段
+//「起身 → 沿地板走出洞口」，走完或被新互动接管后由兜底定时器还原层级。
+function beginNestExit(it, animate = true, onDone) {
+  if (nestExitTimer) { clearTimeout(nestExitTimer); nestExitTimer = null }
+  nestExiting.value = it
+  catAnim.value = 'sit' // 从 sleep 复位成站姿，起身帧沿用现有 sit
+  nestExitTimer = setTimeout(() => {
+    if (nestExiting.value === it) nestExiting.value = null
+    nestExitTimer = null
+  }, animate ? 1800 : 900)
+  if (!animate || disposed) { onDone?.(); return }
+  const { w } = nestExitSize(it)
+  const exitX = Math.max(55, it.x - w / 2 - 70) // 与进场 approach 对称：从洞口左侧沿地板退出
+  const groundY = it.y + 17 // demo 的地板线
+  const dist = Math.max(1, Math.hypot(exitX - catPos.x, groundY - catPos.y))
+  // 后续行为串在出窝动画的完成回调里：walkTo 与 behaviorNext 共用 stateTimer，
+  // 若调用方立刻 behaviorNext() 会清掉出窝的 done，猫会卡在 walk 帧。
+  // 进场按 demo 固定舞台镜头；出窝相反，要让 follow 相机跟着猫（centerOn 自带
+  // cameraBounds clamp）。窄屏只裁出窝周围一小块世界，固定镜头会让猫走出屏幕看不见。
+  walkTo({ x: exitX, y: groundY }, () => {
+    if (nestExiting.value === it) nestExiting.value = null
+    onDone?.()
+  }, { speed: dist / 0.8 })
+}
+function cancelNest(opts = {}) {
+  const sleepingIn = nestActive.value // 必须在 cancelJumpNest 清状态之前捕获
   cancelJumpNest() // 新 15 款的 rAF 动画与 dwell 定时器；苹果窝逻辑保持原样
   nestToken = null
   if (nestWalking.value) {
@@ -793,6 +830,11 @@ function cancelNest() {
   nestWalking.value = null
   nestActive.value = null
   if (nestTimer) { clearTimeout(nestTimer); nestTimer = null }
+  nestExiting.value = null
+  if (nestExitTimer) { clearTimeout(nestExitTimer); nestExitTimer = null }
+  // 只有从趴睡态退出才需要出窝保护；重新进窝/切换互动传 animate:false，位移由后续 walkTo 接管。
+  if (sleepingIn && !disposed) beginNestExit(sleepingIn, opts.animate !== false, opts.onDone)
+  else opts.onDone?.()
 }
 // 确认稿 939×783、展示宽 192（B 档 0.8 缩放）；软垫脚点按 demo 的 scale 换算到世界坐标。
 // .cat-wrap 宽 110 / margin -55,-100，猫精灵高 83 → 脚点比猫底低 17px。
@@ -805,7 +847,8 @@ function appleNestFoot(it) {
 }
 function enterNest(it) {
   if (roomLocked()) return
-  cancelNest()
+  cancelNest({ animate: false }) // 重新进窝：留给进场动画接管，不叠一段出窝
+  nestExiting.value = null
   const token = {}
   nestToken = token
   nestWalking.value = it
@@ -830,15 +873,14 @@ function enterNest(it) {
       catPos.x = pad.x
       catPos.y = pad.y
       nestWalking.value = null
+      nestExiting.value = null
       nestActive.value = it
       catAnim.value = 'sleep'
       flipped.value = false
       say('呼…呼…')
       nestTimer = setTimeout(() => {
         if (nestToken !== token) return
-        cancelNest() // 会话结束必须还原层级，否则猫走到别处还挂在窝的 zIndex 上
-        catAnim.value = 'sit'
-        behaviorNext()
+        cancelNest({ onDone: () => behaviorNext() }) // 会话结束：走出窝后再继续自主行为
       }, dwell)
     }, { speed: walkDist / 1.35, keepCamera: true })
   }, { keepCamera: true })
@@ -875,6 +917,16 @@ function nestBubbleHeight(it) {
   const p = nestProfile(it.item_key)
   return p ? p.display[1] : APPLE_NEST_HEIGHT
 }
+// 出窝期间气泡不能退回 .cat-wrap 内（会跟着低层级一起被窝盖住）：
+// 继续用独立最高层气泡，横向跟随猫，纵向始终不低于窝顶。
+const nestBubbleStyle = computed(() => {
+  const it = nestActive.value || nestExiting.value
+  if (!it) return {}
+  const zIndex = 13 + Math.floor(it.y)
+  const topBase = it.y - nestBubbleHeight(it) - 10
+  if (nestActive.value) return { left: `${it.x}px`, top: `${topBase}px`, zIndex }
+  return { left: `${catPos.x}px`, top: `${Math.min(catPos.y - 72, topBase)}px`, zIndex }
+})
 function renderNestEntry(p, it, route, elapsed) {
   const T = NEST_ENTRY_TIME
   const jumpStart = T.walk + T.prepare
@@ -927,6 +979,7 @@ function settleNest(p, it, token) {
   const pos = nestSleepPos(p, it)
   catPos.x = pos.x
   catPos.y = pos.y
+  nestExiting.value = null
   nestActive.value = it
   catAnim.value = 'sleep'
   flipped.value = false
@@ -934,8 +987,7 @@ function settleNest(p, it, token) {
   const dwell = (planInteractionSession('nest') || { dwell: 8000 }).dwell
   nestEntryTimer = setTimeout(() => {
     if (nestEntryToken !== token) return
-    cancelJumpNest() // 还原层级，否则猫走到别处还挂在窝的 zIndex 上
-    behaviorNext()
+    cancelNest({ onDone: () => behaviorNext() }) // 与苹果窝统一：走出窝后再继续自主行为
   }, dwell)
 }
 function startNestEntry(p, it, route, token) {
@@ -954,7 +1006,8 @@ function startNestEntry(p, it, route, token) {
 }
 function jumpIntoNest(it) {
   if (roomLocked()) return
-  cancelNest()
+  cancelNest({ animate: false }) // 重新进窝：留给七阶段动画层接管
+  nestExiting.value = null
   const p = nestProfile(it.item_key)
   if (!p) return
   const token = {}
@@ -969,7 +1022,7 @@ function jumpIntoNest(it) {
 
 function interactWith(it) {
   if (!it || !it.item_key || roomLocked()) return
-  cancelNest()
+  cancelNest({ animate: false }) // 切换互动：只保留层级保护，位移由下面的 walkTo 接管
   if (it.item_key === 'cat-tree') return playTree(it, 'top')
   if (it.item_key === APPLE_NEST_KEY) return enterNest(it)
   if (isJumpNest(it.item_key)) return jumpIntoNest(it)
@@ -2326,9 +2379,9 @@ onBeforeUnmount(() => {
       <img class="nest-img" :src="nestArt(nestProfile(it.item_key), 'front')" :style="{ width: nestProfile(it.item_key).display[0] + 'px' }" alt="">
     </div>
 
-    <!-- 窝里说话时气泡挪到窝顶上方并提到最高层，避免压在窝上（高度按各款 display） -->
-    <div v-if="showBubble && nestActive" class="bubble nest-bubble"
-      :style="{ left: nestActive.x + 'px', top: nestActive.y - nestBubbleHeight(nestActive) - 10 + 'px', zIndex: 13 + Math.floor(nestActive.y) }">{{ bubble }}</div>
+    <!-- 窝里与出窝期间都用独立最高层气泡，避免猫层级切换时气泡跟着被窝盖住 -->
+    <div v-if="showBubble && (nestActive || nestExiting)" class="bubble nest-bubble"
+      :class="{ 'nest-bubble-follow': nestExiting }" :style="nestBubbleStyle">{{ bubble }}</div>
 
     <!-- 15 款新窝进窝动画：demo 的 cat-plane(z2) + walker(z4) 双副本补集 clip -->
     <template v-if="nestEntry">
@@ -2362,7 +2415,7 @@ onBeforeUnmount(() => {
     <!-- 猫 -->
     <div class="cat-wrap" ref="catEl" :class="{ sad: moodColor === 'sad', 'room-paused': roomHidden, 'tree-cat': treeRendered, 'tree-peek': treeRendered && treeSession?.currentnode === 'nest' && !treeMoving, 'tree-scratch': treeRendered && treeSession?.mode === 'grip' && !treeMoving }"
       :style="catRoomStyle" :data-tree-node="treeRendered ? treeSession?.currentnode : undefined" @click.stop="petCat">
-      <div class="bubble" v-if="showBubble && !nestActive">{{ bubble }}</div>
+      <div class="bubble" v-if="showBubble && !nestActive && !nestExiting">{{ bubble }}</div>
       <span class="zzz" v-if="catAnim === 'sleep' && zzz">💤</span>
       <div class="cat-inner" :class="{ flip: flipped }">
         <CatSprite :species="species" :anim="catAnim" :size="treeCatSize" :paused="playOpen || roomHidden" />
@@ -2692,6 +2745,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .nest-entry-plane { position: absolute; pointer-events: none; }
 .nest-entry-cat { position: absolute; width: 110px; line-height: 0; pointer-events: none; }
 .nest-bubble { bottom: auto; transform: translate(-50%, -100%); z-index: 13; }
+/* 出窝时气泡横向跟随猫平滑移动，与 0.8s 沿地板走出的节奏一致 */
+.nest-bubble-follow { transition: left .8s linear, top .8s linear; }
 .scene-item:focus-visible { outline: 3px solid #9C8BC5; outline-offset: 4px; }
 .tree-peek { clip-path: inset(20px 16px 0 24px); }
 .tree-peek .cat-inner { translate: -12px 0; }
@@ -2816,7 +2871,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .pbtn:active { transform: translateY(1px); box-shadow: none; }
 .pbtn small { display: block; font-size: 10px; line-height: 1.4; font-weight: 400; color: #88786A; }
 /* 宽屏底部两组共用同一内容区边界：左组靠左、右组靠右，视觉是一条统一工具栏。
-   不包模板容器，900px 以下的原有两行绝对定位规则完全不受影响。 */
+   不包模板容器，900px 以下的原有两行绝对定位规则完全不受影响。
+   容器本身是全宽透明带且 z-index 更高，若吃点击会横压住下方 .actions 按钮中段；
+   因此容器只做布局，命中交给内部真按钮。 */
 .actions { position: absolute; bottom: var(--actions-bottom); left: var(--content-left); right: var(--sidebar-gap); max-width: var(--content-max); margin-inline: auto; display: flex; gap: 10px; z-index: 17; }
 .actions .pbtn { display: flex; align-items: center; gap: 10px; min-width: 0; height: 52px; padding: 8px 14px; }
 .actions .playground-entry { background: #E9F1DD; color: #526646; border-color: #B9CAA7; }
@@ -2828,7 +2885,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .action-copy { min-width: 0; text-align: left; }
 .action-copy b { display: block; font-size: 13px; line-height: 1.4; white-space: nowrap; }
 .action-copy small { margin-top: 2px; white-space: nowrap; }
-.room-tools { position: absolute; left: var(--content-left); right: var(--sidebar-gap); bottom: var(--tools-bottom); max-width: var(--content-max); margin-inline: auto; z-index: 18; display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.room-tools { position: absolute; left: var(--content-left); right: var(--sidebar-gap); bottom: var(--tools-bottom); max-width: var(--content-max); margin-inline: auto; z-index: 18; display: flex; align-items: center; justify-content: flex-end; gap: 10px; pointer-events: none; }
+.room-tools button { pointer-events: auto; }
 .mobile-companion { display: none; }
 .mailbox-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 38px; padding: 0 12px; color: #796653; background: rgba(255, 252, 246, .9); border: 1px solid #D9C7B1; border-radius: 20px; box-shadow: 0 3px 10px rgba(103, 75, 47, .08); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; }
 .mailbox-btn svg { flex-shrink: 0; width: 18px; height: 18px; }

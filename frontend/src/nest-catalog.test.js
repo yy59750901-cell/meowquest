@@ -180,7 +180,9 @@ test('七阶段渲染、抢占与卸载清理都在，苹果窝旧链路未被�
   assert.match(home, /nestRAF = requestAnimationFrame\(step\)/)
   assert.match(home, /function stopNestEntry\(\) \{[\s\S]*?cancelAnimationFrame\(nestRAF\)/)
   assert.match(home, /function cancelJumpNest\(\)[\s\S]*?stopNestEntry\(\)[\s\S]*?clearTimeout\(nestEntryTimer\)/)
-  assert.match(home, /function cancelNest\(\) \{\s*\n\s*cancelJumpNest\(\)/)
+  assert.match(home, /function cancelNest\(opts = \{\}\)[\s\S]*?const sleepingIn = nestActive\.value[\s\S]*?cancelJumpNest\(\)/)
+  // 出窝链路不能改写七阶段进场：dwell 到期统一走 cancelNest 播出窝动画
+  assert.match(home, /cancelNest\(\{ onDone: \(\) => behaviorNext\(\) \}\)/)
   assert.match(home, /onBeforeUnmount\(\(\) => \{[\s\S]*?cancelNest\(\)/)
   assert.match(home, /if \(isJumpNest\(it\.item_key\)\) return jumpIntoNest\(it\)/)
   assert.match(home, /function enterNest\(it\) \{[\s\S]*?const pad = appleNestFoot\(it\)/)

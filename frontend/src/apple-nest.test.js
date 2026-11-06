@@ -26,6 +26,15 @@ test('A 档房间：窗户落在真实相机可见区、地板纹理 2x，不贴
   assert.match(room, /height: 196px;/)
 })
 
+test('底部工具栏容器不吃点击，.actions 按钮整块可点', () => {
+  // 8ad80f1 把 .room-tools 改成全宽透明带（z=18）后横压住 z=17 的 .actions 按钮中段，
+  // 只剩顶部 6px / 底部 8px 能点。容器只做布局，命中必须交回内部真按钮。
+  assert.match(home, /\.room-tools \{[^}]*z-index: 18;[^}]*pointer-events: none; \}/)
+  assert.match(home, /\.room-tools button \{ pointer-events: auto; \}/)
+  assert.match(home, /\.actions \{[^}]*z-index: 17; \}/)
+  assert.doesNotMatch(home, /\.room-tools button \{ pointer-events: none; \}/)
+})
+
 test('商店含老窝、切面苹果窝与 15 款新窝，前后端 key/名称/价格一致', () => {
   const keys = [...registry.matchAll(/\{"key": "(nest[^"]*)"/g)].map(m => m[1])
   assert.equal(keys[0], 'nest')
@@ -88,7 +97,7 @@ test('房间按 192px 宽渲染双片，三层 Z 序严格递增', () => {
 test('进窝只有固定趴睡；地面猫 110px、进窝猫按 0.8 等比缩小且不裁切、不翻身', () => {
   assert.match(home, /const treeCatSize = computed\(\(\) => treeRendered\.value \? TREE_CAT_SIZE : 110\)/)
   assert.match(home, /const NEST_CAT_SCALE = 0\.8/)
-  assert.match(home, /const nestCatActive = computed\(\(\) => Boolean\(nestWalking\.value \|\| nestActive\.value \|\| nestEntry\.value\)\)/)
+  assert.match(home, /const nestCatActive = computed\(\(\) => Boolean\(nestWalking\.value \|\| nestActive\.value \|\| nestEntry\.value \|\| nestExiting\.value\)\)/)
   assert.match(home, /transform: nestCatActive\.value && !treeRendered\.value \?/)
   assert.match(home, /catAnim\.value = 'sleep'/)
   assert.match(home, /const scale = APPLE_NEST_WIDTH \/ 939/)
@@ -102,14 +111,14 @@ test('按 demo 三段进场：地板线、左侧 170px 起走、1.35s 匀速，�
   assert.match(home, /const approachX = Math\.max\(55, pad\.x - 170\)/)
   assert.match(home, /const walkDist = Math\.max\(1, pad\.x - approachX\)/)
   assert.match(home, /\{ speed: walkDist \/ 1\.35, keepCamera: true \}/)
-  // 苹果窝两段 + 新 15 款走到 demo start 的一段，全部固定镜头。
+  // 只有进场三段固定镜头（苹果窝两段 + 新 15 款走到 demo start 一段）；出窝必须跟随相机。
   assert.equal((home.match(/keepCamera: true/g) || []).length, 3)
   assert.match(home, /walkTo\(route\.groundPos,[\s\S]*?keepCamera: true/)
   assert.match(home, /camMode\.value === 'follow' && !opts\.keepCamera/)
   assert.match(home, /nestWalking\.value = it/)
   assert.match(home, /if \(nestWalking\.value\) return 13 \+ Math\.floor\(nestWalking\.value\.y\)/)
   assert.match(home, /catEl\.value\.style\.transition = 'none'/)
-  assert.match(home, /nestWalking\.value = null\s*\n\s*nestActive\.value = it/)
+  assert.match(home, /nestWalking\.value = null[\s\S]*?nestExiting\.value = null[\s\S]*?nestActive\.value = it/)
 })
 
 test('按 demo 补上窝底椭圆投影，且压在窝体下层不遮窝', () => {
@@ -128,19 +137,36 @@ test('猫精灵自带落地投影，与 demo 的 cat drop-shadow 一致', () => 
   assert.match(text('./components/CatSprite.vue'), /filter: drop-shadow\(2px 2px 0 rgba\(43,43,43,\.[0-9]+\)\)/)
 })
 
-test('窝里说话气泡移到窝顶上方、独立最高层，不再压在苹果窝上', () => {
+test('窝里与出窝说话气泡都在独立最高层，不压窝也不被窝盖住', () => {
   assert.match(home, /const APPLE_NEST_HEIGHT = APPLE_NEST_WIDTH \* 783 \/ 939/)
-  assert.match(home, /class="bubble" v-if="showBubble && !nestActive"/)
-  assert.match(home, /v-if="showBubble && nestActive" class="bubble nest-bubble"/)
+  assert.match(home, /class="bubble" v-if="showBubble && !nestActive && !nestExiting"/)
+  assert.match(home, /v-if="showBubble && \(nestActive \|\| nestExiting\)" class="bubble nest-bubble"/)
   // 苹果窝高度仍为 200.13，新窝按各自 display 高度。
   assert.match(home, /if \(it\.item_key === APPLE_NEST_KEY\) return APPLE_NEST_HEIGHT/)
-  assert.match(home, /top: nestActive\.y - nestBubbleHeight\(nestActive\) - 10 \+ 'px'/)
-  assert.match(home, /zIndex: 13 \+ Math\.floor\(nestActive\.y\)/)
+  assert.match(home, /const topBase = it\.y - nestBubbleHeight\(it\) - 10/)
+  assert.match(home, /const zIndex = 13 \+ Math\.floor\(it\.y\)/)
   assert.match(home, /\.nest-bubble \{ bottom: auto; transform: translate\(-50%, -100%\)/)
+  assert.match(home, /\.nest-bubble-follow \{ transition: left \.8s linear, top \.8s linear; \}/)
+})
+
+test('出窝会话：趴睡退出保持最高层、沿地板走出洞口，并串接自主行为', () => {
+  assert.match(home, /const nestExiting = ref\(null\)/)
+  assert.match(home, /if \(nestExiting\.value\) return 13 \+ Math\.floor\(nestExiting\.value\.y\)/)
+  assert.match(home, /function beginNestExit\(it, animate = true, onDone\)/)
+  assert.match(home, /const groundY = it\.y \+ 17/)
+  assert.match(home, /\{ speed: dist \/ 0\.8 \}/)
+  // 出窝不能固定镜头：窄屏相机只裁出窝周围一小块世界，固定镜头会让猫走出屏幕
+  assert.doesNotMatch(home, /\{ speed: dist \/ 0\.8, keepCamera: true \}/)
+  assert.match(home, /出窝相反，要让 follow 相机跟着猫/)
+  // 两条 dwell 到期都必须把 behaviorNext 串在出窝完成回调里，避免共用 stateTimer 被抢占
+  assert.equal((home.match(/cancelNest\(\{ onDone: \(\) => behaviorNext\(\) \}\)/g) || []).length, 2)
+  assert.match(home, /cancelNest\(\{ animate: false \}\)/)
+  assert.match(home, /:class="\{ 'nest-bubble-follow': nestExiting \}" :style="nestBubbleStyle"/)
+  assert.match(home, /nestExiting\.value = null\s*\n\s*nestActive\.value = it/)
 })
 
 test('抢占与卸载都还原层级，自主睡觉仍可挑新旧两种窝', () => {
-  assert.match(home, /function cancelNest\(\)[\s\S]*?nestActive\.value = null[\s\S]*?clearTimeout\(nestTimer\)/)
+  assert.match(home, /function cancelNest\(opts = \{\}\)[\s\S]*?nestActive\.value = null[\s\S]*?clearTimeout\(nestTimer\)/)
   assert.match(home, /onBeforeUnmount\(\(\) => \{[\s\S]*?cancelNest\(\)/)
   assert.match(home, /it\.item_key === 'nest' \|\| it\.item_key === APPLE_NEST_KEY/)
   assert.match(home, /\['plant', 'nest', 'yarn', APPLE_NEST_KEY\]\.includes/)
