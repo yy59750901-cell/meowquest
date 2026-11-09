@@ -242,11 +242,13 @@ type Wish struct {
 func (Wish) TableName() string { return "wish" }
 
 type SceneItem struct {
-	ID       int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	KidID    int64     `gorm:"index" json:"kid_id"`
-	ItemKey  string    `gorm:"size:32;column:item_key" json:"item_key"`
-	X        float64   `json:"x"`
-	Y        float64   `json:"y"`
+	ID      int64   `gorm:"primaryKey;autoIncrement" json:"id"`
+	KidID   int64   `gorm:"index" json:"kid_id"`
+	ItemKey string  `gorm:"size:32;column:item_key" json:"item_key"`
+	X       float64 `json:"x"`
+	Y       float64 `json:"y"`
+	// 猫砂盆的脏污档位 0-3；其它道具恒为 0。状态跟随摆放行，收回物品栏再摆即干净。
+	State    int       `gorm:"default:0;column:state" json:"state"`
 	PlacedAt time.Time `gorm:"autoCreateTime;column:placed_at" json:"placed_at"`
 }
 

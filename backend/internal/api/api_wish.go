@@ -207,9 +207,17 @@ func (s *Server) adminWishAction(c *gin.Context) {
 
 // ===== 道具商店（插件化注册表） =====
 
+// 顺序即商店/物品栏的展示顺序（前端 filterShopItems 只过滤、不排序）。
+// 能玩、常买的先露面，16 款猫窝整体后置，避免新商品被一长串窝埋住。
 var ITEM_REGISTRY = []gin.H{
-	{"key": "nest", "name": "猫窝", "price": 30, "type": "furniture"},
+	{"key": "litter-box", "name": "猫砂盆", "price": 30, "type": "furniture"},
+	{"key": "cat-tree", "name": "猫爬架", "price": 50, "type": "furniture"},
+	{"key": "yarn", "name": "毛线球", "price": 15, "type": "furniture"},
+	{"key": "plant", "name": "盆栽", "price": 20, "type": "furniture"},
+	{"key": "fish", "name": "小鱼挂画", "price": 12, "type": "furniture"},
+	// 原照片确认稿作为猫窝组第一张，其余 16 款保持原有相对顺序。
 	{"key": "nest-apple", "name": "切面苹果窝", "price": 40, "type": "furniture"},
+	{"key": "nest", "name": "猫窝", "price": 30, "type": "furniture"},
 	{"key": "nest-lace-square", "name": "花边方窝", "price": 30, "type": "furniture"},
 	{"key": "nest-tent", "name": "三角帐篷", "price": 42, "type": "furniture"},
 	{"key": "nest-petal-cylinder", "name": "粉色花瓣圆筒窝", "price": 45, "type": "furniture"},
@@ -225,10 +233,6 @@ var ITEM_REGISTRY = []gin.H{
 	{"key": "nest-blue-yellow", "name": "蓝壳黄内衬半开放窝", "price": 40, "type": "furniture"},
 	{"key": "nest-red-dots", "name": "红口波点椭圆洞", "price": 44, "type": "furniture"},
 	{"key": "nest-green-monster", "name": "绿色小怪兽窝", "price": 42, "type": "furniture"},
-	{"key": "cat-tree", "name": "猫爬架", "price": 50, "type": "furniture"},
-	{"key": "yarn", "name": "毛线球", "price": 15, "type": "furniture"},
-	{"key": "plant", "name": "盆栽", "price": 20, "type": "furniture"},
-	{"key": "fish", "name": "小鱼挂画", "price": 12, "type": "furniture"},
 	{"key": "wp-pink", "name": "粉色壁纸", "price": 25, "type": "wallpaper"},
 	{"key": "wp-blue", "name": "蓝色壁纸", "price": 25, "type": "wallpaper"},
 	{"key": "wp-mint", "name": "薄荷壁纸", "price": 25, "type": "wallpaper"},

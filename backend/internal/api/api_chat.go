@@ -102,6 +102,8 @@ func eventCNSafe(typ string, payload map[string]any, day string) string {
 		return fmt.Sprintf("%s任务被退回重做了", day)
 	case "item_bought":
 		return fmt.Sprintf("%s买了新道具", day)
+	case "litter_scoop":
+		return fmt.Sprintf("%s主人帮我铲干净了猫砂盆", day)
 	}
 	return ""
 }

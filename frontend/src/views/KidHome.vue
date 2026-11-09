@@ -11,6 +11,8 @@ import TimerOverlay from '../components/TimerOverlay.vue'
 import CatPlayground from '../components/CatPlayground.vue'
 import CatClimb from '../components/CatClimb.vue'
 import PixelShop from '../components/PixelShop.vue'
+import LitterScoop from '../components/LitterScoop.vue'
+import { LITTER_KEY, LITTER_STATE_LABELS, clampLitterState, litterMiniMarkup } from '../litter-box.js'
 import { TREE_CAT_SIZE, TREE_SPRITE_UNITS, GROUND_CAT_FOOT_GAP, treeRoute, treePath, treeDownRoute, treePoint, treeGroundExit, treeEntryReason, gameEntryReason, treeHitNode, treeAnchorMatches, treeVisibleBase, treeHopPoint } from '../cat-tree-room.js'
 import { planInteractionSession, pickInteractionNode, dwellForNode } from '../room-interaction.js'
 import { evidenceSteps } from '../task-evidence.js'
@@ -103,6 +105,10 @@ const sceneItems = ref([])
 const playOpen = ref(false)
 const gameKind = ref('feather')
 const playOpening = ref(false)
+// 猫砂盆：状态存在 scene_item.state（0-3），覆层只在点击时挂载，不常驻房间。
+const litterItem = ref(null)
+let litterUsedThisSession = false // 每次进屋最多让猫用一次，绝不按时间/离线累积
+let litterUseBusy = false
 // 购买猫爬架即解锁无限爬高，房间里是否摆着爬架不影响游戏入口。
 const hasCatTreeGame = computed(() => shopItems.value.some(it => it.key === 'cat-tree' && it.owned))
 const gamePicker = ref(false)
@@ -110,7 +116,7 @@ const gamePickerEl = ref(null)
 const gamePickerClose = ref(null)
 let gamePickerTrigger = null
 let roomPoseBeforePlay = null
-function roomLocked() { return playOpen.value || playOpening.value || treeLeaving.value || shopActionBusy.value || catTouchBusy.value }
+function roomLocked() { return playOpen.value || playOpening.value || treeLeaving.value || shopActionBusy.value || catTouchBusy.value || litterItem.value }
 function gameBusy() {
   return roomLocked() || eating || placingFeed.value || timerTask.value || wizard.value || wizardUploading.value || taskRecStarting.value || startingTask.value || submitting.value || evidenceUploading.value || evidenceTask || chatStreaming.value || recHolding || recState.value !== 'idle' || taskRec.value || wallpaperSaving.value || wishModal.value
 }
@@ -748,6 +754,11 @@ function behaviorTick() {
   if (!adopted.value || gameBusy() || treeSession.value || gamePicker.value || document.hidden || disposed) return
   const hungry = pet.value && pet.value.hunger < 30
   const r = Math.random()
+  // 猫砂盆：饱腹时低概率去用一次，每次进屋最多一次；不按时间/离线累积、不催铲。
+  const litterBox = !hungry && !litterUsedThisSession
+    ? sceneItems.value.find((it) => it.item_key === LITTER_KEY && clampLitterState(it.state) < 3)
+    : null
+  if (litterBox && r < 0.12) { useLitter(litterBox); return }
   // 道具互动：饱腹时 35% 概率找植物/毛线球/猫窝玩（饿了没力气玩）
   const playables = sceneItems.value.filter((it) => ['plant', 'yarn', 'nest', APPLE_NEST_KEY, 'cat-tree'].includes(it.item_key) || isJumpNest(it.item_key))
   if (!hungry && playables.length && r < 0.35) {
@@ -1075,6 +1086,56 @@ function playYarn(it, round, plan = planInteractionSession('yarn')) {
       )
       behaviorNext(1800)
     }
+  })
+}
+
+// ===== 猫砂盆：小图状态由后端 scene_item.state 驱动，铲屎动作只在全屏覆层里 =====
+// 变脏只能由猫在线真用过一次触发；不按时间/离线累积、不催铲、不扣心情。
+function openLitter(it) {
+  if (gameBusy()) return
+  if (!clampLitterState(it.state)) { showToast('盆盆干干净净～等小猫用过再来铲吧'); return }
+  cancelNest({ animate: false })
+  litterItem.value = it
+}
+async function onLitterScooped(delta) {
+  const item = litterItem.value
+  if (!item || !delta) return
+  const local = sceneItems.value.find((x) => x.id === item.id)
+  if (local) local.state = Math.max(0, clampLitterState(local.state) - delta)
+  try {
+    const { ok, data } = await jpost('/litter/scoop', { id: item.id, delta })
+    if (!ok || typeof data.state !== 'number') showToast('铲屎结果没保存上，稍后再看看')
+    else if (local) local.state = data.state
+  } catch { showToast('网络不太稳，铲屎结果稍后同步') }
+  // 覆层关闭后 roomLocked 才解除，此时刷新能拿到后端真值。
+  if (!litterItem.value) await refreshScene()
+}
+function onLitterClose() {
+  litterItem.value = null
+  behaviorNext(1200)
+}
+function useLitter(box) {
+  if (gameBusy() || litterUseBusy || litterUsedThisSession) return
+  litterUsedThisSession = true
+  litterUseBusy = true
+  cancelNest({ animate: false })
+  const beside = 52
+  walkTo({ x: box.x + (catPos.x < box.x ? -beside : beside), y: box.y }, () => {
+    facePoint(box.x)
+    catAnim.value = 'eat' // 低头刨砂，沿用现有帧表
+    say('刨一刨…好啦！')
+    stateTimer = setTimeout(async () => {
+      catAnim.value = 'sit'
+      try {
+        const { ok, data } = await jpost('/litter/use', { id: box.id })
+        if (ok && typeof data.state === 'number') {
+          const local = sceneItems.value.find((x) => x.id === box.id)
+          if (local) local.state = data.state
+        }
+      } catch { /* 本次没同步上不影响互动，下次进屋会重新拉场景 */ }
+      litterUseBusy = false
+      behaviorNext(1500)
+    }, 1400)
   })
 }
 
@@ -2117,7 +2178,8 @@ function onItemPointerDown(e, it, sceneId) {
         playTree(it, mode)
         return
       }
-      if (drag.id && (['plant', 'nest', 'yarn', APPLE_NEST_KEY].includes(drag.key) || isJumpNest(drag.key))) interactWith(it)
+      if (drag.id && drag.key === LITTER_KEY) openLitter(it)
+      else if (drag.id && (['plant', 'nest', 'yarn', APPLE_NEST_KEY].includes(drag.key) || isJumpNest(drag.key))) interactWith(it)
       else showToast('按住拖动来摆放，拖到房间边缘可以收回')
       return
     }
@@ -2345,14 +2407,17 @@ onBeforeUnmount(() => {
     <div v-for="it in placedDecor" :key="it.id" class="scene-item"
       :class="{ shake: shakeId === it.id }"
       :style="{ left: it.x + 'px', top: it.y + 'px', zIndex: decorDepth(it), transition: it.item_key === 'yarn' ? 'left .8s ease' : '' }"
-      :title="it.item_key === 'cat-tree' ? '点顶部、小窝、柱子有不同反应，按住拖动摆放' : decorArt(it.item_key).name"
-      :tabindex="it.item_key === 'cat-tree' ? 0 : undefined" :role="it.item_key === 'cat-tree' ? 'button' : undefined"
-      :aria-label="it.item_key === 'cat-tree' ? '猫爬架，点不同位置和小猫互动，按住拖动摆放' : undefined"
-      @keydown.enter.prevent.stop="it.item_key === 'cat-tree' && playTree(it, 'top')"
-      @keydown.space.prevent.stop="it.item_key === 'cat-tree' && playTree(it, 'top')"
+      :title="it.item_key === 'cat-tree' ? '点顶部、小窝、柱子有不同反应，按住拖动摆放' : it.item_key === LITTER_KEY ? '猫砂盆 · ' + LITTER_STATE_LABELS[clampLitterState(it.state)] + '（点开铲屎，按住拖动摆放）' : decorArt(it.item_key).name"
+      :tabindex="it.item_key === 'cat-tree' || it.item_key === LITTER_KEY ? 0 : undefined" :role="it.item_key === 'cat-tree' || it.item_key === LITTER_KEY ? 'button' : undefined"
+      :aria-label="it.item_key === 'cat-tree' ? '猫爬架，点不同位置和小猫互动，按住拖动摆放' : it.item_key === LITTER_KEY ? '猫砂盆，' + LITTER_STATE_LABELS[clampLitterState(it.state)] + '，点开铲屎' : undefined"
+      @keydown.enter.prevent.stop="it.item_key === 'cat-tree' ? playTree(it, 'top') : it.item_key === LITTER_KEY && openLitter(it)"
+      @keydown.space.prevent.stop="it.item_key === 'cat-tree' ? playTree(it, 'top') : it.item_key === LITTER_KEY && openLitter(it)"
       @pointerdown="(e) => onItemPointerDown(e, it, it.id)">
       <img v-if="it.item_key === 'nest-apple'" class="nest-img" src="/art/nest-apple.png" :style="{ width: decorArt(it.item_key).size + 'px' }" :alt="decorArt(it.item_key).name">
       <img v-else-if="isJumpNest(it.item_key)" class="nest-img" :src="nestArt(nestProfile(it.item_key), 'back')" :style="{ width: nestProfile(it.item_key).display[0] + 'px' }" :alt="decorArt(it.item_key).name">
+      <div v-else-if="it.item_key === LITTER_KEY" class="litter-mini"
+        :style="{ width: decorArt(it.item_key).size + 'px' }"
+        v-html="litterMiniMarkup(it.state || 0)"></div>
       <PixelItem v-else :item-key="it.item_key" :size="decorArt(it.item_key).size" />
     </div>
 
@@ -2686,6 +2751,9 @@ onBeforeUnmount(() => {
   <Teleport to="body">
     <CatPlayground v-if="playOpen && adopted && gameKind === 'feather'" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
     <CatClimb v-if="playOpen && adopted && gameKind === 'climb'" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
+    <LitterScoop v-if="litterItem && adopted" :state="clampLitterState(litterItem.state)"
+      :species="species" :mood="pet?.mood ?? 100"
+      @scooped="onLitterScooped" @close="onLitterClose" />
   </Teleport>
 </template>
 
@@ -2733,6 +2801,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .bubble { position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); width: max-content; max-width: 300px; background: #FFFCF6; border: 1.5px solid #CBB49A; border-radius: 12px; padding: 8px 12px; font-size: 12px; line-height: 1.5; font-weight: 600; white-space: normal; overflow-wrap: anywhere; box-shadow: 0 4px 12px rgba(103, 75, 47, .12); pointer-events: none; }
 .zzz { position: absolute; top: -20px; right: 0; }
 .scene-item { position: absolute; transform: translate(-50%, -100%); line-height: 0; cursor: grab; user-select: none; touch-action: none; }
+/* 猫砂盆小图：整张 SVG 按 scene_item.state 换档，96px 是能一眼看出团数的下限。 */
+.litter-mini { line-height: 0; filter: drop-shadow(0 4px 0 rgba(90, 62, 38, .2)); }
+.litter-mini :deep(svg) { display: block; width: 100%; height: auto; image-rendering: pixelated; }
 .nest-front { position: absolute; transform: translate(-50%, -100%); line-height: 0; pointer-events: none; }
 .nest-img { display: block; height: auto; image-rendering: pixelated; }
 /* 确认稿 demo 的 .shade：窝宽 240 配 220x13 椭圆投影，底边比窝底低 5px，压在窝体下层。

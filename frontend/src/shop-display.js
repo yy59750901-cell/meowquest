@@ -30,6 +30,10 @@ const SHOP_DISPLAY = {
     unlockBadge: '购买后解锁家具互动和无限爬高游戏',
     ownedHint: '无限爬高已加入「和猫玩」；摆进房间后，点不同位置还有不同反应。',
   },
+  'litter-box': {
+    name: '猫砂盆', category: 'furniture', icon: '/art/litter-box-thumb.svg',
+    description: '小猫用过之后会留下结团，小图上看得见；点开就能帮它铲干净。',
+  },
   'wall-default': { name: '原装白墙', category: 'decor', description: '房间自带的温暖白墙，可随时换回，不耗星星。' },
   'wp-pink': { category: 'decor', description: '柔粉像素壁纸，替换房间整面墙的颜色与纹理。' },
   'wp-blue': { category: 'decor', description: '雾蓝像素壁纸，替换房间整面墙的颜色与纹理。' },

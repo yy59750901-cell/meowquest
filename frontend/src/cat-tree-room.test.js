@@ -7,6 +7,7 @@ import { parse, compileScript, compileTemplate } from '@vue/compiler-sfc'
 import * as tree from './cat-tree-room.js'
 import * as interaction from './room-interaction.js'
 import * as catalog from './nest-catalog.js'
+import * as litter from './litter-box.js'
 import { decorArt, getSceneLighting, isWallpaper } from './scene-art.js'
 import { getShopDisplay } from './shop-display.js'
 
@@ -30,7 +31,7 @@ function harness() {
   const focusable = name => Vue.markRaw({ name, isConnected: true, focus() { document.activeElement = this }, getBoundingClientRect: () => ({ left: 350, top: 260, width: 192, height: 192 }), querySelector: () => null })
   const trigger = focusable('爬架'), close = focusable('关闭'), action = focusable('动作')
   const context = {
-    ...tree, ...interaction, ...catalog, decorArt, getSceneLighting, isWallpaper, getShopDisplay, ref: Vue.ref, computed: Vue.computed, reactive: Vue.reactive, nextTick: Vue.nextTick,
+    ...tree, ...interaction, ...catalog, ...litter, decorArt, getSceneLighting, isWallpaper, getShopDisplay, ref: Vue.ref, computed: Vue.computed, reactive: Vue.reactive, nextTick: Vue.nextTick,
     onMounted: fn => { hooks.mount = fn }, onBeforeUnmount: fn => { hooks.cleanup = fn }, watch: (get, fn) => watchers.push([get, fn]),
     showToast: text => toasts.push(text), closeToast() {}, showDialog() {}, showConfirmDialog: async () => {}, reviewPending: () => false, reviewStages: {}, evidenceSteps: () => [],
     document, window: { innerWidth: 1280, innerHeight: 720, matchMedia: () => ({ matches: false }), ...host('window') },
@@ -412,7 +413,10 @@ test('爬架仍可键盘互动、位置提示更新；收回爬架后游戏入�
   assert.match(furniture.props.title, /不同反应/)
   assert.equal(furniture.props['aria-expanded'], undefined)
   assert.match(furniture.props['aria-label'], /点不同位置/)
-  assert.match(source, /@keydown\.enter\.prevent\.stop="it\.item_key === 'cat-tree' && playTree\(it, 'top'\)"/)
+  // 键盘分支扩展为爬架 / 猫砂盆两条，语义不变，断言口径同步更新。
+  const keyExpr = "it.item_key === 'cat-tree' ? playTree(it, 'top') : it.item_key === LITTER_KEY && openLitter(it)"
+  assert.ok(source.includes(`@keydown.enter.prevent.stop="${keyExpr}"`), '爬架仍可键盘互动，猫砂盆也可点开铲屎')
+  assert.ok(source.includes(`@keydown.space.prevent.stop="${keyExpr}"`), '空格键同样覆盖两条分支')
   ui.sceneItems.value = []
   assert.equal(ui.shopViewItems.value[0].actionLabel, '摆放')
   await ui.openTreeGame()
@@ -808,3 +812,42 @@ for (const boundary of ['hidden', 'removed', 'unmount']) {
     if (boundary !== 'unmount') ui.cleanup()
   })
 }
+
+test('猫砂盆：干净时不开覆层，有结团时点开，铲完按数量发一次 scoop', async () => {
+  const ui = harness()
+  const box = { id: 91, item_key: 'litter-box', x: 400, y: 600, state: 0 }
+  ui.sceneItems.value = [box]
+
+  ui.openLitter(box)
+  assert.equal(ui.litterItem.value, null, '干净时点小图不该弹覆层')
+  assert.ok(ui.toasts.some(text => text.includes('干干净净')), '应给出等待小猫用过的提示')
+
+  box.state = 2
+  ui.openLitter(box)
+  // ref 会把对象包成 reactive proxy，按 id/字段核对而不是引用相等。
+  assert.equal(ui.litterItem.value?.id, 91, '脏时点小图打开同一个摆放实例')
+  assert.equal(ui.litterItem.value?.state, 2)
+
+  await ui.onLitterScooped(2)
+  const scoop = ui.requests.find(req => req.url === '/api/litter/scoop')
+  assert.ok(scoop, '关闭覆层要按铲掉的数量结算')
+  assert.deepEqual(scoop.body, { id: 91, delta: 2 })
+  assert.equal(box.state, 0, '后端返回 state=0 要立刻回写，小图变干净')
+
+  ui.onLitterClose()
+  assert.equal(ui.litterItem.value, null)
+  ui.cleanup()
+})
+
+test('猫砂盆：状态只由猫在线用过触发，不按时间或离线累积', () => {
+  const ui = harness()
+  const box = { id: 92, item_key: 'litter-box', x: 420, y: 600, state: 0 }
+  ui.sceneItems.value = [box]
+  // Math.random 桩恒为 .9，behaviorTick 的 litter 分支 (r<0.12) 不会命中，
+  // 但源码里不能出现按时间差累加状态的写法。
+  assert.match(source, /litterUsedThisSession/)
+  assert.match(source, /jpost\('\/litter\/use', \{ id: box\.id \}\)/)
+  assert.doesNotMatch(source, /Date\.now\(\).*state\s*\+\+/, '不允许按离线时间攒脏污')
+  assert.match(source, /clampLitterState\(it\.state\) < 3/, '满 3 团后不再让猫继续使用')
+  ui.cleanup()
+})

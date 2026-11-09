@@ -928,3 +928,12 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - `git push origin main` 成功 `83ab991..a165887`，推后 HEAD 与 `origin/main` 同步。随后把部署/提交状态补记为本节，并按历史惯例做 docs 小提交保持工作区干净。
 - **本机**：8600 已是同一份产物（`index-p0wJMGBA.js` / `index-BS2idrri.css`）；Vite dev server 5173 服务当前源码，供 DEV-only 的 `/climb-preview` 交互验收。
 - **边界**：C 方案（墙/地板分界线）未实施；390/320 小屏窗户残余、320 展开态工具条溢出、`cat-tree` 缩略图、摇杆帽盖箭头与 `NEAR_PAD` 全平台统一取舍，均按第四十六节如实保留，本轮未外扩。`backend/internal/web/dist` 仍按既有约定入库供 Go embed。
+
+## 四十八、猫砂盆小图 + 全屏铲屎落地（11/09，本地已验收，未提交/未部署）
+
+- **决策**：勇哥拍板「商店买小图摆屋里 → 小图按猫屎多少变化、一眼看出 → 点开全屏覆层放大版铲屎」，并确认状态要保存。存 `scene_item.state` 的 0-3 档位计数（不存每坨坐标）；**保存 ≠ 按时间累积**，离线不新增，只有猫在线真用过才 +1、封顶 3，不催铲、不扣心情。
+- **后端**：`model.go` SceneItem 加 `State`（`autoMigrateAll` 已含该表，重启自动加列；`schema_mysql.sql` 仅文档同步并补齐缺失的 kid_id）；新 `api_litter.go` 两条原子增减接口 `/litter/use`（`LEAST(3,state+1)`）与 `/litter/scoop`（`GREATEST(0,state-delta)`，带 id/kid_id/item_key 校验并写 `litter_scoop` 事件）；`api.go` 注册、`eventCNSafe` 补中文、`ITEM_REGISTRY` 加 30 星商品。刻意不用 RowsAffected 判成功——钳到边界时值不变会返回 0。
+- **前端**：新 `litter-box.js`（四档小图 SVG、砂块预设点、心情分档）+ `LitterScoop.vue`（全屏覆层，复用已验收原型的拖拽手感）+ `public/art/litter-box-thumb.svg`；`KidHome.vue` 按 `it.state` 换小图、点击白名单开覆层、`behaviorTick` 低概率触发猫用一次（每会话最多 +1）、关闭时按铲掉数发 scoop 并刷新；`shop-display.js` / `scene-art.js` 注册 96px。心情只改猫的姿势/距离/灰度/台词。
+- **验证**：前端 **272/272** 单测（新增 6 条纯逻辑 + 2 条接线行为/红线，同步更新 1 条键盘断言口径）、`go test ./...`、`npm run build`、`go build`、`git diff --check` 全过。真实构建产物浏览器验收 1280/390/320 + 心情低用例 **105/105 FAILURES 0**（真实 pointer 拖拽、状态联动、覆层几何），独立原型回归 **324/324**；截图 `litter-game-check/`、`litter-room-check/` 并逐张目视。
+- **看图修掉的真问题**：`CatSprite` 内部 svg 固定 110px 不随 `--u` 缩放、手机上溢出压住小桶；`.cat` 的 left/top 过渡在 `--u` 初始化期间让猫滑去压桶；心情低/一般档猫位越过桶沿（三档统一收进 <=424 并写进单测防回归）。
+- **边界**：`frontend/build.sh` 已同步 embed、后端重编译并重启本机 8600（PID 87233，`index-BJYPgF3G.js` / `index-4_ny3oxm.css`，首页 200 且 JS 含 `/litter/use`）；**线上未部署**，未跑 `deploy.sh`，改动未 commit / 未 push。手机竖屏全屏覆层上下留白偏大（宽扁舞台居中），如实保留。

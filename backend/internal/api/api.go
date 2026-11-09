@@ -65,6 +65,9 @@ func (s *Server) Router() *gin.Engine {
 		api.GET("/scene", s.kid, s.sceneLayout)
 		api.POST("/scene/place", s.kid, s.placeItem)
 		api.POST("/scene/remove", s.kid, s.removeItem)
+		// 猫砂盆状态：猫用过 +1、铲完 -delta，两条都是原子增减
+		api.POST("/litter/use", s.kid, s.litterUse)
+		api.POST("/litter/scoop", s.kid, s.litterScoop)
 	}
 	admin := r.Group("/api/admin")
 	{

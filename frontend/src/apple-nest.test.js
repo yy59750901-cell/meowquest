@@ -37,9 +37,12 @@ test('底部工具栏容器不吃点击，.actions 按钮整块可点', () => {
 
 test('商店含老窝、切面苹果窝与 15 款新窝，前后端 key/名称/价格一致', () => {
   const keys = [...registry.matchAll(/\{"key": "(nest[^"]*)"/g)].map(m => m[1])
-  assert.equal(keys[0], 'nest')
-  assert.equal(keys[1], 'nest-apple')
+  // A 档重排（11/09）：能玩的 5 件商品整体提前，猫窝组以原照片确认稿打头，其余保持原相对顺序。
+  assert.equal(keys[0], 'nest-apple')
+  assert.equal(keys[1], 'nest')
   assert.deepEqual(keys.slice(2), NEST_KEYS)
+  assert.ok(registry.indexOf('"key": "litter-box"') < registry.indexOf('"key": "nest-apple"'),
+    '猫砂盆必须排在猫窝组之前')
   assert.match(registry, /\{"key": "nest-apple", "name": "切面苹果窝", "price": 40, "type": "furniture"\}/)
   for (const key of NEST_KEYS) {
     const p = NEST_CATALOG[key]

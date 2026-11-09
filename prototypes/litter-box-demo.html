@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>猫砂盆 · 房间小图 + 全屏铲屎原型（独立 demo）</title>
+<!-- 独立原型：不接入 meowquest 代码，不请求后端，不写入任何数据。
+     房间视图按游戏世界 1:1 画（窄屏是相机裁切，不是整体缩放）；
+     全屏覆层里的近景舞台按宽度缩放。确认形态后再决定是否接进游戏。 -->
+<style>
+  :root {
+    --u: 1px;
+    --mini: 96px;
+    --paper: #FFFCF6;
+    --ink: #5D493B;
+    --line: #CBB49A;
+    --mood: #99AE89;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 22px 14px 44px;
+    background: #FBF5E9;
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body.overlay-open { overflow: hidden; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  .card {
+    background: var(--paper);
+    border: 2px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 0 12px 36px rgba(100, 73, 47, .12);
+    overflow: hidden;
+  }
+  .head { padding: 18px 20px 13px; border-bottom: 1px solid #E6D8C5; }
+  h1 { margin: 0 0 5px; font-size: 19px; font-weight: 600; }
+  .sub { margin: 0; font-size: 12px; color: #8A7561; line-height: 1.6; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 12px 20px; background: #FFFDF8; border-bottom: 1px solid #E6D8C5;
+  }
+  .ctl-label { font-size: 12px; color: #8A7561; font-weight: 600; }
+  .mood-group { display: flex; gap: 6px; }
+  button {
+    font: inherit; font-size: 12px; font-weight: 600; color: var(--ink);
+    border: 1.5px solid #D9C6AD; background: #FAF3E3;
+    border-radius: 10px; padding: 7px 11px; cursor: pointer;
+    touch-action: manipulation; white-space: nowrap;
+  }
+  button:hover { border-color: #B99C7B; }
+  button.on { background: var(--mood); border-color: #7E966F; color: #fff; }
+  button.primary { background: #C78776; border-color: #B0705F; color: #fff; }
+  button.ghost { background: #F7F0E5; }
+  button:disabled { opacity: .5; cursor: default; }
+  .spacer { flex: 1 1 auto; }
+  .mood-chip { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; }
+  .mood-chip .bar { width: 68px; height: 8px; border-radius: 5px; background: #E9E1D3; overflow: hidden; }
+  .mood-chip .bar i { display: block; height: 100%; background: var(--mood); transition: width .25s ease; }
+  .progress { font-size: 12px; font-weight: 600; color: #8A7561; }
+  .state-text { font-size: 12px; font-weight: 600; color: #6D5844; }
+  .shop-mini {
+    display: flex; align-items: center; gap: 8px; padding: 4px 9px 4px 5px;
+    border: 1.5px solid #E6D8C5; border-radius: 10px; background: #F7F0E5;
+  }
+  .shop-thumb { display: block; width: 34px; height: 28px; }
+  .shop-thumb svg { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
+  .shop-mini b { display: block; font-size: 12px; line-height: 1.3; }
+  .shop-mini small { display: block; font-size: 10px; color: #8A7561; line-height: 1.4; }
+
+  /* ===== 房间视图：1:1 世界坐标，窄屏靠裁切（和游戏相机一致），不整体缩放 ===== */
+  .room-shell { padding: 16px 20px 18px; background: #F6EFE1; }
+  .room {
+    position: relative; width: 100%; max-width: 640px; height: 360px; margin: 0 auto;
+    border: 2px solid #D9C6AD; border-radius: 12px; overflow: hidden;
+    background: #E7CDA6;
+  }
+  .r-wall { position: absolute; inset: 0 0 auto 0; height: 210px; background: #FAF3E3; }
+  .r-wall::after {
+    content: ''; position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent 0 23px, rgba(190, 168, 135, .10) 23px 24px);
+  }
+  .r-skirting {
+    position: absolute; left: 0; top: 204px; width: 100%; height: 16px;
+    background: linear-gradient(to bottom, #c69969 0 30%, #a77950 30% 58%, #8b6345 58% 72%, #ae8056 72% 92%, #79583e 92%);
+  }
+  .r-floor {
+    position: absolute; left: 0; top: 220px; width: 100%; height: 140px;
+    background: repeating-linear-gradient(90deg, #E7CDA6 0 78px, #DCC097 78px 80px, #EBD4AF 80px 158px, #D3B48C 158px 160px);
+  }
+  .r-floor::after {
+    content: ''; position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent 0 51px, rgba(120, 88, 56, .12) 51px 53px);
+  }
+  .r-window {
+    position: absolute; left: 390px; top: 44px; width: 180px; height: 130px;
+    border: 8px solid #B98960; border-radius: 4px; background: #CFE3EB;
+    box-shadow: inset 0 0 0 4px #E8D2B4;
+  }
+  .r-window::before, .r-window::after {
+    content: ''; position: absolute; background: #B98960;
+  }
+  .r-window::before { left: 50%; top: 0; width: 6px; height: 100%; transform: translateX(-50%); }
+  .r-window::after { left: 0; top: 50%; width: 100%; height: 6px; transform: translateY(-50%); }
+  .r-item { position: absolute; image-rendering: pixelated; }
+  .r-nest { left: 10px; top: 262px; width: 120px; height: 62px; }
+  .r-yarn { left: 350px; top: 320px; width: 34px; height: 34px; }
+  .r-cat { left: 120px; top: 250px; width: 110px; height: 83px; }
+  .r-cat svg { width: 100%; height: 100%; display: block; }
+  .litter-mini {
+    position: absolute; left: 240px; top: 268px;
+    width: var(--mini); height: calc(var(--mini) * 0.833);
+    cursor: pointer; border: 0; padding: 0; background: none;
+    filter: drop-shadow(0 5px 0 rgba(90, 62, 38, .18));
+    transition: filter .18s ease, transform .18s ease;
+  }
+  .litter-mini:hover { filter: drop-shadow(0 7px 2px rgba(90, 62, 38, .26)); transform: translateY(-2px); }
+  .litter-mini svg { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
+  .litter-mini.clean-pop { animation: cleanpop .42s ease; }
+  @keyframes cleanpop { 0%,100% { transform: scale(1) } 45% { transform: scale(1.14) } }
+  .r-state {
+    position: absolute; left: 232px; top: 224px; min-width: 112px; text-align: center;
+    padding: 4px 9px; border-radius: 14px; background: #FFFCF6;
+    border: 1.5px solid #CBB49A; font-size: 12px; font-weight: 600; white-space: nowrap;
+    box-shadow: 0 4px 10px rgba(103, 75, 47, .12);
+  }
+  .room-hint {
+    width: fit-content; max-width: 100%; margin: 10px auto 0; padding: 6px 14px;
+    border-radius: 20px; background: #FFFCF6; border: 1px solid #D9C6AD;
+    font-size: 12px; font-weight: 600; color: #6D5844; text-align: center; line-height: 1.6;
+  }
+
+  /* ===== 全屏覆层 ===== */
+  .overlay { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+    padding: 12px; background: rgba(58, 44, 32, .58); }
+  .overlay[hidden] { display: none; }
+  .overlay-card {
+    width: min(940px, 100%); max-height: calc(100dvh - 24px); overflow-y: auto;
+    background: var(--paper); border: 2px solid var(--line); border-radius: 18px;
+    box-shadow: 0 24px 60px rgba(45, 32, 20, .3);
+  }
+  .overlay-head {
+    display: flex; align-items: center; gap: 12px; padding: 14px 18px;
+    border-bottom: 1px solid #E6D8C5; background: #FFFDF8;
+  }
+  .overlay-head b { font-size: 16px; }
+  .overlay-head small { display: block; font-size: 11px; color: #8A7561; margin-top: 2px; }
+  .overlay-head .spacer { flex: 1; }
+  .overlay-controls {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 18px; border-bottom: 1px solid #E6D8C5; background: #FFFDF8;
+  }
+  .stage-shell { padding: 14px 18px 16px; background: #F6EFE1; }
+  .stage {
+    position: relative; width: 100%; max-width: 680px; margin: 0 auto;
+    aspect-ratio: 680 / 420;
+    border: 2px solid #D9C6AD; border-radius: 12px;
+    background: #E7CDA6; overflow: hidden;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  .world {
+    position: absolute; left: 0; top: 0;
+    width: calc(var(--u) * 680); height: calc(var(--u) * 420);
+  }
+  .wall { position: absolute; left: 0; top: 0; width: calc(var(--u) * 680); height: calc(var(--u) * 252); background: #FAF3E3; }
+  .wall::after {
+    content: ''; position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent 0 23px, rgba(190, 168, 135, .10) 23px 24px);
+  }
+  .skirting {
+    position: absolute; left: 0; top: calc(var(--u) * 246);
+    width: calc(var(--u) * 680); height: calc(var(--u) * 16);
+    background: linear-gradient(to bottom, #c69969 0 30%, #a77950 30% 58%, #8b6345 58% 72%, #ae8056 72% 92%, #79583e 92%);
+  }
+  .floor {
+    position: absolute; left: 0; top: calc(var(--u) * 262);
+    width: calc(var(--u) * 680); height: calc(var(--u) * 158);
+    background: repeating-linear-gradient(90deg, #E7CDA6 0 78px, #DCC097 78px 80px, #EBD4AF 80px 158px, #D3B48C 158px 160px);
+  }
+  .floor::after {
+    content: ''; position: absolute; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent 0 51px, rgba(120, 88, 56, .12) 51px 53px);
+  }
+  .pixel { position: absolute; image-rendering: pixelated; display: block; }
+
+  .clump {
+    position: absolute; width: calc(var(--u) * 44); height: calc(var(--u) * 40);
+    transform: translate(-50%, -50%); transition: filter .15s ease;
+    filter: drop-shadow(0 calc(var(--u) * 3) 0 rgba(90, 62, 38, .18));
+  }
+  .clump svg { width: 100%; height: 100%; display: block; }
+  .clump.held { z-index: 9; filter: drop-shadow(0 calc(var(--u) * 8) calc(var(--u) * 4) rgba(90, 62, 38, .28)); }
+  .clump.gone { display: none; }
+  .scoop {
+    position: absolute; width: calc(var(--u) * 92); height: calc(var(--u) * 78);
+    transform: translate(-50%, -50%); cursor: grab; z-index: 8; touch-action: none;
+  }
+  .scoop.dragging { cursor: grabbing; }
+  .scoop.returning { transition: left .45s ease, top .45s ease; }
+  .scoop svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .scoop.shake { animation: shake .22s ease; }
+  @keyframes shake { 0%,100% { rotate: 0deg } 30% { rotate: -7deg } 70% { rotate: 7deg } }
+  .bin-open {
+    position: absolute; left: calc(var(--u) * 528); top: calc(var(--u) * 194);
+    width: calc(var(--u) * 134); height: calc(var(--u) * 104);
+    border: calc(var(--u) * 3) dashed #5D8C6A; border-radius: calc(var(--u) * 12);
+    background: rgba(157, 187, 163, .16); opacity: 0; transition: opacity .18s ease;
+    pointer-events: none; z-index: 3;
+  }
+  .bin-open.show { opacity: 1; }
+  .bin-label {
+    position: absolute; left: 0; right: 0; top: calc(var(--u) * -24);
+    text-align: center; font-size: max(10px, calc(var(--u) * 12)); font-weight: 600; color: #4E7557;
+    white-space: nowrap;
+  }
+  .bin.bump { animation: bump .28s ease; }
+  @keyframes bump { 0%,100% { translate: 0 0 } 45% { translate: 0 calc(var(--u) * -6) } }
+  .cat { position: absolute; z-index: 6; transition: left .5s ease, top .5s ease, filter .3s ease; }
+  .cat svg { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
+  .cat.hop { animation: hop .5s ease 2; }
+  @keyframes hop { 0%,100% { translate: 0 0 } 45% { translate: 0 calc(var(--u) * -14) } }
+  .bubble {
+    position: absolute; right: calc(var(--u) * -8); bottom: calc(100% + 8px);
+    z-index: 9; max-width: max(160px, calc(var(--u) * 220)); white-space: nowrap;
+    background: var(--paper); border: 1.5px solid var(--line); border-radius: 12px;
+    padding: 7px 11px; font-size: max(11px, calc(var(--u) * 13)); font-weight: 600;
+    line-height: 1.5; box-shadow: 0 6px 14px rgba(103, 75, 47, .14);
+    pointer-events: none;
+  }
+  .hint {
+    width: fit-content; max-width: 100%; margin: 10px auto 0; padding: 6px 14px;
+    border-radius: 20px; background: #FFFCF6; border: 1px solid #D9C6AD;
+    font-size: 12px; font-weight: 600; color: #6D5844; text-align: center; line-height: 1.6;
+  }
+  .grain {
+    position: absolute; width: calc(var(--u) * 5); height: calc(var(--u) * 5);
+    background: #C9A87A; z-index: 7; pointer-events: none; animation: fall .42s ease-in forwards;
+  }
+  @keyframes fall {
+    from { opacity: 1; translate: 0 0; }
+    to { opacity: 0; translate: var(--gx, 0px) calc(var(--u) * 34); }
+  }
+  .heart {
+    position: absolute; z-index: 11; color: #C14B6E;
+    font-size: max(14px, calc(var(--u) * 22)); font-weight: 700; pointer-events: none;
+    animation: floatup .9s ease-out forwards;
+  }
+  @keyframes floatup {
+    from { opacity: 1; translate: 0 0; }
+    to { opacity: 0; translate: var(--hx, 0px) calc(var(--u) * -48); }
+  }
+
+  .notes { padding: 16px 20px 20px; border-top: 1px solid #E6D8C5; }
+  .notes h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+  .notes ol { margin: 0; padding-left: 20px; font-size: 12px; line-height: 1.85; color: #6D5844; }
+  .notes p { margin: 10px 0 0; font-size: 11px; line-height: 1.7; color: #9A8570; }
+  @media (max-width: 560px) {
+    body { padding: 12px 8px 30px; }
+    .head { padding: 14px 14px 11px; }
+    .controls, .overlay-controls { padding: 10px 14px; gap: 6px; }
+    .room-shell { padding: 12px 12px 14px; }
+    .stage-shell { padding: 10px 10px 12px; }
+    .spacer { flex-basis: 100%; height: 0; }
+    .notes { padding: 14px; }
+    .overlay { padding: 0; }
+    /* 竖屏里宽扁舞台撑不满高度：内容整体垂直居中，避免上半截挤满、下半截全空。 */
+    .overlay-card {
+      width: 100%; min-height: 100dvh; max-height: none;
+      border: 0; border-radius: 0; display: flex; flex-direction: column; justify-content: center;
+    }
+    .overlay-head { padding: 12px 14px; }
+    /* 窄屏是相机裁切：把小图挪进可视区，收掉次要装饰，避免半张盆被裁掉。 */
+    .r-nest, .r-yarn { display: none; }
+    .r-cat { left: 20px; }
+    .litter-mini { left: 150px; }
+    .r-state { left: 142px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="head">
+      <h1>猫砂盆 · 房间小图 + 全屏铲屎</h1>
+      <p class="sub">房间只摆一个小图，猫屎多少一眼看得见；点小图打开全屏覆层，里面是放大、细节更多的铲屎动作。</p>
+    </div>
+
+    <div class="controls">
+      <div class="shop-mini">
+        <span class="shop-thumb" id="shopThumb"></span>
+        <span><b>猫砂盆</b><small>商店 · 30 ⭐ · 已拥有</small></span>
+      </div>
+      <span class="spacer"></span>
+      <button type="button" class="primary" id="useBtn">小猫用了一次</button>
+      <button type="button" id="sizeBtn">小图尺寸 96 → 72</button>
+      <button type="button" class="ghost" id="resetRoomBtn">重置房间</button>
+      <span class="state-text" id="roomStateText">干干净净</span>
+    </div>
+
+    <div class="room-shell">
+      <div class="room" id="room" aria-label="房间视图：猫砂盆小图摆在地板上，点它打开全屏铲屎">
+        <div class="r-wall"></div>
+        <div class="r-window"></div>
+        <div class="r-skirting"></div>
+        <div class="r-floor"></div>
+
+        <svg class="r-item r-nest" viewBox="0 0 120 62" shape-rendering="crispEdges" aria-hidden="true">
+          <ellipse cx="60" cy="57" rx="52" ry="4" fill="rgba(90,62,38,.16)"/>
+          <path d="M8 34h104v6h4v14H4V40h4z" fill="#8B6345"/>
+          <path d="M10 36h100v4h2v12H8V40h2z" fill="#D6A16B"/>
+          <path d="M14 42h92v8H14z" fill="#F0D3A6"/>
+          <path d="M28 24h64v6h6v10H22V30h6z" fill="#A47B55"/>
+          <path d="M30 26h60v4h4v8H26V30h4z" fill="#E7C896"/>
+        </svg>
+
+        <svg class="r-item r-yarn" viewBox="0 0 34 34" shape-rendering="crispEdges" aria-hidden="true">
+          <ellipse cx="17" cy="30" rx="12" ry="2.5" fill="rgba(90,62,38,.18)"/>
+          <path d="M9 5h16v2h4v4h2v12h-2v4h-4v2H9v-2H5v-4H3V11h2V7h4z" fill="#9B7BC4"/>
+          <path d="M9 5h16v2H9zM5 11h4v12H5z" fill="#C4A9E4"/>
+          <path d="M13 10h8v2h-8zM13 20h8v2h-8z" fill="#7E5EA8"/>
+        </svg>
+
+        <div class="r-item r-cat" id="roomCat"></div>
+
+        <div class="r-state" id="rState">干干净净</div>
+        <button type="button" class="litter-mini" id="litterMini" aria-label="猫砂盆，点开铲屎"></button>
+      </div>
+      <div class="room-hint" id="roomHint">先点「小猫用了一次」，看小图怎么变；再点小图打开全屏。</div>
+    </div>
+
+    <div class="notes">
+      <h2>这个原型在验证什么</h2>
+      <ol>
+        <li><b>小图状态</b>：0 / 1 / 2 / 3 团四档，砂面上结团数量不同，3 团时多两条气味线；96px 与 72px 可切换对比，看哪种尺寸一眼能认出来。</li>
+        <li><b>点开全屏</b>：小图只占房间一小块，铲子、小桶、放大砂面全部只在覆层里出现；覆层里的砂块数量和小图显示的团数一致，铲完关掉，小图同步变干净。</li>
+        <li><b>刻意没有</b>：按时间/离线攒猫屎、红点催铲、脏了扣心情、每日必铲、倒计时和计分。「小猫用了一次」在这里是按钮，游戏里应是猫的自主行为。</li>
+      </ol>
+      <p>房间视图按游戏世界 1:1 绘制，窄屏是相机裁切而非整体缩放（与游戏一致）。独立 HTML 原型，未接入 meowquest 代码，不请求后端、不写入数据。</p>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay" hidden role="dialog" aria-modal="true" aria-label="铲猫屎全屏覆层">
+  <div class="overlay-card">
+    <div class="overlay-head">
+      <div><b>铲猫屎</b><small id="overlaySub">把结团砂块铲进右边小桶</small></div>
+      <span class="spacer"></span>
+      <button type="button" id="closeBtn">关闭 ✕</button>
+    </div>
+    <div class="overlay-controls">
+      <span class="ctl-label">小猫心情</span>
+      <div class="mood-group" id="moodGroup">
+        <button type="button" data-mood="good" class="on" aria-pressed="true">心情好</button>
+        <button type="button" data-mood="ok" aria-pressed="false">一般</button>
+        <button type="button" data-mood="low" aria-pressed="false">有点蔫</button>
+      </div>
+      <div class="mood-chip"><span>心情</span><span class="bar"><i id="moodBar" style="width:85%"></i></span><span id="moodNum">85</span></div>
+      <span class="spacer"></span>
+      <span class="progress" id="progress">已铲 0 / 3</span>
+      <button type="button" class="primary" id="demoBtn">看一遍演示</button>
+      <button type="button" id="resetBtn">再玩一次</button>
+    </div>
+    <div class="stage-shell">
+      <div class="stage" id="stage" role="img" aria-label="猫砂盆近景：拖动铲子把结团砂块铲进右侧小桶">
+        <div class="world" id="world">
+          <div class="wall"></div>
+          <div class="skirting"></div>
+          <div class="floor"></div>
+
+          <svg class="pixel" style="left:calc(var(--u) * 62); top:calc(var(--u) * 202); width:calc(var(--u) * 380); height:calc(var(--u) * 150)" viewBox="0 0 380 150" shape-rendering="crispEdges" aria-hidden="true">
+            <rect x="0" y="24" width="380" height="126" fill="#8B6345"/>
+            <rect x="8" y="30" width="364" height="112" fill="#C9A276"/>
+            <rect x="8" y="6" width="364" height="24" fill="#E0BC90"/>
+            <rect x="8" y="6" width="364" height="6" fill="#F2D9B0"/>
+            <rect x="8" y="24" width="364" height="6" fill="#B98C61"/>
+            <rect x="20" y="38" width="340" height="78" fill="#EFE0BE"/>
+            <rect x="20" y="38" width="340" height="5" fill="#E4D0A6"/>
+            <g fill="#D8BF95">
+              <rect x="36" y="54" width="5" height="4"/><rect x="72" y="72" width="4" height="4"/>
+              <rect x="112" y="50" width="5" height="4"/><rect x="146" y="88" width="4" height="4"/>
+              <rect x="188" y="58" width="5" height="4"/><rect x="224" y="98" width="4" height="4"/>
+              <rect x="268" y="52" width="5" height="4"/><rect x="304" y="82" width="4" height="4"/>
+              <rect x="336" y="62" width="5" height="4"/><rect x="58" y="102" width="4" height="4"/>
+              <rect x="128" y="106" width="5" height="4"/><rect x="210" y="46" width="4" height="4"/>
+              <rect x="292" y="106" width="5" height="4"/><rect x="342" y="96" width="4" height="4"/>
+            </g>
+            <rect x="0" y="116" width="380" height="34" fill="#A47B55"/>
+            <rect x="8" y="120" width="364" height="7" fill="#D4A875"/>
+            <rect x="8" y="138" width="364" height="12" fill="#8B6345"/>
+            <rect x="24" y="132" width="26" height="6" fill="#C99B6E"/>
+            <rect x="330" y="132" width="26" height="6" fill="#C99B6E"/>
+          </svg>
+
+          <div id="clumps"></div>
+
+          <div class="bin-open" id="binOpen"><span class="bin-label">放这里松手</span></div>
+          <svg class="pixel bin" id="bin" style="left:calc(var(--u) * 540); top:calc(var(--u) * 212); width:calc(var(--u) * 116); height:calc(var(--u) * 132)" viewBox="0 0 116 132" shape-rendering="crispEdges" aria-hidden="true">
+            <rect x="18" y="26" width="80" height="98" fill="#6E8F78"/>
+            <rect x="24" y="30" width="68" height="92" fill="#9DBBA3"/>
+            <rect x="24" y="30" width="10" height="92" fill="#B6CFB9"/>
+            <rect x="82" y="30" width="10" height="92" fill="#82A18A"/>
+            <rect x="8" y="14" width="100" height="16" fill="#5F8169"/>
+            <rect x="8" y="14" width="100" height="5" fill="#7FA48A"/>
+            <rect x="50" y="4" width="16" height="12" fill="#5F8169"/>
+            <rect x="40" y="54" width="7" height="46" fill="#7FA48A"/>
+            <rect x="55" y="54" width="7" height="46" fill="#7FA48A"/>
+            <rect x="70" y="54" width="7" height="46" fill="#7FA48A"/>
+            <rect x="18" y="118" width="80" height="8" fill="#5F8169"/>
+          </svg>
+
+          <div class="cat pixel" id="cat">
+            <svg id="catSvg" viewBox="0 0 16 12" shape-rendering="crispEdges"></svg>
+            <div class="bubble" id="bubble">我帮你看着！</div>
+          </div>
+
+          <div class="scoop" id="scoop" aria-label="可拖动的猫砂铲">
+            <svg viewBox="0 0 92 78" shape-rendering="crispEdges">
+              <rect x="40" y="0" width="13" height="30" fill="#8B6345"/>
+              <rect x="36" y="0" width="21" height="9" fill="#A47B55"/>
+              <rect x="40" y="3" width="13" height="4" fill="#C99B6E"/>
+              <rect x="6" y="28" width="80" height="42" fill="#8B6345"/>
+              <rect x="10" y="32" width="72" height="34" fill="#E0CDA8"/>
+              <g stroke="#A4825A" stroke-width="2">
+                <line x1="24" y1="32" x2="24" y2="66"/><line x1="38" y1="32" x2="38" y2="66"/>
+                <line x1="52" y1="32" x2="52" y2="66"/><line x1="66" y1="32" x2="66" y2="66"/>
+                <line x1="10" y1="44" x2="82" y2="44"/><line x1="10" y1="56" x2="82" y2="56"/>
+              </g>
+              <rect x="6" y="66" width="80" height="8" fill="#A47B55"/>
+              <rect x="6" y="28" width="80" height="4" fill="#C99B6E"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+      <div class="hint" id="hint">按住铲子 → 拖到砂块上铲起 → 拖到右边小桶松手</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // 猫的像素帧直接取自 frontend/src/components/CatSprite.vue，保证和游戏里是同一只猫。
+  var FR = {
+    idle: ['.B....B.....BB..', '.BB..BB.....BB..', '.BBBBBB.....BB..', 'BeBeBBBBppBBBB..', 'BBBBBBBpppBBBB..', 'BBBBBBBBBBBBB...', '.BBBBBBBBBBBB...', '.BBBBpppBBBBB...', '.BBBBpppBBBBB...', '.BB.BB..BB.BB...', '.BB.BB..BB.BB...', '.B...B..B...B...'],
+    wag: ['.B....B......B..', '.BB..BB......BB.', '.BBBBBB......BB.', 'BeBeBBBBppBBBBB.', 'BBBBBBBpppBBBBB.', 'BBBBBBBBBBBBB...', '.BBBBBBBBBBBB...', '.BBBBpppBBBBB...', '.BBBBpppBBBBB...', '.BB.BB..BB.BB...', '.BB.BB..BB.BB...', '.B...B..B...B...'],
+    sit: ['..B....B........', '..BB..BB........', '..BBBBBB........', '.BeBeBBB........', '.BBBBBBB........', '..BBBBBB........', '...BBBBppB......', '...BBBBppBB.....', '...BBBBBBBBB....', '...BB.BBBBBB..B.', '...BB.BppBBBBBB.', '..BBB.BppBBBBB..'],
+    sleep: ['................', '................', '................', '................', '................', '..B....B........', '..BB..BBppBBB...', '..BBBBBBppBBBB..', '.BeeBeeBBBBBBBB.', '.BBBBBBBBppBBBB.', '..BBBBBBBppBBBB.', '.BBBBBBBBBBBBB..']
+  };
+  var PAL = { B: '#E8975A', p: '#F5E6C8', e: '#1B5E3A', z: '#2B2B2B', m: '#C14B6E' };
+
+  var MOODS = {
+    good: {
+      value: 85, frames: ['idle', 'idle', 'wag'], catX: 416, catY: 148, filter: 'none',
+      start: '我帮你看着！', pick: '沙沙沙～好舒服', drop: '干净啦！喵～',
+      done: '盆盆好舒服，谢谢你！', back: '还差一点点～'
+    },
+    ok: {
+      value: 55, frames: ['sit'], catX: 412, catY: 156, filter: 'none',
+      start: '喵…慢慢来', pick: '嗯…', drop: '谢谢',
+      done: '嗯，舒服多了，喵。', back: '放回砂盆里啦～'
+    },
+    low: {
+      value: 22, frames: ['sit'], catX: 408, catY: 158, filter: 'grayscale(.75)',
+      start: '……（不太想动）', pick: '……', drop: '…喵',
+      done: '…谢谢你，我过来啦。', back: '慢慢来就好'
+    }
+  };
+
+  var START_CLUMPS = [{ x: 152, y: 268 }, { x: 252, y: 292 }, { x: 342, y: 258 }];
+  var SCOOP_HOME = { x: 300, y: 132 };
+  var BIN_ZONE = { left: 534, right: 656, top: 190, bottom: 296 };
+  var STATE_LABELS = ['干干净净', '有 1 团啦', '有 2 团啦', '满啦 · 有得玩'];
+
+  var $ = function (id) { return document.getElementById(id); };
+  var room = $('room'), mini = $('litterMini'), overlay = $('overlay');
+  var stage = $('stage'), world = $('world'), scoop = $('scoop'), clumpsBox = $('clumps');
+  var cat = $('cat'), catSvg = $('catSvg'), bubble = $('bubble');
+  var binOpen = $('binOpen'), bin = $('bin'), hint = $('hint');
+  var progressEl = $('progress'), moodBar = $('moodBar'), moodNum = $('moodNum');
+  var demoBtn = $('demoBtn'), resetBtn = $('resetBtn');
+
+  var roomState = 0;
+  var miniSize = 96;
+  var moodKey = 'good';
+  var clumps = [];
+  var held = null;
+  var scoopPos = { x: SCOOP_HOME.x, y: SCOOP_HOME.y };
+  var dragging = false;
+  var demoRunning = false;
+  var doneCount = 0;
+  var frameTimer = null;
+
+  function unit() { return stage.clientWidth / 680; }
+  function syncUnit() { stage.style.setProperty('--u', unit() + 'px'); }
+  function px(n) { return 'calc(var(--u) * ' + n + ')'; }
+  function logical(e) {
+    var r = stage.getBoundingClientRect();
+    var u = unit();
+    return { x: (e.clientX - r.left - stage.clientLeft) / u,
+             y: (e.clientY - r.top - stage.clientTop) / u };
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ===== 房间小图：状态直接画进砂面，不用角标、不做红点 =====
+  function miniClump(cx, cy) {
+    return '<path d="M' + (cx - 5) + ' ' + (cy + 2) + 'h2v-2h3v-2h3v2h2v5h-10z" fill="#B98F63" stroke="#8B6345" stroke-width="0.8"/>'
+      + '<rect x="' + (cx - 2) + '" y="' + (cy - 2) + '" width="3" height="2" fill="#E0C79C"/>';
+  }
+  function miniMarkup(n) {
+    var s = '<svg viewBox="0 0 48 40" shape-rendering="crispEdges">';
+    if (n >= 3) {
+      s += '<g fill="none" stroke="#C7B283" stroke-width="1.6" stroke-linecap="round">'
+        + '<path d="M13 7 q3 -4 6 0"/><path d="M28 4 q3 -4 6 0"/></g>';
+    }
+    s += '<rect x="2" y="12" width="44" height="24" fill="#8B6345"/>'
+      + '<rect x="4" y="14" width="40" height="20" fill="#C9A276"/>'
+      + '<rect x="2" y="9" width="44" height="6" fill="#E0BC90"/>'
+      + '<rect x="2" y="9" width="44" height="2" fill="#F2D9B0"/>'
+      + '<rect x="6" y="15" width="36" height="13" fill="#EFE0BE"/>'
+      + '<rect x="6" y="15" width="36" height="2" fill="#E4D0A6"/>'
+      + '<g fill="#D8BF95"><rect x="9" y="20" width="2" height="2"/><rect x="19" y="25" width="2" height="2"/>'
+      + '<rect x="29" y="19" width="2" height="2"/><rect x="38" y="24" width="2" height="2"/></g>';
+    if (n === 0) {
+      s += '<path d="M39 2h2v3h3v2h-3v3h-2V7h-3V5h3z" fill="#FFFFFF" opacity=".95"/>';
+    } else if (n === 1) {
+      s += miniClump(24, 22);
+    } else if (n === 2) {
+      s += miniClump(15, 22) + miniClump(32, 22);
+    } else {
+      s += miniClump(12, 21) + miniClump(24, 24) + miniClump(35, 20);
+    }
+    s += '<rect x="2" y="29" width="44" height="7" fill="#A47B55"/>'
+      + '<rect x="4" y="30" width="40" height="2" fill="#D4A875"/>'
+      + '</svg>';
+    return s;
+  }
+  function setRoomState(n, pop) {
+    roomState = Math.max(0, Math.min(3, n));
+    mini.innerHTML = miniMarkup(roomState);
+    mini.dataset.state = String(roomState);
+    $('rState').textContent = STATE_LABELS[roomState];
+    $('roomStateText').textContent = STATE_LABELS[roomState];
+    $('useBtn').disabled = roomState >= 3;
+    if (pop) {
+      mini.classList.remove('clean-pop');
+      void mini.offsetWidth;
+      mini.classList.add('clean-pop');
+    }
+  }
+  function setMiniSize(v) {
+    miniSize = v;
+    document.documentElement.style.setProperty('--mini', v + 'px');
+    $('sizeBtn').textContent = v === 96 ? '小图尺寸 96 → 72' : '小图尺寸 72 → 96';
+  }
+
+  function frameMarkup(name) {
+    var rows = FR[name] || FR.sit, out = '';
+    for (var y = 0; y < rows.length; y++) {
+      for (var x = 0; x < rows[y].length; x++) {
+        var ch = rows[y][x];
+        if (ch !== '.' && ch !== ' ' && PAL[ch]) {
+          out += '<rect x="' + x + '" y="' + y + '" width="1.02" height="1.02" fill="' + PAL[ch] + '"/>';
+        }
+      }
+    }
+    return '<svg viewBox="0 0 16 12" shape-rendering="crispEdges" style="width:100%;height:100%;display:block">' + out + '</svg>';
+  }
+
+  function clumpSvg() {
+    return '<svg viewBox="0 0 44 40" shape-rendering="crispEdges">'
+      + '<ellipse cx="22" cy="34" rx="16" ry="3" fill="rgba(90,62,38,.16)"/>'
+      + '<path d="M8 12h6V8h8v4h8V6h6v6h4v14h-4v6H12v-6H6V16h2z" fill="#C9A87A" stroke="#A8815A" stroke-width="2"/>'
+      + '<rect x="12" y="14" width="5" height="4" fill="#DCBE94"/><rect x="26" y="18" width="4" height="4" fill="#B38F63"/>'
+      + '<rect x="18" y="24" width="5" height="4" fill="#B38F63"/><rect x="30" y="10" width="4" height="3" fill="#DCBE94"/>'
+      + '</svg>';
+  }
+  function buildClumps(n) {
+    clumpsBox.innerHTML = '';
+    clumps = START_CLUMPS.slice(0, n).map(function (p, i) {
+      var el = document.createElement('div');
+      el.className = 'clump';
+      el.innerHTML = clumpSvg();
+      el.dataset.index = String(i);
+      clumpsBox.appendChild(el);
+      return { x: p.x, y: p.y, homeX: p.x, homeY: p.y, el: el, state: 'ground' };
+    });
+    renderClumps();
+  }
+  function renderClumps() {
+    clumps.forEach(function (c) {
+      c.el.classList.toggle('held', c.state === 'held');
+      c.el.classList.toggle('gone', c.state === 'gone');
+      c.el.style.left = px(c.x);
+      c.el.style.top = px(c.y);
+    });
+  }
+
+  function setScoop(x, y) {
+    scoopPos.x = x; scoopPos.y = y;
+    scoop.style.left = px(x); scoop.style.top = px(y);
+    if (held) {
+      held.x = x; held.y = y + 12;
+      held.el.style.left = px(held.x); held.el.style.top = px(held.y);
+    }
+  }
+  function scoopFace() { return { x: scoopPos.x, y: scoopPos.y + 12 }; }
+  function inBin(p) {
+    return p.x >= BIN_ZONE.left && p.x <= BIN_ZONE.right && p.y >= BIN_ZONE.top && p.y <= BIN_ZONE.bottom;
+  }
+  function say(text) { bubble.textContent = text; bubble.style.display = 'block'; }
+
+  function setMood(key) {
+    moodKey = key;
+    var m = MOODS[key];
+    document.querySelectorAll('#moodGroup button').forEach(function (b) {
+      var on = b.dataset.mood === key;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-pressed', String(on));
+    });
+    moodBar.style.width = m.value + '%';
+    moodNum.textContent = String(m.value);
+    cat.style.left = px(m.catX); cat.style.top = px(m.catY);
+    cat.style.width = px(110); cat.style.height = px(83);
+    catSvg.style.filter = m.filter;
+    startFrames();
+    if (!held) say(doneCount >= clumps.length && clumps.length ? m.done : doneCount > 0 ? m.drop : m.start);
+  }
+  function drawFrame(name) { catSvg.innerHTML = frameMarkup(name).replace(/^<svg[^>]*>/, '').replace(/<\/svg>$/, ''); }
+  function startFrames() {
+    clearInterval(frameTimer);
+    var frames = MOODS[moodKey].frames, i = 0;
+    drawFrame(frames[0]);
+    frameTimer = setInterval(function () { i = (i + 1) % frames.length; drawFrame(frames[i]); }, 600);
+  }
+
+  function grains(x, y) {
+    for (var i = 0; i < 9; i++) {
+      var g = document.createElement('div');
+      g.className = 'grain';
+      g.style.left = px(x - 18 + Math.random() * 36);
+      g.style.top = px(y - 4 + Math.random() * 10);
+      g.style.setProperty('--gx', (Math.random() * 26 - 13) + 'px');
+      world.appendChild(g);
+      (function (node) { setTimeout(function () { node.remove(); }, 460); })(g);
+    }
+  }
+  function hearts() {
+    for (var i = 0; i < 4; i++) {
+      var h = document.createElement('div');
+      h.className = 'heart'; h.textContent = '♥';
+      h.style.left = px(MOODS[moodKey].catX + 20 + i * 16);
+      h.style.top = px(MOODS[moodKey].catY + 6);
+      h.style.setProperty('--hx', (Math.random() * 30 - 15) + 'px');
+      h.style.animationDelay = (i * 90) + 'ms';
+      world.appendChild(h);
+      (function (node) { setTimeout(function () { node.remove(); }, 1200); })(h);
+    }
+  }
+
+  function tryPickup() {
+    if (held || doneCount >= clumps.length) return;
+    var f = scoopFace(), best = null, bestD = 46;
+    clumps.forEach(function (c) {
+      if (c.state !== 'ground') return;
+      var d = Math.hypot(c.x - f.x, c.y - f.y);
+      if (d < bestD) { bestD = d; best = c; }
+    });
+    if (!best) return;
+    held = best; best.state = 'held'; best.el.classList.add('held');
+    grains(best.x, best.y);
+    scoop.classList.remove('shake'); void scoop.offsetWidth; scoop.classList.add('shake');
+    say(MOODS[moodKey].pick);
+    setScoop(scoopPos.x, scoopPos.y);
+  }
+  function updateProgress() { progressEl.textContent = '已铲 ' + doneCount + ' / ' + clumps.length; }
+  function release() {
+    if (!held) return;
+    var c = held;
+    held = null;
+    binOpen.classList.remove('show');
+    if (inBin(scoopFace())) {
+      c.state = 'gone'; doneCount += 1; updateProgress();
+      bin.classList.remove('bump'); void bin.offsetWidth; bin.classList.add('bump');
+      if (moodKey === 'good') { cat.classList.remove('hop'); void cat.offsetWidth; cat.classList.add('hop'); hearts(); }
+      if (doneCount >= clumps.length) {
+        say(MOODS[moodKey].done);
+        hint.textContent = '全铲干净啦！点「关闭」回房间，看看小图变什么样';
+        $('overlaySub').textContent = '铲完啦，关掉覆层看看小图';
+        if (moodKey !== 'good') { cat.classList.remove('hop'); void cat.offsetWidth; cat.classList.add('hop'); hearts(); }
+      } else {
+        say(MOODS[moodKey].drop);
+      }
+      scoop.classList.add('returning');
+      setScoop(SCOOP_HOME.x, SCOOP_HOME.y);
+      setTimeout(function () { scoop.classList.remove('returning'); }, 480);
+    } else {
+      c.state = 'ground'; c.x = c.homeX; c.y = c.homeY;
+      say(MOODS[moodKey].back);
+    }
+    renderClumps();
+  }
+
+  function reset() {
+    demoRunning = false; demoBtn.disabled = false;
+    held = null; doneCount = 0;
+    updateProgress();
+    hint.textContent = '按住铲子 → 拖到砂块上铲起 → 拖到右边小桶松手';
+    $('overlaySub').textContent = '把结团砂块铲进右边小桶';
+    binOpen.classList.remove('show');
+    clumps.forEach(function (c) { c.state = 'ground'; c.x = c.homeX; c.y = c.homeY; });
+    renderClumps();
+    setScoop(SCOOP_HOME.x, SCOOP_HOME.y);
+    say(MOODS[moodKey].start);
+  }
+
+  // ===== 覆层开关：小图状态 ↔ 覆层砂块数 ↔ 关闭后小图状态 =====
+  function openOverlay() {
+    if (!roomState) {
+      $('roomHint').textContent = '盆盆现在干干净净～先点「小猫用了一次」，就有得铲啦';
+      return;
+    }
+    overlay.hidden = false;
+    document.body.classList.add('overlay-open');
+    syncUnit();
+    buildClumps(roomState);
+    reset();
+    setMood(moodKey);
+    $('roomHint').textContent = '覆层里铲完关掉，小图会跟着变';
+    $('closeBtn').focus();
+  }
+  function closeOverlay() {
+    demoRunning = false;
+    var left = clumps.filter(function (c) { return c.state !== 'gone'; }).length;
+    var wasDirty = roomState > 0;
+    overlay.hidden = true;
+    document.body.classList.remove('overlay-open');
+    setRoomState(left, wasDirty && left === 0);
+    $('roomHint').textContent = left === 0
+      ? '小图变干净啦！想再玩就点「小猫用了一次」，随时都能玩'
+      : '还剩 ' + left + ' 团，小图和刚才铲到哪是一致的';
+  }
+
+  scoop.addEventListener('pointerdown', function (e) {
+    if (demoRunning) return;
+    e.preventDefault(); e.stopPropagation();
+    dragging = true;
+    scoop.classList.remove('returning');
+    scoop.classList.add('dragging');
+    scoop.setPointerCapture(e.pointerId);
+    var p = logical(e); setScoop(p.x, p.y);
+  });
+  scoop.addEventListener('pointermove', function (e) {
+    if (!dragging || demoRunning) return;
+    var p = logical(e); setScoop(p.x, p.y);
+    tryPickup();
+    if (held) binOpen.classList.add('show');
+  });
+  function endDrag(e) {
+    if (!dragging) return;
+    dragging = false;
+    scoop.classList.remove('dragging');
+    if (e && scoop.hasPointerCapture && e.pointerId !== undefined && scoop.hasPointerCapture(e.pointerId)) {
+      scoop.releasePointerCapture(e.pointerId);
+    }
+    release();
+  }
+  scoop.addEventListener('pointerup', endDrag);
+  scoop.addEventListener('pointercancel', endDrag);
+
+  function glideTo(x, y, ms, pickup) {
+    return new Promise(function (resolve) {
+      var from = { x: scoopPos.x, y: scoopPos.y }, t0 = performance.now();
+      function step(t) {
+        var k = Math.min(1, (t - t0) / ms);
+        var e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+        setScoop(from.x + (x - from.x) * e, from.y + (y - from.y) * e);
+        if (k < 1) requestAnimationFrame(step);
+        else {
+          if (pickup) tryPickup();
+          if (held) binOpen.classList.add('show');
+          resolve();
+        }
+      }
+      requestAnimationFrame(step);
+    });
+  }
+  async function autoDemo() {
+    if (demoRunning) return;
+    reset(); demoRunning = true; demoBtn.disabled = true;
+    await sleep(320);
+    for (var i = 0; i < clumps.length && demoRunning; i++) {
+      var c = clumps[i];
+      await glideTo(c.homeX, c.homeY - 12, 700, true);
+      await sleep(360);
+      if (!demoRunning) return;
+      await glideTo(590, 232, 820);
+      await sleep(220);
+      release();
+      if (i < clumps.length - 1) await sleep(620);
+    }
+    demoRunning = false; demoBtn.disabled = false;
+  }
+
+  $('useBtn').addEventListener('click', function () {
+    setRoomState(Math.min(3, roomState + 1), false);
+    $('roomHint').textContent = '小图变了吗？点小图打开全屏，里面的砂块数量和它一致';
+  });
+  $('sizeBtn').addEventListener('click', function () { setMiniSize(miniSize === 96 ? 72 : 96); });
+  $('resetRoomBtn').addEventListener('click', function () {
+    setRoomState(0, false);
+    $('roomHint').textContent = '已重置：先点「小猫用了一次」，看小图怎么变；再点小图打开全屏';
+  });
+  mini.addEventListener('click', openOverlay);
+  $('closeBtn').addEventListener('click', closeOverlay);
+  overlay.addEventListener('pointerdown', function (e) { if (e.target === overlay) closeOverlay(); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !overlay.hidden) closeOverlay(); });
+  $('moodGroup').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-mood]');
+    if (b) setMood(b.dataset.mood);
+  });
+  demoBtn.addEventListener('click', autoDemo);
+  resetBtn.addEventListener('click', function () { reset(); });
+
+  $('roomCat').innerHTML = frameMarkup('sit');
+  $('shopThumb').innerHTML = miniMarkup(0);
+  setMiniSize(96);
+  setRoomState(0, false);
+  buildClumps(0);
+  syncUnit();
+  if (window.ResizeObserver) new ResizeObserver(syncUnit).observe(stage);
+  window.addEventListener('resize', syncUnit);
+  setMood('good');
+  setScoop(SCOOP_HOME.x, SCOOP_HOME.y);
+})();
+</script>
+</body>
+</html>
