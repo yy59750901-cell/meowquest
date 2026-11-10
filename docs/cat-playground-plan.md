@@ -939,3 +939,10 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - **边界**：`frontend/build.sh` 已同步 embed，本机 8600 同步过同一份产物。手机竖屏全屏覆层上下留白偏大（宽扁舞台居中），如实保留。
 - **发布（11/09 16:2x）**：用户明确「提交push，然后发布吧，不用备份老的服务和数据库」。`deploy.sh` 四步全过（交叉编译 → scp → systemctl 替换重启 → 健康检查），`systemd active`、线上首页 200；线上真实产物 `index-BJYPgF3G.js` / `index-4_ny3oxm.css` 与 `litter-box-thumb.svg` 均 200，JS 含 `/litter/use`、`/litter/scoop`，CSS 含 `litter-overlay` / `litter-mini`，服务日志最近 30 行无 error / migration / panic（重启时 AutoMigrate 已自动为 `scene_item` 加 `state` 列）。脚本本身无备份步骤、不触碰数据库，与用户要求一致。
 - **提交**：`ed1c28b` `feat: 接入猫砂盆小图与全屏铲屎，状态持久化并调整商店顺序`（23 文件 +1961 / −55），push `8d011d9..ed1c28b`，HEAD 与 `origin/main` 0/0 同步。提交前对 1929 行新增文本做 URL / IP / 凭据扫描 **0 命中**，暂存清单无 `.env` / `.deploy.local` / 密钥 / 日志误入。
+
+## 四十九、心情口径与发奖衰减发布（11/10 16:5x）
+
+- 用户明确「提交push，然后发布，不需要备份原来的服务和数据库」。`backend/deploy.sh` 只有交叉编译 → scp → systemctl 替换重启 → 健康检查四步，无备份步骤、不触碰数据库，与要求一致；真实服务器/域名仍只在 gitignore 的 `backend/.deploy.local`。
+- **提交**：先跑 `frontend/build.sh` 同步 embed（`index-DTP6RFu4.js` / `index-DuM0vttx.css`），`8943d20` `fix: 结算发奖前先按结算时钟衰减心情，低状态文案统一为变灰`（8 文件 +47 / −11，两个 embed 资源识别为 rename），push `25d480f..8943d20`，HEAD 与 `origin/main` 0/0 同步。提交前 `go test ./...`、前端 272/272、`go build`、`git diff --check` 全过；新增文本 URL / IP / 凭据扫描 0 命中，暂存清单无 `.env` / `.deploy.local` / 密钥误入。
+- **发布**：`deploy.sh` 四步全过，`systemd active`、首页 200。线上 `index.html` 引用与本地 embed 一致（`index-DTP6RFu4.js` / `index-DuM0vttx.css`），JS/CSS 均 200，线上 JS 含新文案「低于 30 猫会变灰」；线上二进制 SHA256 `a4fc9e63…` 与本地 release 逐字节一致；最近 30 行服务日志无 error / panic / fatal / migration / warn。按指令未备份旧二进制与数据库。
+- **范围**：两件搁置项收口（文档 184/197/288 行与 HUD 统一「低于 30 变灰」口径；发奖前 `TickAt` 先衰减再 `LEAST(100, mood+10)`），断签 -20 口径未动。本轮无 schema 变化。视觉验收沿用 11/10 11:12 的 1440×900 / 390×844 饱腹提示展开态四张实拍（气泡无溢出、无重叠）+ 10:52 的 320 小屏截图，本轮只缩短文案。
