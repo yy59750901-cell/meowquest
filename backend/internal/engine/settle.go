@@ -434,6 +434,14 @@ func ReconcileKidLocked(db *store.DB, kidID int64, now time.Time) error {
 				unprocessedCredits--
 			}
 			if state == "missed" {
+				// 断签：连击从有到无的当天扣 20 心情。row.State 已是 missed 说明本日扣过；
+				// streak>0 保证连续漏做只扣一次，也不惩罚本来就没有连击的孩子。
+				if streak > 0 && row.State != "missed" {
+					if err = db.Model(&store.Pet{}).Where("kid_id=?", kidID).
+						Update("mood", gorm.Expr("GREATEST(0, mood-20)")).Error; err != nil {
+						return err
+					}
+				}
 				streak = 0
 			}
 			v := streak
@@ -512,8 +520,10 @@ func ReconcileKidLocked(db *store.DB, kidID int64, now time.Time) error {
 		if err = db.Create(&led).Error; err != nil {
 			return err
 		}
+		// 任务完成的唯一发奖点：与星星同一事务、由 task 流水保证幂等，每个任务只 +10 心情。
 		if err = db.Model(&store.Pet{}).Where("kid_id=?", kidID).Updates(map[string]any{
-			"balance": gorm.Expr("balance+?", final), "earned_total": gorm.Expr("earned_total+?", final)}).Error; err != nil {
+			"balance": gorm.Expr("balance+?", final), "earned_total": gorm.Expr("earned_total+?", final),
+			"mood": gorm.Expr("LEAST(100, mood+10)")}).Error; err != nil {
 			return err
 		}
 		if err = markSettled(db, dt.ID, int(taskStreak)); err != nil {

@@ -1561,3 +1561,97 @@ func TestStreakLegacyZeroCachePaidTodayStillEndsAtOne(t *testing.T) {
 		})
 	}
 }
+
+// 心情与星星同在唯一发奖点：每个任务 +10，重复结算不重加，封顶 100。
+func TestTaskSettlementAddsMoodOncePerTaskAndCapsAt100(t *testing.T) {
+	s, kid, now := streakFixture(t, 0, false)
+	setMood := func(v float64) {
+		t.Helper()
+		if err := s.DB.Model(&store.Pet{}).Where("kid_id=?", kid.ID).Update("mood", v).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	setMood(50)
+	dt := streakTask(t, s, kid, now, 1, "a", "weekday_fixed", "pending")
+	if !settleStreak(t, s, dt, now) {
+		t.Fatal("任务应完成结算")
+	}
+	if p := streakPet(t, s, kid); p.Mood != 60 {
+		t.Fatalf("完成一个任务应 +10 心情，实际 %.1f", p.Mood)
+	}
+	// 补审/重放不能重复加心情
+	settleStreak(t, s, dt, now)
+	if p := streakPet(t, s, kid); p.Mood != 60 {
+		t.Fatalf("重复结算又加了心情：%.1f", p.Mood)
+	}
+	// 第二个任务各加一次，并保持 100 上限
+	setMood(95)
+	dt2 := streakTask(t, s, kid, now, 1, "a", "weekday_fixed", "pending")
+	settleStreak(t, s, dt2, now)
+	if p := streakPet(t, s, kid); p.Mood != 100 {
+		t.Fatalf("心情应封顶 100，实际 %.1f", p.Mood)
+	}
+	setMood(50)
+	dt3 := streakTask(t, s, kid, now, 1, "a", "weekday_fixed", "pending")
+	settleStreak(t, s, dt3, now)
+	if p := streakPet(t, s, kid); p.Mood != 60 {
+		t.Fatalf("新任务应再 +10 心情，实际 %.1f", p.Mood)
+	}
+}
+
+// 断签：连击从有到无当天 -20，重复对账/连续漏做不重扣，下限 0。
+func TestStreakBreakDeductsMoodTwentyOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mood, want float64
+	}{
+		{"正常扣 20", 80, 60},
+		{"下限 0", 10, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, kid, now := streakFixture(t, 2, false)
+			if err := s.DB.Model(&store.Pet{}).Where("kid_id=?", kid.ID).Update("mood", tc.mood).Error; err != nil {
+				t.Fatal(err)
+			}
+			// 当天有参与连击的固定日任务，孩子没做；过了提交窗口即断签。
+			streakTask(t, s, kid, now, 1, "c", "weekday_fixed", "pending")
+			midnight, _ := time.ParseInLocation("2006-01-02", engine.BusinessDate(now), engine.BusinessLocation)
+			end := midnight.AddDate(0, 0, 1)
+			if err := engine.Reconcile(s.DB, end); err != nil {
+				t.Fatal(err)
+			}
+			if p := streakPet(t, s, kid); p.Streak != 0 || p.Mood != tc.want {
+				t.Fatalf("断签应清零连击且心情 %.0f，实际 %+v", tc.want, p)
+			}
+			if err := engine.Reconcile(s.DB, end); err != nil {
+				t.Fatal(err)
+			}
+			if p := streakPet(t, s, kid); p.Mood != tc.want {
+				t.Fatalf("重复对账又扣了心情：%.1f", p.Mood)
+			}
+			if err := engine.Reconcile(s.DB, end.AddDate(0, 0, 1)); err != nil {
+				t.Fatal(err)
+			}
+			if p := streakPet(t, s, kid); p.Mood != tc.want {
+				t.Fatalf("连击为 0 后的漏做不应再扣：%.1f", p.Mood)
+			}
+		})
+	}
+}
+
+// 请假/休息日是 neutral，不算断签：不扣心情，也不清连击。
+func TestLeaveDayDoesNotDeductMood(t *testing.T) {
+	s, kid, now := streakFixture(t, 2, false)
+	if err := s.DB.Model(&store.Pet{}).Where("kid_id=?", kid.ID).Update("mood", 80).Error; err != nil {
+		t.Fatal(err)
+	}
+	streakTask(t, s, kid, now, 1, "c", "weekday_fixed", "pending")
+	mustTaskCreate(t, s.DB, &store.LeaveRecord{KidID: kid.ID, Date: engine.BusinessDate(now), Reason: "请假"})
+	midnight, _ := time.ParseInLocation("2006-01-02", engine.BusinessDate(now), engine.BusinessLocation)
+	if err := engine.Reconcile(s.DB, midnight.AddDate(0, 0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if p := streakPet(t, s, kid); p.Mood != 80 || p.Streak != 2 {
+		t.Fatalf("请假日不应扣心情或清连击：%+v", p)
+	}
+}
