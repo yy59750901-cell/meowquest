@@ -31,6 +31,8 @@ func streakFixture(t *testing.T, base int64, legacy bool) (*Server, store.Kid, t
 	mustTaskCreate(t, db, &kid)
 	now, _ := time.ParseInLocation("2006-01-02 15:04", engine.BusinessDate(time.Now())+" 12:00", engine.BusinessLocation)
 	pet := store.Pet{KidID: kid.ID, Name: "测试猫", Streak: base, StreakBaseValue: base, Balance: 100, EarnedTotal: 100}
+	// 结算会在发奖前按结算时钟补齐衰减；基线对齐到 fixture 时钟，用例不受本机当前时刻影响。
+	pet.LastTick = &now
 	if !legacy {
 		pet.StreakBaseDate = engine.BusinessDate(now)
 	}
@@ -1596,6 +1598,31 @@ func TestTaskSettlementAddsMoodOncePerTaskAndCapsAt100(t *testing.T) {
 	settleStreak(t, s, dt3, now)
 	if p := streakPet(t, s, kid); p.Mood != 60 {
 		t.Fatalf("新任务应再 +10 心情，实际 %.1f", p.Mood)
+	}
+}
+
+// 长期不上线：发奖前先按结算时钟衰减，+10 不会被 100 上限吃掉；饱腹同时被提前结算。
+func TestTaskSettlementTicksBeforeMoodReward(t *testing.T) {
+	s, kid, now := streakFixture(t, 0, false)
+	last := now.Add(-40 * time.Hour)
+	if err := s.DB.Model(&store.Pet{}).Where("kid_id=?", kid.ID).Updates(map[string]any{
+		"mood": 100, "hunger": 100, "hunger_decay": 2, "last_tick": last,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	dt := streakTask(t, s, kid, now, 1, "a", "weekday_fixed", "pending")
+	if !settleStreak(t, s, dt, now) {
+		t.Fatal("任务应完成结算")
+	}
+	p := streakPet(t, s, kid)
+	if p.Mood != 90 {
+		t.Fatalf("应先衰减 20 再 +10，期望 90，实际 %.1f", p.Mood)
+	}
+	if p.Hunger != 20 {
+		t.Fatalf("发奖时应同时结算饱腹衰减，期望 20，实际 %.1f", p.Hunger)
+	}
+	if p.LastTick == nil || p.LastTick.Before(now.Add(-time.Minute)) {
+		t.Fatalf("last_tick 应推进到结算时刻，实际 %v", p.LastTick)
 	}
 }
 

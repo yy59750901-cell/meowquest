@@ -237,6 +237,11 @@ func (d *DB) TemplatesOfKid(kidID int64) ([]TaskTemplate, error) {
 
 // Tick 惰性衰减：读时结算（hunger -decay/h，mood -0.5/h），无 cron
 func (d *DB) Tick(kidID int64) (*Pet, error) {
+	return d.TickAt(kidID, time.Now())
+}
+
+// TickAt 用调用方时钟结算，供事务内与结算判定时间保持一致。
+func (d *DB) TickAt(kidID int64, now time.Time) (*Pet, error) {
 	var pet Pet
 	if err := d.Where("kid_id=?", kidID).First(&pet).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -248,11 +253,10 @@ func (d *DB) Tick(kidID int64) (*Pet, error) {
 	if last == nil {
 		last = &pet.HatchedAt
 	}
-	hours := time.Since(*last).Hours()
+	hours := now.Sub(*last).Hours()
 	if hours > 0 {
 		pet.Hunger = clampMin(pet.Hunger-pet.HungerDecay*hours, 0)
 		pet.Mood = clampMin(pet.Mood-0.5*hours, 0)
-		now := time.Now()
 		pet.LastTick = &now
 		if err := d.Model(&Pet{}).Where("kid_id=?", kidID).
 			Updates(map[string]any{"hunger": pet.Hunger, "mood": pet.Mood, "last_tick": now}).Error; err != nil {

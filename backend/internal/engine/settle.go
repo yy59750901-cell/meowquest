@@ -514,6 +514,11 @@ func ReconcileKidLocked(db *store.DB, kidID int64, now time.Time) error {
 		base := snap.BaseScore + dt.SettlementExtra
 		final := int(float64(base)*snap.DateMultiplier*mul + 0.5)
 		taskID := dt.ID
+		// 发奖前先按结算时钟补齐惰性衰减，否则长期不上线时旧 mood 会把 +10 顶到 100 上限。
+		// 同一事务内后续任务重入时 hours=0，不会重复扣衰减。
+		if _, err := db.TickAt(kidID, now); err != nil {
+			return err
+		}
 		// 幂等由孩子锁 + task 流水 existing 检查保证；不对有历史重复/NULL/非task的流水强加索引。
 		led := store.SettlementLedger{KidID: kidID, Date: dt.Date, DailyTaskID: &taskID, Source: "task", Base: base,
 			DateMultiplier: snap.DateMultiplier, StreakMultiplier: mul, Final: final, DeltaBalance: final, DeltaEarned: final}
