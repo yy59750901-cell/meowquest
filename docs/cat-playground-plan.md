@@ -966,4 +966,13 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - **修复的验收问题**：反序站位入席对穿改为按实际左右座位分配、串行RAF分段避让；毛球舞台预留10px退步，左右边界可跑完4轮；同列猫邀请后路由失败改为预选可达入场顺序；移任何地面家具取消社交；盆栽互动边缘开饭允许不穿实体的短安全撤离并选可达摆盘点。动画路由失败提示“已结算但动画未完成”，不假播感谢。四猫合玩离场猫仍候位管理直到结束，防自主行为提前卡停后续轮次。
 - **实际视觉与连续动作**：主代理使用本地WebKit、真实当前Vue页面与假数据API，未触碰真实数据库。桌面1440×1000、390×844、320×740的双猫餐盘逐张看图；读取实际嘴部像素包围盒而非只相信隐形marker，食物接触误差分别约0.004/0.012px，两猫向内低头、盘底和脚底同地面。WebKit对镜像circle的getScreenCTM返回差异，本轮结论取真实可见像素位置。320×844四猫两批嘴接触同样通过、候位完整、每顿请求1次。毛球2猫与4猫实测四个catch轮次、角色交换，save=1；桌面及320追逐经历invite/approach/chase/lookback/exchange，陪伴无遮挡，0 pageerror。实现代理另测四猫9018个猫对实际SVG框相交0次；最近欧氏距离约84px是纵向仍有1px间隙，不误宣称全程欧氏距离≥110。
 - **验证/文件**：最终前端417/417通过，构建 `--emptyOutDir=false` 通过，git diff检查通过；本轮未修改backend，群体feed后端验证沿用第五十节。主要文件：KidHome.vue、CatSprite.vue、multi-cat.js、room-interaction.js及对应测试。截图、量化JSON、可复跑脚本在工作区 `multicat-acceptance/round2/`；实现代理临时review资料已移出业务仓库，不入库。旧包chunk>500kB警告仍在，未做无关拆包。
-- **交付边界**：首版实际领养上限仍2，4猫只是验证扩展逻辑的假数据，不自动开放。未提交、推送、部署或同步已入库embed；此前未提交多猫后端改动均保留。孩子真机操作手感和对低头姿态/合玩的审美反馈待确认；一起睡与更复杂猫猫社交未做。
+- **交付边界**：首版实际领养上限仍2，4猫只是验证扩展逻辑的假数据，不自动开放。未提交、推送、部署或同步已入库embed；此前未提交多猫后端改动均保留。孩子真机操作手感和对低头姿态/合玩的审美反馈待确认；一起睡与更复杂猫猫社交未做。（本节与第五十节描述的是当时的本地状态；随后已提交发布，见第五十二节。）
+
+## 五十二、多猫版本提交、推送与线上部署（11月12日 16:2x，用户明确「提交push，然后部署」）
+
+- **发布前验证**：`git fetch origin main` 后本地/远端 0/0 无分叉；前端 417/417、`npm run build -- --emptyOutDir=false`、`git diff --check`；后端 `go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`go build ./...` 全过。暂存后 `git diff --cached --check` 发现并修掉 `frontend/src/multi-cat.test.js` 末尾多余空行（此前该文件未跟踪，不在 `diff --check` 覆盖范围）。新增文本 URL / IPv4 / 凭据扫描 0 命中，暂存清单无 `.env` / `.deploy.local` / 私钥。
+- **embed 同步**：`frontend/build.sh` 重建并同步 `backend/internal/web/dist`，`index.html` 引用 `index-DnB1sSBU.js` / `index-3y8MWD11.css`（旧 `index-DTP6RFu4.js` / `index-DuM0vttx.css` 删除，CSS 识别为 rename）。
+- **提交**：`07ee329` `feat: 多猫同屋与共享开饭，加入毛球合玩与短追逐`，25 文件 +4590 / −660；push `700466a..07ee329`，推后 HEAD 与 `origin/main` 0/0，工作区干净。
+- **部署前置**：线上为 PG（复用服务器 PG 容器），`PreparePetOwnership` + `AutoMigrate` + `MigrateMultiPet` 的 PG 路径已在真实隔离 PG 集成验证；只读预检确认 systemd 只有单个 `meowquest.service`、无新旧二进制混跑、日志无异常。按历史「不用备份」口径未备份旧二进制与数据库；MySQL 真实隔离实例仍未验证，线上不用。真实服务器/域名仍只在 gitignore 的 `backend/.deploy.local`。
+- **部署与核验**：`backend/deploy.sh` 四步全过；`systemd active`、首页 200。线上 `index.html` 引用与本地 embed 一致，JS 200（606441B）/ CSS 200（290676B）；线上 JS 含「开饭已结算」「小猫追逐」「yarn-wait」「data-mouth-pixel」「一起开饭」且命中数与本地产物一致，CSS 含 `meal-facing` / `social-facing`；匿名 `/api/species` 200；线上二进制 SHA256 与本地 release 一致（`daa6ff23…`）；最近 80 行日志无 error / panic / fatal / migration / warn。**只读查询线上 PG 确认迁移完成**：`feed_request` / `kid_account` / `pet` 三表齐备，`pet_rows=4` 数据未丢，`kid_id` 单列 UNIQUE 约束残留 `0`。
+- **边界**：实际领养上限仍 2；四猫为假数据扩展验收，未开放。孩子真机手感与低头姿态/合玩审美反馈待确认；一起睡与更复杂社交未做。
