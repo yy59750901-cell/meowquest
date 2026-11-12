@@ -1,10 +1,16 @@
 package api
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"meowquest/backend/internal/engine"
 	"meowquest/backend/internal/llm"
@@ -37,6 +43,7 @@ func (s *Server) Router() *gin.Engine {
 		api.POST("/adopt", s.adopt) // {code, kid_id?/kid_name, species, name}
 
 		api.GET("/pet", s.kid, s.pet)
+		api.POST("/pet/adopt", s.kid, s.adoptAdditional)
 		api.POST("/pet/feed", s.kid, s.feed)
 		api.POST("/pet/touch", s.kid, s.touch)
 		api.GET("/pet/events", s.kid, s.events)
@@ -325,53 +332,153 @@ func (s *Server) adopt(c *gin.Context) {
 
 // ===== 宠物（per-kid） =====
 
-func (s *Server) pet(c *gin.Context) {
+func queryPetID(c *gin.Context) (int64, bool) {
+	value, present := c.GetQuery("pet_id")
+	if !present {
+		return 0, true
+	}
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "pet_id必须为正整数"})
+		return 0, false
+	}
+	return id, true
+}
+
+func petError(c *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, store.ErrPetNotFound) {
+		status = http.StatusNotFound
+	} else if errors.Is(err, store.ErrInsufficientStars) {
+		status = http.StatusBadRequest
+	}
+	c.JSON(status, gin.H{"error": err.Error()})
+}
+
+func (s *Server) loadPetSnapshot(kidID, petID int64) (gin.H, error) {
+	// 越权ID先拒绝，不让无效选猫请求触发本孩子的结算和watermark更新。
+	var authorized store.Pet
+	query := s.DB.Where("kid_id=?", kidID)
+	if petID != 0 {
+		query = query.Where("id=?", petID)
+	}
+	if err := query.Order("id").First(&authorized).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, store.ErrPetNotFound
+		}
+		return nil, err
+	}
+	if err := engine.ReconcileKidWithClock(s.DB, kidID, s.now); err != nil {
+		return nil, err
+	}
+	p, pets, account, err := s.DB.PetSnapshotAt(kidID, petID, s.now())
+	if err != nil {
+		return nil, err
+	}
+	var kid store.Kid
+	if err := s.DB.First(&kid, p.KidID).Error; err != nil {
+		return nil, err
+	}
+	var pending, days int64
+	if err := s.DB.Model(&store.DailyTask{}).Where("kid_id=? AND status='approved' AND settlement_status='pending'", p.KidID).Count(&pending).Error; err != nil {
+		return nil, err
+	}
+	if err := s.DB.Model(&store.KidStreakDay{}).Where("kid_id=? AND streak_after IS NULL", p.KidID).Count(&days).Error; err != nil {
+		return nil, err
+	}
+	return gin.H{"pet": p, "pets": pets, "account": account, "pet_limit": store.MaxPetsPerKid(),
+		"kid": kid, "streak_pending": days > 0, "pending_reward_count": int(pending)}, nil
+}
+
+func (s *Server) petSnapshot(c *gin.Context, petID int64, extras gin.H) {
 	if kidOf(c) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no pet"})
 		return
 	}
-	if err := engine.ReconcileKidWithClock(s.DB, kidOf(c), s.now); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	p, err := s.DB.GetPet(kidOf(c))
+	response, err := s.loadPetSnapshot(kidOf(c), petID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		petError(c, err)
 		return
 	}
-	if p == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no pet"})
-		return
+	for key, value := range extras {
+		response[key] = value
 	}
-	var kid store.Kid
-	s.DB.First(&kid, p.KidID)
-	var pending, days int64
-	if err := s.DB.Model(&store.DailyTask{}).Where("kid_id=? AND status='approved' AND settlement_status='pending'", p.KidID).Count(&pending).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if err := s.DB.Model(&store.KidStreakDay{}).Where("kid_id=? AND streak_after IS NULL", p.KidID).Count(&days).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"pet": p, "kid": kid, "streak_pending": days > 0, "pending_reward_count": int(pending)})
+	c.JSON(http.StatusOK, response)
 }
 
-func (s *Server) feed(c *gin.Context) {
-	if err := s.DB.FeedPet(kidOf(c)); err != nil {
+func (s *Server) pet(c *gin.Context) {
+	if id, ok := queryPetID(c); ok {
+		s.petSnapshot(c, id, nil)
+	}
+}
+
+func (s *Server) adoptAdditional(c *gin.Context) {
+	var req struct {
+		Name        string `json:"name" binding:"required"`
+		Species     string `json:"species" binding:"required"`
+		Personality string `json:"personality"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请填写猫咪名字并选择品种"})
+		return
+	}
+	id, err := s.DB.AdoptAdditionalPet(kidOf(c), req.Name, req.Species, req.Personality)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	s.pet(c)
+	s.petSnapshot(c, id, gin.H{"adopted": true, "new_pet_id": id})
+}
+
+func (s *Server) feed(c *gin.Context) {
+	var req struct {
+		RequestID json.RawMessage `json:"request_id"`
+		PetID     int64           `json:"pet_id" binding:"gte=0"`
+	}
+	// 旧单猫客户端可省略整个body或request_id；新客户端须提供稳定ID以安全重试。
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "开饭请求格式不正确"})
+		return
+	}
+	requestID := "legacy-" + store.NewToken()
+	if len(req.RequestID) > 0 {
+		if err := json.Unmarshal(req.RequestID, &requestID); err != nil || string(req.RequestID) == "null" || strings.TrimSpace(requestID) == "" || len(requestID) > 128 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "request_id需要1到128字节的非空字符串"})
+			return
+		}
+	}
+	result, err := s.DB.FeedGroupAt(kidOf(c), req.PetID, requestID, s.now())
+	if err != nil {
+		petError(c, err)
+		return
+	}
+	// FeedGroupAt成功意味着扣款或全饱no-op的请求记录已经提交；后续读取失败不是回滚。
+	response, err := s.loadPetSnapshot(kidOf(c), req.PetID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":      "开饭结果已提交，但状态快照获取失败，请使用相同request_id重试",
+			"request_id": requestID, "committed": true, "fed": result.Fed, "all_full": result.AllFull,
+		})
+		return
+	}
+	response["fed"], response["all_full"], response["request_id"] = result.Fed, result.AllFull, requestID
+	c.JSON(http.StatusOK, response)
 }
 
 func (s *Server) touch(c *gin.Context) {
-	left, err := s.DB.TouchPet(kidOf(c))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	var req struct {
+		PetID int64 `json:"pet_id" binding:"gte=0"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "抚摸请求格式不正确"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"touch_left_today": left})
+	left, err := s.DB.TouchPetAt(kidOf(c), req.PetID, s.now())
+	if err != nil {
+		petError(c, err)
+		return
+	}
+	s.petSnapshot(c, req.PetID, gin.H{"touch_left_today": left})
 }
 
 func (s *Server) events(c *gin.Context) {

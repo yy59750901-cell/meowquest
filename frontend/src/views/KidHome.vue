@@ -14,7 +14,8 @@ import PixelShop from '../components/PixelShop.vue'
 import LitterScoop from '../components/LitterScoop.vue'
 import { LITTER_KEY, LITTER_STATE_LABELS, clampLitterState, litterMiniMarkup } from '../litter-box.js'
 import { TREE_CAT_SIZE, TREE_SPRITE_UNITS, GROUND_CAT_FOOT_GAP, treeRoute, treePath, treeDownRoute, treePoint, treeGroundExit, treeEntryReason, gameEntryReason, treeHitNode, treeAnchorMatches, treeVisibleBase, treeHopPoint } from '../cat-tree-room.js'
-import { planInteractionSession, pickInteractionNode, dwellForNode } from '../room-interaction.js'
+import { planInteractionSession, pickInteractionNode, dwellForNode, socialActorEligible, socialPair, socialObstacles, socialRoute, socialStage, socialFormationRoute, yarnPawContact, actorFloorRoute, planActorSeats, planChaseEntry, floorFurnitureSnapshot } from '../room-interaction.js'
+import { createReservations, mergeSnapshot, mealBatches, mealPlacement, createMealTransaction } from '../multi-cat.js'
 import { evidenceSteps } from '../task-evidence.js'
 import { reviewPending, reviewStages } from '../ai-review.js'
 import { NEST_ENTRY_TIME, NEST_WALK_FRAME_MS, NEST_MOTION, NEST_PAD, isJumpNest, nestProfile, nestArt, nestRoute, nestFlightPoint, nestLandingPoint, nestOpeningClip, nestHandoff, nestSleepPos } from '../nest-catalog.js'
@@ -60,9 +61,19 @@ async function switchKid() {
   try {
     await showConfirmDialog({ title: '换一个小朋友？', message: '这只小猫会等你回来的～' })
   } catch (e) { return }
-  if (roomLocked() || eating || startingTask.value || submitting.value || evidenceUploading.value || recState.value !== 'idle' || chatStreaming.value || wizard.value || timerTask.value) return showToast('先完成正在进行的操作，再换人吧')
+  if (roomLocked() || eating || placingFeed.value || feedPreparing.value || startingTask.value || submitting.value || evidenceUploading.value || recState.value !== 'idle' || chatStreaming.value || wizard.value || timerTask.value) return showToast('先完成正在进行的操作，再换人吧')
   closeGamePicker(false)
-  resetTreeToFloor()
+  resetFeedIdentity()
+  cancelCameraDrag?.(); cancelDecorDrag?.()
+  identityEpoch++
+  cancelAllCats()
+  for (const actor of actors.values()) actor.dispose()
+  actors.clear(); reservations.clear()
+  kidID.value = ''; selectedPetID.value = ''; pets.value = []; account.value = {}; petLoading = null; mealTransaction = null
+  cancelChat()
+  chatOpen.value = false; chatMessages.value = []; messages.value = []; unread.value = 0; mailOpen.value = false; mailAnnounced = false
+  today.value = { date: '', date_multiplier: 1, tasks: [] }; wishes.value = []; shopItems.value = []; sceneItems.value = []
+  hadDuration.value = {}; achievedDuration.value = {}; tasksLoading = null; streakPending.value = false; pendingRewardCount.value = 0
   document.cookie = 'kid_token=; Max-Age=0; path=/'
   adopted.value = false
   pet.value = null
@@ -88,7 +99,7 @@ async function pickKid(k) {
     adopted.value = true
     await loadAll()
     say('我等到你啦！')
-    stateTimer = setTimeout(behaviorTick, 800)
+    allCats(actor => actor.behaviorNext(800))
   } else if (data.error) {
     showToast(data.error)
   }
@@ -107,8 +118,6 @@ const gameKind = ref('feather')
 const playOpening = ref(false)
 // 猫砂盆：状态存在 scene_item.state（0-3），覆层只在点击时挂载，不常驻房间。
 const litterItem = ref(null)
-let litterUsedThisSession = false // 每次进屋最多让猫用一次，绝不按时间/离线累积
-let litterUseBusy = false
 // 购买猫爬架即解锁无限爬高，房间里是否摆着爬架不影响游戏入口。
 const hasCatTreeGame = computed(() => shopItems.value.some(it => it.key === 'cat-tree' && it.owned))
 const gamePicker = ref(false)
@@ -118,7 +127,7 @@ let gamePickerTrigger = null
 let roomPoseBeforePlay = null
 function roomLocked() { return playOpen.value || playOpening.value || treeLeaving.value || shopActionBusy.value || catTouchBusy.value || litterItem.value }
 function gameBusy() {
-  return roomLocked() || eating || placingFeed.value || timerTask.value || wizard.value || wizardUploading.value || taskRecStarting.value || startingTask.value || submitting.value || evidenceUploading.value || evidenceTask || chatStreaming.value || recHolding || recState.value !== 'idle' || taskRec.value || wallpaperSaving.value || wishModal.value
+  return roomLocked() || eating || placingFeed.value || feedPreparing.value || timerTask.value || wizard.value || wizardUploading.value || taskRecStarting.value || startingTask.value || submitting.value || evidenceUploading.value || evidenceTask || chatStreaming.value || recHolding || recState.value !== 'idle' || taskRec.value || wallpaperSaving.value || wishModal.value
 }
 function openTreeGame() {
   const reason = gameEntryReason({ adopted: adopted.value, busy: gameBusy(), owned: hasCatTreeGame.value })
@@ -153,6 +162,7 @@ function gamePickerKeydown(e) {
   buttons[(i + (e.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus()
 }
 function startGame(kind) {
+  if (kind === 'chase') return startChase(true)
   closeGamePicker(false)
   if (kind === 'climb') return openTreeGame()
   return openPlayground('feather')
@@ -168,7 +178,8 @@ async function openPlayground(kind = 'feather') {
     closeGamePicker(false)
     cancelDecorDrag?.()
     cancelCameraDrag?.()
-    await leaveTree()
+    cancelSocial(false)
+    await allCats(actor => actor.leaveTree())
     if (!adopted.value || document.hidden || disposed) return
     if (kind === 'climb' && !hasCatTreeGame.value) return
     gameKind.value = kind
@@ -186,8 +197,8 @@ async function openPlayground(kind = 'feather') {
       camAnim.value = 'none'
       if (matrix) setCamera(matrix.m41, matrix.m42)
     }
-    roomPoseBeforePlay = { anim: walking ? 'sit' : catAnim.value, flipped: flipped.value, tools: toolsOpen.value, cameraMode: camMode.value }
-    interrupt()
+    roomPoseBeforePlay = { anim: selectedActor.value.walking ? 'sit' : catAnim.value, flipped: flipped.value, tools: toolsOpen.value, cameraMode: camMode.value }
+    cancelAllCats()
     placingFeed.value = false
     hudOpen.value = false
     toolsOpen.value = false
@@ -211,40 +222,84 @@ function closePlayground() {
     if (camMode.value === 'follow') centerOn(catPos.x, catPos.y - 48, 0)
     roomPoseBeforePlay = null
   }
-  if (adopted.value && !document.hidden) behaviorNext(1800)
+  if (adopted.value && !document.hidden) allCats(actor => actor.behaviorNext(1800))
 }
 
-// 猫行为
-const catAnim = ref('sit')
-const catPos = reactive({ x: 0, y: 0 })
-const flipped = ref(false)
-const bubble = ref('')
-const showBubble = ref(false)
-// 开心跳：WAAPI 动画（不销毁重建 DOM，保住位移 transition——修复吃完瞬移）
-function hopFx() {
-  const inner = catEl.value && catEl.value.querySelector('.cat-inner')
-  if (!inner) return
-  const fx = flipped.value ? 'scaleX(-1)' : 'none'
-  inner.animate(
-    [{ transform: fx }, { transform: fx + ' translateY(-22px)' }, { transform: fx }],
-    { duration: 600, easing: 'ease' },
-  )
-}
-const zzz = ref(false)
-
+// 每猫实例持有自己的 DOM、状态和取消令牌；选择只改变 UI 投影，不替换实例。
+const pets = ref([])
+const selectedPetID = ref('')
+const kidID = ref('')
+const account = ref({})
+const petLimit = ref(2)
+let identityEpoch = 0
+const actors = new Map()
+const primaryActor = createRoomCat('legacy', 0)
+actors.set('legacy', primaryActor)
+const selectedActor = computed(() => actors.get(String(selectedPetID.value)) || primaryActor)
+const roomActors = computed(() => (pets.value.length ? pets.value : [pet.value || { id: 'legacy' }]).map(p => reactive(actors.get(String(p.id || 'legacy')) || primaryActor)))
+const actorRef = key => computed({ get: () => selectedActor.value[key].value, set: value => { selectedActor.value[key].value = value } })
+const catAnim = actorRef('catAnim'), flipped = actorRef('flipped'), bubble = actorRef('bubble'), showBubble = actorRef('showBubble'), zzz = actorRef('zzz')
+const catEl = actorRef('catEl'), nestActive = actorRef('nestActive'), nestWalking = actorRef('nestWalking'), nestExiting = actorRef('nestExiting'), nestEntry = actorRef('nestEntry')
+const treeSession = actorRef('treeSession'), treeRendered = actorRef('treeRendered'), treeMoving = actorRef('treeMoving'), treeLeaving = actorRef('treeLeaving')
+const catDepth = actorRef('catDepth'), catRoomStyle = actorRef('catRoomStyle'), treeCatSize = actorRef('treeCatSize'), nestBubbleStyle = actorRef('nestBubbleStyle')
+const shakeId = actorRef('shakeId')
+const catPos = reactive({ get x() { return selectedActor.value.catPos.x }, set x(v) { selectedActor.value.catPos.x = v }, get y() { return selectedActor.value.catPos.y }, set y(v) { selectedActor.value.catPos.y = v } })
 let stateTimer = null
-let walking = false
-let walkEpoch = 0
+let disposed = false, initTimer = null
+const syncCatPos = (...args) => selectedActor.value.syncCatPos(...args)
+const interrupt = (...args) => selectedActor.value.interrupt(...args)
+const resetTreeToFloor = (...args) => selectedActor.value.resetTreeToFloor(...args)
+const leaveTree = (...args) => selectedActor.value.leaveTree(...args)
+const playTree = (...args) => selectedActor.value.playTree(...args)
+const walkTo = (...args) => selectedActor.value.walkTo(...args)
+const behaviorNext = (...args) => selectedActor.value.behaviorNext(...args)
+const behaviorTick = (...args) => selectedActor.value.behaviorTick(...args)
+const cancelNest = (...args) => selectedActor.value.cancelNest(...args)
+const interactWith = (...args) => selectedActor.value.interactWith(...args)
+const say = (...args) => selectedActor.value.say(...args)
+const hearts = (...args) => selectedActor.value.hearts(...args)
+function allCats(fn) { return Promise.all([...actors.values()].map(fn)) }
+function cancelAllCats() { cancelSocial(false); for (const actor of actors.values()) actor.cancel() }
+function resumeAllCats(delay) { return allCats(actor => actor.resumeBehavior(delay)) }
+async function releaseFurniture(id) {
+  const item = sceneItems.value.find(it => it.id === id)
+  if (socialSession.value?.itemID === id || (item && decorArt(item.item_key).surface === 'floor')) cancelSocial()
+  await allCats(actor => actor.releaseFurniture(id))
+}
+function selectCat(id) {
+  if (playOpen.value || playOpening.value || recState.value !== 'idle' || recHolding) return
+  id = String(id)
+  const found = pets.value.find(p => String(p.id) === id)
+  if (!found) return
+  selectedPetID.value = id
+  pet.value = { ...found }
+  species.value = found.species || 'orange'
+  if (kidID.value) localStorage.setItem(`meow_selected_cat_${kidID.value}`, id)
+  chatOpen.value = false
+  chatMessages.value = actors.get(id).chat.messages
+  chatLeft.value = actors.get(id).chat.left
+  camMode.value = 'follow'; initialGroupFraming.value = false
+  if (socialSession.value) frameSocial()
+  else if (!mealGroupFraming.value) centerOn(catPos.x, catPos.y - 48, 0)
+}
+function clickCat(actor) {
+  cancelSocialFor(actor.id)
+  if (String(actor.id) !== String(selectedPetID.value)) selectCat(actor.id)
+  else petCat()
+}
 
 // ===== API =====
 async function jget(url) {
+  const epoch = identityEpoch
   const r = await fetch(API + url)
+  if (disposed || epoch !== identityEpoch) return null
   if (r.status === 401) { adopted.value = false; return null }
-  return r.json()
+  const data = await r.json()
+  return !disposed && epoch === identityEpoch ? data : null
 }
 async function jpost(url, body) {
   const r = await fetch(API + url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
-  return { ok: r.ok, data: await r.json().catch(() => ({})) }
+  return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) }
 }
 
 const hadDuration = ref({}) // AI / 家长退回只补材料，同一任务不重计时
@@ -274,10 +329,12 @@ function applyToday(t) {
 }
 async function refreshTasks() {
   if (tasksLoading) return tasksLoading
-  tasksLoading = (async () => {
-    try { return applyToday(await jget('/tasks/today')) } catch { return false }
+  const epoch = identityEpoch
+  const pending = (async () => {
+    try { const data = await jget('/tasks/today'); return !disposed && epoch === identityEpoch ? applyToday(data) : false } catch { return false }
   })()
-  try { return await tasksLoading } finally { tasksLoading = null }
+  tasksLoading = pending
+  try { return await pending } finally { if (tasksLoading === pending) tasksLoading = null }
 }
 
 // ===== 世界视口：固定逻辑世界 + 相机（窄屏看局部可拖，跟猫为默认焦点） =====
@@ -285,15 +342,17 @@ const WORLD_W = 1280, WORLD_H = 720
 const cam = ref({ x: 0, y: 0 })
 const camMode = ref('follow') // follow(跟猫) | free(自由拖动)
 const camAnim = ref('') // 相机移动的 CSS transition（跟猫同步时设置）
+const initialGroupFraming = ref(false)
+const mealGroupFraming = computed(() => mealPhase.value === 'animating' && mealSpots.value.length > 0)
 const sceneLighting = ref(getSceneLighting())
 const roomHidden = ref(document.hidden)
 let lightingTimer = null
 function syncSceneLighting() { sceneLighting.value = getSceneLighting() }
 function onDocumentVisibility() {
   roomHidden.value = document.hidden
-  if (document.hidden) { cancelFeeding(true); closeGamePicker(false); resetTreeToFloor() }
+  if (document.hidden) { cancelFeeding(true); closeGamePicker(false); cancelAllCats(); cancelChat(); clearTimeout(initTimer); clearTimeout(stateTimer); cancelCameraDrag?.(); cancelDecorDrag?.() }
   if (!document.hidden) {
-    if (!roomLocked() && !eating) behaviorNext(4500)
+    if (!roomLocked() && !eating) allCats(actor => actor.behaviorNext(4500))
     syncSceneLighting()
     if (adopted.value && !playOpen.value) {
       refreshProgress()
@@ -313,21 +372,7 @@ const appleNests = computed(() => placedDecor.value.filter(it => it.item_key ===
 const jumpNests = computed(() => placedDecor.value.filter(it => isJumpNest(it.item_key)))
 // 图层按地面锚点排序：未来新增装饰沿用同一坐标与注册表。
 const decorDepth = it => decorArt(it.item_key).surface === 'wall' ? 2 : 10 + Math.floor(it.y)
-// 进窝时以窝锚点算层级，保证 back(10+y) < cat(11+y) < front(12+y)；
-// 沿地板走向洞口的阶段猫必须在前片之上（demo 的 walker z=4），否则会穿过窝体。
-const nestActive = ref(null) // 窝里趴睡
-const nestWalking = ref(null) // 沿地板走近洞口
-const nestExiting = ref(null) // 出窝会话：猫还在窝体范围内时保持最高层，避免层级瞬时掉档
-let nestExitTimer = null
-const catDepth = computed(() => {
-  if (treeRendered.value && treeSession.value) return 11 + Math.floor(treeSession.value.anchor.y)
-  if (nestActive.value) return 11 + Math.floor(nestActive.value.y)
-  // 出窝时猫仍在窝的像素范围内，不能用 10+猫.y（会掉到 back 10+窝.y 之下被整只盖住）；
-  // 沿用沿地板进场的 walker 层 13+窝.y，直到走出窝体或被兜底定时器还原。
-  if (nestExiting.value) return 13 + Math.floor(nestExiting.value.y)
-  if (nestWalking.value) return 13 + Math.floor(nestWalking.value.y)
-  return 10 + Math.floor(catPos.y)
-})
+const reservations = createReservations()
 const rootEl = ref(null)
 const statusToggleEl = ref(null)
 const statusPanelEl = ref(null)
@@ -375,14 +420,30 @@ function centerOn(x, y, durSec) {
   camAnim.value = durSec != null ? `transform ${durSec}s linear` : 'transform .45s ease'
   setCamera(b.width / 2 - x, focusY - y)
 }
-function resetCam() { camMode.value = 'follow'; centerOn(catPos.x, catPos.y - 48) }
+function frameGroup(points) {
+  if (!points.length) return
+  const x = (Math.min(...points.map(p => p.x)) + Math.max(...points.map(p => p.x))) / 2
+  const y = (Math.min(...points.map(p => p.y)) + Math.max(...points.map(p => p.y))) / 2
+  centerOn(x, y - 48, 0)
+}
+function resetCam() {
+  camMode.value = 'follow'; initialGroupFraming.value = false
+  if (mealGroupFraming.value) frameGroup(mealSpots.value)
+  else if (socialSession.value) frameSocial()
+  else centerOn(catPos.x, catPos.y - 48)
+}
 
+const petRequestID = id => pets.value.find(cat => String(cat.id) === String(id))?.id ?? id
+const petQuery = id => id && id !== 'legacy' ? `/pet?pet_id=${encodeURIComponent(id)}` : '/pet'
 async function loadAll() {
+  const epoch = identityEpoch, requestedID = selectedPetID.value
   const [sp, p, t, w, s, sc] = await Promise.all([
-    jget('/species'), jget('/pet'), jget('/tasks/today'), jget('/wish/list'), jget('/shop'), jget('/scene'),
+    jget('/species'), jget(petQuery(requestedID)), jget('/tasks/today'), jget('/wish/list'), jget('/shop'), jget('/scene'),
   ])
+  if (disposed || epoch !== identityEpoch) return
   if (sp) speciesList.value = sp.species || []
-  if (p && p.pet) { adopted.value = true; applyPet(p); species.value = p.pet.species }
+  if (p && p.pet) { adopted.value = true; applyPet(p, requestedID) }
+  if (disposed || epoch !== identityEpoch) return
   applyToday(t)
   if (w) wishes.value = w.wishes || []
   if (s) shopItems.value = s.items || []
@@ -392,22 +453,60 @@ async function loadAll() {
 
 async function refreshScene() {
   if (roomLocked() || document.hidden || disposed) return
+  const epoch = identityEpoch
   try {
     const sc = await jget('/scene')
-    if (sc && !roomLocked() && !document.hidden && !disposed) sceneItems.value = sc.items || []
-  } catch { showToast('房间同步暂时失败，稍后会再同步') }
+    if (!sc || epoch !== identityEpoch || roomLocked() || document.hidden || disposed) return
+    const incoming = sc.items || [], s = socialSession.value
+    if (s && floorFurnitureSnapshot(incoming, decorArt) === s.furniture
+      && (s.itemID === null || incoming.some(it => it.id === s.itemID && it.item_key === 'yarn'))) return
+    if (s) cancelSocial()
+    sceneItems.value = incoming
+  } catch { if (!disposed && epoch === identityEpoch) showToast('房间同步暂时失败，稍后会再同步') }
 }
-function applyPet(p) {
+function applyPet(p, requestedID = selectedPetID.value) {
   if (!p?.pet) return
-  pet.value = p.pet
+  const nextKid = String(p.kid?.id || p.pet.kid_id || kidID.value || '')
+  const changedKid = nextKid && nextKid !== kidID.value
+  const merged = mergeSnapshot(p, changedKid ? [] : pets.value, requestedID)
+  if (!merged) return
+  if (changedKid) resetFeedIdentity()
+  if (changedKid && kidID.value) {
+    identityEpoch++; cancelAllCats()
+    cancelCameraDrag?.(); cancelDecorDrag?.()
+    for (const actor of actors.values()) actor.dispose()
+    actors.clear(); selectedPetID.value = ''; pets.value = []; account.value = {}; petLoading = null; tasksLoading = null
+    sceneItems.value = []; messages.value = []; unread.value = 0; mailOpen.value = false; mailAnnounced = false
+  }
+  kidID.value = nextKid
+  account.value = { ...account.value, ...merged.account }
+  pets.value = merged.pets
+  for (const [index, cat] of pets.value.entries()) {
+    const id = String(cat.id)
+    if (!actors.has(id)) {
+      if (actors.has('legacy') && index === 0) { actors.delete('legacy'); primaryActor.id.value = id; actors.set(id, primaryActor) }
+      else { const actor = createRoomCat(id, index); actors.set(id, actor); nextTick(() => actor.resumeBehavior(1200 + index * 900)) }
+    }
+  }
+  for (const [id, actor] of actors) if (!pets.value.some(cat => String(cat.id) === id)) { actor.dispose(); actors.delete(id) }
+  if (changedKid || !pets.value.some(cat => String(cat.id) === String(selectedPetID.value))) {
+    const remembered = nextKid ? localStorage.getItem(`meow_selected_cat_${nextKid}`) : ''
+    selectedPetID.value = pets.value.some(cat => String(cat.id) === remembered) ? remembered : String(pets.value[0].id)
+  }
+  const selected = pets.value.find(cat => String(cat.id) === String(selectedPetID.value))
+  pet.value = { ...selected }
+  species.value = selected.species || 'orange'
+  petLimit.value = Number.isSafeInteger(p.pet_limit) && p.pet_limit > 0 ? p.pet_limit : 2
   streakPending.value = !!p.streak_pending
   pendingRewardCount.value = p.pending_reward_count || 0
 }
 let petLoading = null
-async function refreshPet() {
+async function refreshPet(requestedID = selectedPetID.value) {
   if (petLoading) return petLoading
-  petLoading = (async () => { applyPet(await jget('/pet')) })()
-  try { await petLoading } finally { petLoading = null }
+  const epoch = identityEpoch
+  const pending = (async () => { const p = await jget(petQuery(requestedID)); if (!disposed && epoch === identityEpoch) applyPet(p, requestedID) })()
+  petLoading = pending
+  try { await pending } finally { if (petLoading === pending) petLoading = null }
 }
 async function refreshProgress() {
   // 家长确认、补审或宽限结束都可能改变余额和连击，不只刷新今日任务。
@@ -422,8 +521,9 @@ const unread = ref(0)
 let mailAnnounced = false // 每次进页面只主动播报一次，之后只留红点
 
 async function refreshMessages() {
+  const epoch = identityEpoch
   const d = await jget('/kid/messages')
-  if (!d) return 0
+  if (!d || disposed || epoch !== identityEpoch) return null
   messages.value = d.items || []
   unread.value = d.unread || 0
   return unread.value
@@ -432,9 +532,9 @@ async function refreshMessages() {
 // 进页面（或切回前台）时把最新一条未读念出来；关掉页面也不怕，红点还在。
 async function syncMail() {
   if (!adopted.value || document.hidden) return
-  const before = unread.value
+  const epoch = identityEpoch, before = unread.value
   const n = await refreshMessages()
-  if (n <= before || mailAnnounced) return
+  if (disposed || epoch !== identityEpoch || !adopted.value || document.hidden || n === null || n <= before || mailAnnounced) return
   const latest = (messages.value || []).find(m => !m.read_at)
   if (latest?.content) {
     mailAnnounced = true
@@ -444,11 +544,14 @@ async function syncMail() {
 
 async function openMailbox() {
   if (roomLocked()) return
+  const epoch = identityEpoch
   closeGamePicker(false)
   mailOpen.value = true
   if (unread.value === 0) await refreshMessages()
+  if (disposed || epoch !== identityEpoch || !adopted.value) return
   if (unread.value > 0) {
     const d = await jpost('/kid/messages/read', {})
+    if (disposed || epoch !== identityEpoch || !adopted.value) return
     if (d?.ok) unread.value = d.data?.unread ?? 0
     // 同步本地已读状态，避免关掉再打开还显示未读。
     messages.value = messages.value.map(m => ({ ...m, read_at: m.read_at || new Date().toISOString() }))
@@ -468,13 +571,149 @@ async function doAdopt() {
     adopted.value = true
     await loadAll()
     say(`我是${name}！以后请多多关照喵～`)
-    stateTimer = setTimeout(behaviorTick, 1000)
+    allCats(actor => actor.behaviorNext(1000))
   } else if (data.error) {
     showToast(data.error)
   }
 }
 
-// ===== 猫行为状态机（房间内走动/躺/睡） =====
+const additionalAdoptOpen = ref(false), additionalAdoptBusy = ref(false)
+const additionalName = ref(''), additionalSpecies = ref('black')
+const adoptOptions = computed(() => speciesList.value.length ? speciesList.value : ['orange', 'black', 'cow', 'white'].map(species => ({ species, display_name: { orange: '橘猫', black: '黑猫', cow: '奶牛猫', white: '白猫' }[species] })))
+function openAdditionalAdopt() {
+  if (gameBusy() || pets.value.length >= petLimit.value) return
+  additionalName.value = ''; additionalSpecies.value = 'black'; additionalAdoptOpen.value = true
+}
+async function adoptAdditionalCat() {
+  if (additionalAdoptBusy.value || pets.value.length >= petLimit.value) return
+  additionalAdoptBusy.value = true
+  const epoch = identityEpoch
+  try {
+    const { ok, data } = await jpost('/pet/adopt', { name: additionalName.value.trim() || '小黑', species: additionalSpecies.value })
+    if (disposed || epoch !== identityEpoch) return
+    if (!ok || !data.adopted) return showToast(data.error || '领养没有完成，请稍后再试')
+    applyPet(data)
+    additionalAdoptOpen.value = false
+    selectCat(data.new_pet_id)
+    showToast('新伙伴来啦！免费领养，不新增礼包')
+  } catch { if (!disposed) showToast('领养结果待确认，请先刷新小猫列表，不要重复提交') }
+  finally { additionalAdoptBusy.value = false }
+}
+
+// ===== 猫行为状态机：每次调用工厂都创建独立闭包 =====
+function createRoomCat(initialID, index) {
+const id = ref(initialID)
+const pet = computed(() => pets.value.find(p => String(p.id) === String(id.value)) || (id.value === primaryActor?.id.value ? selectedPetFallback() : null))
+const catAnim = ref('sit'), flipped = ref(false), bubble = ref(''), showBubble = ref(false), zzz = ref(false)
+const mealSeat = ref(null), socialRole = ref(''), socialPose = ref('')
+const catPos = reactive({ x: 704 + index * 150, y: 590.4 })
+const catEl = ref(null)
+const nestActive = ref(null), nestWalking = ref(null), nestExiting = ref(null)
+let nestExitTimer = null, stateTimer = null, behaviorTimer = null, walking = false, walkEpoch = 0
+let disposed = false, heldItem = null, generation = 0
+let litterUsedThisSession = false, litterUseBusy = false
+const catTimers = new Set()
+function setTimeout(fn, ms) {
+  const epoch = generation
+  const timer = globalThis.setTimeout(() => {
+    catTimers.delete(timer)
+    if (!disposed && !document.hidden && !playOpen.value && epoch === generation) return fn()
+  }, ms)
+  catTimers.add(timer)
+  return timer
+}
+function clearTimeout(timer) { globalThis.clearTimeout(timer); catTimers.delete(timer) }
+function useLitter(box) {
+  if (gameBusy() || litterUseBusy || litterUsedThisSession || !claim(box)) return
+  litterUsedThisSession = true; litterUseBusy = true
+  const epoch = generation
+  walkTo({ x: box.x - 52, y: box.y }, () => {
+    catAnim.value = 'eat'
+    stateTimer = setTimeout(async () => {
+      if (epoch !== generation || disposed || document.hidden) return
+      catAnim.value = 'sit'
+      try {
+        const { ok, data } = await jpost('/litter/use', { id: box.id })
+        if (epoch !== generation || disposed) return
+        const local = sceneItems.value.find(it => it.id === box.id)
+        if (ok && local && typeof data.state === 'number') local.state = data.state
+      } catch { /* 下次同步房间真值 */ }
+      litterUseBusy = false; behaviorNext(1500)
+    }, 1400)
+  })
+}
+const effects = new Set()
+const chat = reactive({ messages: [], left: 30, input: '', streaming: false })
+let chatController = null
+function cancelChat() { chatController?.abort(); chatController = null; chat.streaming = false }
+function startChatRequest() { cancelChat(); chatController = new AbortController(); return chatController }
+const catDepth = computed(() => {
+  if (treeRendered.value && treeSession.value) return 11 + Math.floor(treeSession.value.anchor.y)
+  if (nestActive.value) return 11 + Math.floor(nestActive.value.y)
+  if (nestExiting.value) return 13 + Math.floor(nestExiting.value.y)
+  if (nestWalking.value) return 13 + Math.floor(nestWalking.value.y)
+  return 10 + Math.floor(catPos.y)
+})
+const selected = () => String(selectedPetID.value || 'legacy') === String(id.value)
+function roomLocked() { return playOpen.value || playOpening.value || treeLeaving.value || shopActionBusy.value || litterItem.value || disposed }
+function gameBusy() { return roomLocked() || eating || placingFeed.value || feedPreparing.value || timerTask.value || wizard.value || wizardUploading.value || taskRecStarting.value || startingTask.value || submitting.value || evidenceUploading.value || evidenceTask || wallpaperSaving.value || wishModal.value }
+function centerOn(x, y, duration) {
+  if (!selected() || mealGroupFraming.value || socialSession.value) return
+  initialGroupFraming.value = false
+  focusCamera(x, y, duration)
+}
+function claim(it) {
+  if (!reservations.acquire(it.id, id.value)) { if (selected()) showToast('这里有小猫在用，等它玩完吧'); behaviorNext(2500); return false }
+  if (heldItem && heldItem.id !== it.id) reservations.release(heldItem.id, id.value)
+  heldItem = { ...it }
+  return true
+}
+function releaseClaim() { if (heldItem) reservations.release(heldItem.id, id.value); heldItem = null }
+function say(t) {
+  if (disposed || document.hidden || playOpen.value) return
+  bubble.value = t || TALK[Math.floor(Math.random() * TALK.length)]
+  showBubble.value = true
+  clearTimeout(bubbleTimer)
+  bubbleTimer = setTimeout(() => { showBubble.value = false }, 2200)
+}
+function hearts() {
+  if (disposed || document.hidden || playOpen.value || playOpening.value) return
+  const inner = catEl.value?.querySelector('.cat-inner')
+  if (!inner?.animate) return
+  const facing = flipped.value ? 'scaleX(-1)' : 'none'
+  const effect = inner.animate([{ transform: facing }, { transform: facing + ' translateY(-22px)' }, { transform: facing }], { duration: 600, easing: 'ease' })
+  effects.add(effect)
+  effect.onfinish = () => effects.delete(effect)
+}
+function cancel() {
+  cancelSocialFor(id.value)
+  generation++
+  syncCatPos()
+  const nest = nestActive.value || nestWalking.value || nestEntry.value?.it || nestExiting.value
+  cancelNest({ animate: false })
+  resetTreeToFloor()
+  interrupt()
+  clearTimeout(nestExitTimer); nestExitTimer = null
+  nestExiting.value = null
+  clearTimeout(bubbleTimer); showBubble.value = false
+  if (nest) Object.assign(catPos, { x: Math.max(70, nest.x - 166), y: Math.min(700, nest.y + 17) })
+  if (catEl.value) catEl.value.style.transition = 'none'
+  catAnim.value = 'sit'; shakeId.value = 0; mealSeat.value = null
+  for (const effect of effects) effect.cancel()
+  effects.clear()
+  for (const timer of catTimers) globalThis.clearTimeout(timer)
+  catTimers.clear(); litterUseBusy = false
+  releaseClaim()
+}
+function syncFurniture() {
+  if (treeSession.value && !treeAnchorMatches(treeSession.value.anchor, sceneItems.value)) { resetTreeToFloor(); return }
+  if (heldItem && !sceneItems.value.some(it => it.id === heldItem.id && (it.item_key === 'yarn' || (it.x === heldItem.x && it.y === heldItem.y)))) cancel()
+}
+async function releaseFurniture(itemID) {
+  if (treeSession.value?.itemid === itemID) { await leaveTree(); releaseClaim() }
+  else if (heldItem?.id === itemID) cancel()
+}
+function dispose() { cancel(); cancelChat(); disposed = true }
 function randTarget() {
   return { x: 80 + Math.random() * (WORLD_W - 200), y: (0.62 + Math.random() * 0.32) * WORLD_H }
 }
@@ -494,6 +733,7 @@ function interrupt() {
   if (walkRAF !== null) cancelAnimationFrame(walkRAF)
   walkRAF = null
   clearTimeout(stateTimer)
+  clearTimeout(behaviorTimer); behaviorTimer = null
   walking = false
 }
 // 爬架会话只在房间内存中存在；锚点保留旧家具位置供取消时安全下架。
@@ -509,7 +749,7 @@ const catRoomStyle = computed(() => ({ left: `${catPos.x}px`, top: `${catPos.y}p
   transform: nestCatActive.value && !treeRendered.value ? `scale(${NEST_CAT_SCALE})` : undefined,
   ...(treeRendered.value ? { width: `${TREE_CAT_SIZE}px`, marginLeft: `${-TREE_CAT_SIZE / 2}px`, marginTop: `${-Math.round(TREE_CAT_SIZE * .75)}px` } : {}) }))
 let treeEpoch = 0, treeRAF = null, treeWalkResolve = null, leavePromise = null
-let disposed = false, walkRAF = null, bubbleTimer = null, initTimer = null
+let walkRAF = null, bubbleTimer = null
 const treeTimers = new Map()
 function cancelTreePending() {
   treeEpoch++
@@ -563,6 +803,7 @@ function finishTreeFloor(anchor) {
   treeRendered.value = false
   treeSession.value = null
   treeMoving.value = false
+  releaseClaim()
   Object.assign(catPos, exit)
   catAnim.value = 'sit'
   if (camMode.value === 'follow' && !playOpen.value && !disposed) centerOn(exit.x, exit.y - 48, 0)
@@ -602,6 +843,7 @@ async function leaveTree() {
       }
       await nextTick()
       treeLeaving.value = false
+      releaseClaim()
       leavePromise = null
     }
   })()
@@ -684,6 +926,7 @@ async function runTreeSession(session, plan, epoch, walkingEpoch) {
   }
 }
 async function playTree(it, mode = 'top') {
+  cancelSocialFor(id.value)
   const reason = treeEntryReason({ adopted: adopted.value, busy: gameBusy(), owned: shopItems.value.some(x => x.key === 'cat-tree' && x.owned), placed: sceneItems.value.some(x => x.id === it?.id && x.item_key === 'cat-tree') })
   if (reason || document.hidden || disposed) { if (reason) showToast(reason); return }
   closeGamePicker(false)
@@ -694,6 +937,8 @@ async function playTree(it, mode = 'top') {
   }
   await leaveTree()
   if (gameBusy() || document.hidden || disposed || !sceneItems.value.some(x => x.id === it.id)) return
+  cancelNest({ animate: false })
+  if (!claim(it)) return
   cancelTreePending()
   const anchor = { id: it.id, x: it.x, y: it.y }
   const epoch = treeEpoch
@@ -719,6 +964,7 @@ async function playTree(it, mode = 'top') {
   return session.done
 }
 async function walkTo(target, done, opts = {}) {
+  cancelSocialFor(id.value)
   if (playOpen.value || playOpening.value || treeLeaving.value || document.hidden || disposed) return
   if (treeSession.value && !opts.tree) { showToast('小猫在爬架上，先请它下来再走动吧'); return }
   interrupt() // 抢占
@@ -745,13 +991,23 @@ async function walkTo(target, done, opts = {}) {
   stateTimer = setTimeout(() => { if (playOpen.value || playOpening.value || document.hidden || disposed || epoch !== walkEpoch) return; catAnim.value = 'sit'; walking = false; done && done() }, dur + 60)
 }
 function lieDown() { zzz.value = false; catAnim.value = 'sleep' }
+function scheduleBehavior(delay) {
+  clearTimeout(behaviorTimer); behaviorTimer = null
+  if (!adopted.value || document.hidden || disposed || playOpen.value || playOpening.value) return
+  behaviorTimer = setTimeout(() => { behaviorTimer = null; behaviorTick() }, delay)
+}
 function behaviorNext(delay) {
-  clearTimeout(stateTimer)
-  if (roomLocked() || treeSession.value || document.hidden || disposed) return
-  stateTimer = setTimeout(behaviorTick, delay || (600 + Math.random() * 1200))
+  if (socialRole.value || treeSession.value || document.hidden || disposed || playOpen.value || playOpening.value) return
+  releaseClaim()
+  scheduleBehavior(delay || (600 + Math.random() * 1200))
+}
+function resumeBehavior(delay) {
+  if (walking || socialRole.value || treeSession.value || nestActive.value || nestWalking.value || nestEntry.value || nestExiting.value || heldItem || chat.streaming) return
+  behaviorNext(delay)
 }
 function behaviorTick() {
-  if (!adopted.value || gameBusy() || treeSession.value || gamePicker.value || document.hidden || disposed) return
+  if (!adopted.value || socialRole.value || treeSession.value || walking || nestActive.value || nestWalking.value || nestEntry.value || nestExiting.value || heldItem || document.hidden || disposed || playOpen.value || playOpening.value) return
+  if (gameBusy() || chat.streaming || gamePicker.value) { scheduleBehavior(1200); return }
   const hungry = pet.value && pet.value.hunger < 30
   const r = Math.random()
   // 猫砂盆：饱腹时低概率去用一次，每次进屋最多一次；不按时间/离线累积、不催铲。
@@ -759,8 +1015,9 @@ function behaviorTick() {
     ? sceneItems.value.find((it) => it.item_key === LITTER_KEY && clampLitterState(it.state) < 3)
     : null
   if (litterBox && r < 0.12) { useLitter(litterBox); return }
+  if (!hungry && r < .06 && performance.now() - lastChaseAt >= 60000 && startChase(false)) return
   // 道具互动：饱腹时 35% 概率找植物/毛线球/猫窝玩（饿了没力气玩）
-  const playables = sceneItems.value.filter((it) => ['plant', 'yarn', 'nest', APPLE_NEST_KEY, 'cat-tree'].includes(it.item_key) || isJumpNest(it.item_key))
+  const playables = sceneItems.value.filter((it) => !reservations.owner(it.id) && (['plant', 'yarn', 'nest', APPLE_NEST_KEY, 'cat-tree'].includes(it.item_key) || isJumpNest(it.item_key)))
   if (!hungry && playables.length && r < 0.35) {
     const item = playables[Math.floor(Math.random() * playables.length)]
     if (item.item_key === 'cat-tree') playTree(item, ['top', 'nest', 'grip'][Math.floor(Math.random() * 3)])
@@ -771,7 +1028,7 @@ function behaviorTick() {
     walkTo(randTarget(), () => behaviorNext())
   } else if (r < 0.8) {
     // 睡觉是一次长停留；老窝走到旁边躺，苹果窝沿用旧进场，新 15 款按 demo 跳跃进窝。
-    const nestItems = sceneItems.value.filter((it) => it.item_key === 'nest' || it.item_key === APPLE_NEST_KEY || isJumpNest(it.item_key))
+    const nestItems = sceneItems.value.filter((it) => !reservations.owner(it.id) && (it.item_key === 'nest' || it.item_key === APPLE_NEST_KEY || isJumpNest(it.item_key)))
     const target = nestItems.length ? nestItems[Math.floor(Math.random() * nestItems.length)] : null
     const nap = planInteractionSession('nest')
     if (target && target.item_key === APPLE_NEST_KEY) {
@@ -779,7 +1036,16 @@ function behaviorTick() {
     } else if (target && isJumpNest(target.item_key)) {
       jumpIntoNest(target)
     } else if (target) {
-      walkTo({ x: target.x, y: target.y }, () => { lieDown(); behaviorNext(nap.dwell) })
+      if (!claim(target)) return
+      walkTo({ x: target.x, y: target.y }, () => {
+        lieDown()
+        const epoch = walkEpoch
+        stateTimer = setTimeout(() => {
+          if (epoch !== walkEpoch) return
+          catAnim.value = 'sit'
+          behaviorNext()
+        }, nap.dwell)
+      })
     } else {
       lieDown()
       behaviorNext(nap.dwell)
@@ -830,6 +1096,7 @@ function beginNestExit(it, animate = true, onDone) {
   }, { speed: dist / 0.8 })
 }
 function cancelNest(opts = {}) {
+  if (heldItem?.item_key === 'nest') { interrupt(); catAnim.value = 'sit'; releaseClaim() }
   const sleepingIn = nestActive.value // 必须在 cancelJumpNest 清状态之前捕获
   cancelJumpNest() // 新 15 款的 rAF 动画与 dwell 定时器；苹果窝逻辑保持原样
   nestToken = null
@@ -843,6 +1110,7 @@ function cancelNest(opts = {}) {
   if (nestTimer) { clearTimeout(nestTimer); nestTimer = null }
   nestExiting.value = null
   if (nestExitTimer) { clearTimeout(nestExitTimer); nestExitTimer = null }
+  if (opts.animate === false && heldItem && (heldItem.item_key.startsWith('nest'))) releaseClaim()
   // 只有从趴睡态退出才需要出窝保护；重新进窝/切换互动传 animate:false，位移由后续 walkTo 接管。
   if (sleepingIn && !disposed) beginNestExit(sleepingIn, opts.animate !== false, opts.onDone)
   else opts.onDone?.()
@@ -860,6 +1128,7 @@ function enterNest(it) {
   if (roomLocked()) return
   cancelNest({ animate: false }) // 重新进窝：留给进场动画接管，不叠一段出窝
   nestExiting.value = null
+  if (!claim(it)) return
   const token = {}
   nestToken = token
   nestWalking.value = it
@@ -1020,7 +1289,7 @@ function jumpIntoNest(it) {
   cancelNest({ animate: false }) // 重新进窝：留给七阶段动画层接管
   nestExiting.value = null
   const p = nestProfile(it.item_key)
-  if (!p) return
+  if (!p || !claim(it)) return
   const token = {}
   nestEntryToken = token
   const route = nestRoute(p, it)
@@ -1032,11 +1301,18 @@ function jumpIntoNest(it) {
 }
 
 function interactWith(it) {
-  if (!it || !it.item_key || roomLocked()) return
+  if (!it || !it.item_key || roomLocked() || eating || placingFeed.value || feedPreparing.value) return
+  if (it.item_key === 'yarn') {
+    if (socialSession.value?.itemID === it.id) return
+    if (!eligibleSocialCat(actors.get(String(id.value)))) return
+    if (startSharedYarn(it, id.value)) return
+  }
+  cancelSocialFor(id.value)
   cancelNest({ animate: false }) // 切换互动：只保留层级保护，位移由下面的 walkTo 接管
   if (it.item_key === 'cat-tree') return playTree(it, 'top')
   if (it.item_key === APPLE_NEST_KEY) return enterNest(it)
   if (isJumpNest(it.item_key)) return jumpIntoNest(it)
+  if (!claim(it)) return
   // 每个道具的连续次数与停留时长都走同一份可复用 profile。
   const plan = planInteractionSession(it.item_key)
   const beside = it.item_key === 'yarn' ? 44 : 52
@@ -1081,13 +1357,313 @@ function playYarn(it, round, plan = planInteractionSession('yarn')) {
       stateTimer = setTimeout(() => playYarn({ ...it, x: nx }, round + 1, plan), plan.dwell)
     } else {
       // 玩完：保存毛线球新位置
-      jpost('/scene/place', { id: it.id, key: 'yarn', x: nx, y: it.y }).then(() => loadAll())
+      const epoch = generation, identity = identityEpoch
+      jpost('/scene/place', { id: it.id, key: 'yarn', x: nx, y: it.y }).then(() => {
+        if (!disposed && epoch === generation && identity === identityEpoch) refreshScene()
+      }).catch(() => {})
       say('抓到你啦！'
       )
       behaviorNext(1800)
     }
   })
 }
+
+return { id, pet, catAnim, catPos, flipped, bubble, showBubble, zzz, catEl, mealSeat, nestActive, nestWalking, nestExiting, nestEntry,
+  treeSession, treeRendered, treeMoving, treeLeaving, catDepth, catRoomStyle, treeCatSize, nestBubbleStyle, shakeId, chat,
+  syncCatPos, interrupt, resetTreeToFloor, leaveTree, playTree, walkTo, behaviorNext, behaviorTick, cancelNest, interactWith, say, hearts,
+  cancel, dispose, releaseFurniture, syncFurniture, resumeBehavior, cancelChat, startChatRequest, socialRole, socialPose,
+  get heldItem() { return heldItem }, get walking() { return walking }, get generation() { return generation } }
+}
+function selectedPetFallback() { return pet.value }
+function focusCamera(...args) { centerOn(...args) }
+
+// 社交会话持有唯一控制器与家具锁；所有动作共享 epoch，不递归调用全屋取消。
+const socialSession = ref(null)
+let socialEpoch = 0, lastChaseAt = -60000
+const socialCounts = new Map()
+function eligibleSocialCat(actor, ownSession = null) {
+  if (!actor) return false
+  return socialActorEligible({ hunger: actor.pet.value?.hunger, anim: ownSession && actor.socialRole.value ? 'sit' : actor.catAnim.value,
+    walking: actor.walking, sleeping: actor.catAnim.value === 'sleep',
+    occupied: Boolean(actor.heldItem || actor.treeSession.value || actor.nestActive.value || actor.nestWalking.value || actor.nestEntry.value || actor.nestExiting.value || actor.mealSeat.value !== null),
+    chat: actor.chat.streaming || (chatOpen.value && String(selectedPetID.value) === String(actor.id.value)),
+    social: Boolean(actor.socialRole.value && !ownSession) })
+}
+function socialAlive(s) {
+  if (!s || socialSession.value !== s || s.epoch !== socialEpoch || s.identity !== identityEpoch || disposed || document.hidden || !adopted.value || eating || feedPreparing.value || placingFeed.value || playOpen.value || playOpening.value) return false
+  if (s.furniture !== floorFurnitureSnapshot(sceneItems.value, decorArt)) return false
+  if (s.itemID !== null) {
+    const ball = sceneItems.value.find(it => it.id === s.itemID && it.item_key === 'yarn')
+    if (!ball || reservations.owner(s.itemID) !== s.owner || ball.x !== s.ball.x || ball.y !== s.ball.y) return false
+  }
+  return s.activeIDs.every(id => eligibleSocialCat(actors.get(id), s))
+}
+function frameSocial(s = socialSession.value) {
+  if (!s) return
+  const points = s.activeIDs.map(id => actors.get(id)?.catPos).filter(Boolean)
+  // 球的原摆放坐标不把相机拉远；互动进入以后才纳入当前双猫镜头。
+  if (s.kind === 'yarn' && s.stage !== 'invite' && s.stage !== 'approach') points.push({ x: s.ball.x, y: s.ball.y })
+  frameGroup(points)
+}
+function cancelSocial(resume = true, excludedID = '') {
+  const s = socialSession.value
+  if (!s) return
+  socialSession.value = null; socialEpoch++
+  for (const [timer, resolve] of s.timers) { clearTimeout(timer); resolve(false) }
+  s.timers.clear()
+  if (s.raf !== null) cancelAnimationFrame(s.raf)
+  s.motionResolve?.(false); s.raf = null; s.motionResolve = null
+  if (s.itemID !== null) reservations.release(s.itemID, s.owner)
+  for (const id of s.members) {
+    const actor = actors.get(id)
+    if (!actor) continue
+    actor.socialRole.value = ''; actor.socialPose.value = ''; actor.cancel()
+    if (resume && id !== String(excludedID) && adopted.value && !disposed && !document.hidden && !eating && !feedPreparing.value && !playOpen.value && !playOpening.value) actor.behaviorNext(1800)
+  }
+  if (adopted.value && !disposed && !document.hidden && !mealGroupFraming.value && !playOpen.value) centerOn(catPos.x, catPos.y - 48, 0)
+}
+function cancelSocialFor(id) {
+  if (socialSession.value?.members.has(String(id))) cancelSocial(true, id)
+}
+function socialWait(s, ms) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { s.timers.delete(timer); resolve(socialAlive(s)) }, ms)
+    s.timers.set(timer, resolve)
+  })
+}
+function writeSocialBall(s, point) {
+  if (!socialAlive(s)) return false
+  const ball = sceneItems.value.find(it => it.id === s.itemID)
+  ball.x = point.x; ball.y = point.y; s.ball = { ...point }
+  return true
+}
+function socialMotion(s, duration, update) {
+  if (!socialAlive(s)) return Promise.resolve(false)
+  return new Promise(resolve => {
+    s.motionResolve = resolve
+    const started = performance.now()
+    const frame = now => {
+      s.raf = null
+      if (!socialAlive(s)) { s.motionResolve = null; resolve(false); return }
+      const t = Math.min(1, (now - started) / duration)
+      update(t); frameSocial(s)
+      if (t < 1) s.raf = requestAnimationFrame(frame)
+      else { s.motionResolve = null; resolve(true) }
+    }
+    s.raf = requestAnimationFrame(frame)
+  })
+}
+function socialWorldObstacles(excludeID) { return socialObstacles(sceneItems.value, decorArt, excludeID) }
+async function socialMoveActor(s, actor, target, speed = 180, pounce = false) {
+  const others = [...actors.values()].filter(a => a !== actor).map(a => s.kind === 'chase'
+    ? { left: a.catPos.x - 55, right: a.catPos.x + 55, top: a.catPos.y - 92, bottom: a.catPos.y + 92 }
+    : { left: a.catPos.x - 55, right: a.catPos.x + 55, top: a.catPos.y - 65, bottom: a.catPos.y + 65 })
+  const route = s.kind === 'chase'
+    ? actorFloorRoute(actor.catPos, target, [...actors.values()].filter(a => a !== actor).map(a => a.catPos), socialWorldObstacles(s.itemID))
+    : socialRoute(actor.catPos, target, [...socialWorldObstacles(s.itemID), ...others])
+  if (!route) return false
+  actor.socialPose.value = pounce ? 'pounceA' : ''; actor.catAnim.value = pounce ? 'pounce' : 'walk'
+  for (const point of route) {
+    const from = { ...actor.catPos }, duration = pounce ? 420 : Math.max(200, Math.hypot(point.x - from.x, point.y - from.y) / speed * 1000)
+    actor.flipped.value = point.x > from.x
+    if (!await socialMotion(s, duration, t => {
+      actor.catPos.x = from.x + (point.x - from.x) * t
+      actor.catPos.y = from.y + (point.y - from.y) * t - (pounce ? Math.sin(Math.PI * t) * 12 : 0)
+      if (pounce) actor.socialPose.value = t < .5 ? 'pounceA' : 'pounceB'
+    })) return false
+  }
+  actor.socialPose.value = ''; actor.catAnim.value = 'sit'
+  return true
+}
+function createSocial(kind, item, ids) {
+  const s = reactive({ kind, itemID: item?.id ?? null, epoch: ++socialEpoch, identity: identityEpoch,
+    owner: `social-${socialEpoch}`, ball: item ? { x: item.x, y: item.y } : null,
+    activeIDs: [], members: new Set(), counts: new Map(), timers: new Map(), raf: null, motionResolve: null,
+    stage: 'invite', round: 0, roles: ids, saved: false, furniture: floorFurnitureSnapshot(sceneItems.value, decorArt) })
+  if (item && !reservations.acquire(item.id, s.owner)) return null
+  socialSession.value = s
+  const watchdog = setTimeout(() => {
+    if (socialSession.value !== s) return
+    if (s.kind === 'yarn' && !s.saved) showToast('球球先休息一下，合玩没能完成，可以再点毛球试试')
+    cancelSocial()
+  }, 45000)
+  s.timers.set(watchdog, () => {})
+  return s
+}
+function enlistSocial(s, ids) {
+  if (s.kind === 'yarn') {
+    // 候位仍归会话持有，不能释放后让自主计时器把猫带回球的通道。
+    for (const actor of actors.values()) {
+      const id = String(actor.id.value)
+      if (!s.members.has(id) && !eligibleSocialCat(actor)) continue
+      if (!s.members.has(id)) {
+        actor.syncCatPos(); actor.interrupt()
+        if (actor.catEl.value) actor.catEl.value.style.transition = 'none'
+        s.members.add(id)
+      }
+      if (!ids.includes(id)) {
+        actor.socialRole.value = 'yarn-wait'; actor.socialPose.value = ''; actor.catAnim.value = 'sit'
+      }
+    }
+  }
+  for (const id of ids) {
+    const actor = actors.get(id)
+    if (!actor.socialRole.value) {
+      actor.syncCatPos(); actor.interrupt()
+      if (actor.catEl.value) actor.catEl.value.style.transition = 'none'
+    }
+    actor.socialRole.value = s.kind
+    s.members.add(id); s.counts.set(id, (s.counts.get(id) || 0) + 1)
+  }
+  s.activeIDs = ids; s.roles = ids
+}
+function startSharedYarn(item, initiator) {
+  if (socialSession.value) return socialSession.value.itemID === item.id
+  const ids = [...actors.values()].filter(a => eligibleSocialCat(a)).map(a => String(a.id.value))
+  const pair = socialPair(ids, initiator)
+  if (pair.length < 2) return false
+  const stage = socialStage(item, 95, socialWorldObstacles(item.id))
+  if (!stage) return false
+  const s = createSocial('yarn', item, pair)
+  if (!s) return true
+  enlistSocial(s, pair); initialGroupFraming.value = false; camMode.value = 'follow'
+  void runSharedYarn(s, stage)
+  return true
+}
+async function runSharedYarn(s, stage) {
+  try {
+    if (!await socialWait(s, 400)) return
+    for (let round = 0; round < 4; round++) {
+      if (!socialAlive(s)) return
+      s.round = round; s.stage = round ? 'exchange' : 'approach'
+      if (round) {
+        const ids = [...actors.values()].filter(a => eligibleSocialCat(a, s.members.has(String(a.id.value)) ? s : null)).map(a => String(a.id.value))
+        const pair = socialPair(ids, s.roles[1], s.counts)
+        if (pair.length < 2) return
+        // 先把离场猫送到候位，再让新伙伴入场；保留接球猫原侧，不互穿换边。
+        for (const leavingID of s.activeIDs.filter(id => !pair.includes(id))) {
+          const leaving = actors.get(leavingID)
+          let cleared = false
+          for (const y of [Math.min(700, stage.y + 110), Math.max(446.4, stage.y - 110)]) {
+            if (await socialMoveActor(s, leaving, { x: leaving.catPos.x, y })) { cleared = true; break }
+            if (!socialAlive(s)) return
+          }
+          if (!cleared) return
+        }
+        enlistSocial(s, pair)
+        if (!await socialWait(s, 400)) return
+      }
+      const pair = s.activeIDs.map(id => actors.get(id))
+      const firstLeft = round ? pair[0].catPos.x < stage.x : pair[0].catPos.x < pair[1].catPos.x
+      const seats = new Map(pair.map((actor, i) => {
+        const left = i ? !firstLeft : firstLeft
+        return [String(actor.id.value), { x: stage.x + (left ? -85 : 85), y: stage.y, facing: left }]
+      }))
+      for (const actor of pair) if (!await socialMoveActor(s, actor, seats.get(String(actor.id.value)))) return
+      const hitter = actors.get(s.roles[0]), receiver = actors.get(s.roles[1])
+      const hitSeat = seats.get(s.roles[0]), receiveSeat = seats.get(s.roles[1])
+      hitter.flipped.value = hitSeat.facing; receiver.flipped.value = receiveSeat.facing
+      const hit = yarnPawContact(hitSeat, hitSeat.facing), receive = yarnPawContact(receiveSeat, receiveSeat.facing)
+      const oldBall = { ...s.ball }
+      s.stage = 'offer'
+      if (!await socialMotion(s, 650, t => writeSocialBall(s, { x: oldBall.x + (hit.ball.x - oldBall.x) * t, y: oldBall.y + (hit.ball.y - oldBall.y) * t }))) return
+      s.stage = 'tap'; hitter.catAnim.value = 'catch'; hitter.socialPose.value = 'catchB'; hitter.say('给你球球！')
+      if (!await socialWait(s, 360)) return
+      s.stage = 'crouch'; receiver.catAnim.value = 'crouch'; receiver.socialPose.value = 'crouchA'
+      if (!await socialWait(s, 460)) return
+      hitter.catAnim.value = 'sit'; hitter.socialPose.value = ''
+      const out = { ...receiveSeat, x: receiveSeat.x + (receiveSeat.facing ? -10 : 10) }
+      if (!await socialMoveActor(s, receiver, out)) return
+      receiver.flipped.value = receiveSeat.facing; receiver.catAnim.value = 'crouch'; receiver.socialPose.value = 'crouchB'
+      s.stage = 'roll'
+      if (!await socialMotion(s, 850, t => writeSocialBall(s, { x: hit.ball.x + (receive.ball.x - hit.ball.x) * t, y: receive.ball.y }))) return
+      s.stage = 'pounce'
+      if (!await socialMoveActor(s, receiver, receiveSeat, 180, true)) return
+      receiver.flipped.value = receiveSeat.facing; receiver.catAnim.value = 'catch'; receiver.socialPose.value = 'catchB'; receiver.say('接住啦！轮到我～')
+      s.stage = 'catch'
+      if (!await socialWait(s, 640)) return
+    }
+    if (!socialAlive(s) || s.saved) return
+    s.saved = true; s.stage = 'done'
+    // 仅自然结束写一次；不在回调刷新整个房间，避免晚到快照覆盖新 kid/新玩法。
+    void jpost('/scene/place', { id: s.itemID, key: 'yarn', x: s.ball.x, y: s.ball.y }).catch(() => {})
+  } catch {
+    // 未完成的合玩只收尾，不能落盘或留下无提示的会话。
+  } finally {
+    if (socialSession.value === s) {
+      if (!s.saved && !disposed && !document.hidden && adopted.value) showToast('球球先休息一下，合玩没能完成，可以再点毛球试试')
+      cancelSocial()
+    }
+  }
+}
+function startChase(manual = false) {
+  if (!adopted.value || gameBusy() || document.hidden || disposed || socialSession.value) return false
+  const ids = [...actors.values()].filter(a => eligibleSocialCat(a)).map(a => String(a.id.value))
+  const pair = socialPair(ids, null, socialCounts)
+  if (pair.length < 2) { if (manual) showToast('等两只有精神、正在休息的小猫一起玩吧'); return false }
+  const preferred = { x: pair.reduce((sum, id) => sum + actors.get(id).catPos.x, 0) / 2, y: Math.max(...pair.map(id => actors.get(id).catPos.y)) }
+  const resting = [...actors.values()].filter(a => !pair.includes(String(a.id.value))).map(actorFloorSnapshot)
+  const entry = planChaseEntry(pair.map(id => actorFloorSnapshot(actors.get(id))), preferred, socialWorldObstacles(), resting)
+  if (!entry) { if (manual) showToast('地板有点挤，腾出一小块空地再玩吧'); return false }
+  const s = createSocial('chase', null, pair)
+  closeGamePicker(false); toolsOpen.value = false; hudOpen.value = false; sheet.value = ''
+  enlistSocial(s, pair)
+  pair.forEach(id => socialCounts.set(id, (socialCounts.get(id) || 0) + 1))
+  lastChaseAt = performance.now(); initialGroupFraming.value = false; camMode.value = 'follow'
+  void runChase(s, entry)
+  return true
+}
+async function runChase(s, entry) {
+  try {
+    const { stage } = entry
+    const pair = entry.seats.slice().sort((a, b) => a.seat - b.seat).map(seat => actors.get(seat.id))
+    let direction = entry.direction
+    s.roles = (direction > 0 ? pair : [...pair].reverse()).map(actor => String(actor.id.value))
+    actors.get(s.roles[1]).say('来追我呀～')
+    if (!await socialWait(s, 600)) return
+    s.stage = 'approach'
+    for (const move of entry.moves) {
+      const actor = actors.get(move.id)
+      for (const point of move.route) if (!await socialMoveActor(s, actor, point)) return
+    }
+    let center = { ...stage }
+    for (let round = 0; round < 2; round++) {
+      if (!socialAlive(s)) return
+      s.round = round
+      if (round) {
+        s.stage = 'exchange'; s.roles = [...s.roles].reverse(); direction *= -1
+        if (!await socialWait(s, 400)) return
+      }
+      const target = { x: center.x + direction * 74, y: center.y }
+      const others = [...actors.values()].filter(a => !s.activeIDs.includes(String(a.id.value))).map(a => ({ left: a.catPos.x - 55, right: a.catPos.x + 55, top: a.catPos.y - 92, bottom: a.catPos.y + 92 }))
+      const route = socialFormationRoute(center, target, 64, [...socialWorldObstacles(), ...others])
+      if (!route) return
+      s.stage = 'chase'
+      pair.forEach(actor => { actor.catAnim.value = 'walk'; actor.flipped.value = direction > 0 })
+      for (const point of route) {
+        const from = { ...center }
+        if (!await socialMotion(s, 1200, t => pair.forEach((actor, i) => {
+          actor.catPos.x = from.x + (point.x - from.x) * t + (i ? 64 : -64)
+          actor.catPos.y = from.y + (point.y - from.y) * t
+        }))) return
+        center = { ...point }
+      }
+      s.stage = 'lookback'
+      pair.forEach((actor, i) => { actor.catAnim.value = 'sit'; actor.flipped.value = !i })
+      if (!await socialWait(s, 650)) return
+    }
+    s.stage = 'done'; pair.forEach(actor => actor.say('歇一会儿～'))
+    await socialWait(s, 500)
+  } finally { if (socialSession.value === s) cancelSocial() }
+}
+watch(() => floorFurnitureSnapshot(sceneItems.value, decorArt), () => {
+  const s = socialSession.value
+  if (s && s.furniture !== floorFurnitureSnapshot(sceneItems.value, decorArt)) cancelSocial()
+}, { flush: 'sync' })
+watch(() => sceneItems.value.map(it => `${it.id}:${it.item_key}:${it.x}:${it.y}`).join('|'), () => {
+  const s = socialSession.value
+  if (s && !socialAlive(s)) cancelSocial()
+})
 
 // ===== 猫砂盆：小图状态由后端 scene_item.state 驱动，铲屎动作只在全屏覆层里 =====
 // 变脏只能由猫在线真用过一次触发；不按时间/离线累积、不催铲、不扣心情。
@@ -1112,36 +1688,11 @@ async function onLitterScooped(delta) {
 }
 function onLitterClose() {
   litterItem.value = null
-  behaviorNext(1200)
-}
-function useLitter(box) {
-  if (gameBusy() || litterUseBusy || litterUsedThisSession) return
-  litterUsedThisSession = true
-  litterUseBusy = true
-  cancelNest({ animate: false })
-  const beside = 52
-  walkTo({ x: box.x + (catPos.x < box.x ? -beside : beside), y: box.y }, () => {
-    facePoint(box.x)
-    catAnim.value = 'eat' // 低头刨砂，沿用现有帧表
-    say('刨一刨…好啦！')
-    stateTimer = setTimeout(async () => {
-      catAnim.value = 'sit'
-      try {
-        const { ok, data } = await jpost('/litter/use', { id: box.id })
-        if (ok && typeof data.state === 'number') {
-          const local = sceneItems.value.find((x) => x.id === box.id)
-          if (local) local.state = data.state
-        }
-      } catch { /* 本次没同步上不影响互动，下次进屋会重新拉场景 */ }
-      litterUseBusy = false
-      behaviorNext(1500)
-    }, 1400)
-  })
+  resumeAllCats(1200)
 }
 
 const roomEl = ref(null) // 可拖动的场景视口，不包含导航与侧栏
 const worldEl = ref(null)
-const catEl = ref(null)
 
 // CSS 和 JS 使用同一断点，首帧同步判断；不能用场景宽度判断设备宽度。
 const narrowMedia = window.matchMedia('(max-width: 900px)')
@@ -1183,7 +1734,10 @@ function onViewportResize() {
   nextTick(() => {
     if (playOpen.value || playOpening.value || disposed) return
     if (hudOpen.value) alignStatusPanel()
-    if (camMode.value === 'follow' && adopted.value) centerOn(catPos.x, catPos.y - 48, 0)
+    if (adopted.value && mealGroupFraming.value) frameGroup(mealSpots.value)
+    else if (adopted.value && socialSession.value) frameSocial()
+    else if (camMode.value === 'follow' && adopted.value && initialGroupFraming.value) frameGroup([...actors.values()].map(actor => actor.catPos))
+    else if (camMode.value === 'follow' && adopted.value) centerOn(catPos.x, catPos.y - 48, 0)
     else setCamera(cam.value.x, cam.value.y)
   })
 }
@@ -1325,61 +1879,66 @@ async function onRecStop() {
 
 // ===== 猫聊天（SSE 流式打字机） =====
 const chatOpen = ref(false)
-const chatMessages = ref([]) // {role, content}
-const chatInput = ref('')
-const chatStreaming = ref(false)
-const chatLeft = ref(30)
+const chatProjection = key => computed({ get: () => selectedActor.value.chat[key], set: value => { selectedActor.value.chat[key] = value } })
+const chatMessages = chatProjection('messages'), chatInput = chatProjection('input'), chatStreaming = chatProjection('streaming'), chatLeft = chatProjection('left')
+function cancelChat() { for (const actor of actors.values()) actor.cancelChat() }
 
 async function openChat() {
   if (roomLocked()) return
+  const actor = selectedActor.value, requestedID = actor.id.value, epoch = identityEpoch
+  cancelSocialFor(requestedID)
   closeGamePicker(false)
-  await leaveTree()
-  if (roomLocked() || disposed) return
-  toolsOpen.value = false
-  hudOpen.value = false
-  sheet.value = ''
-  chatOpen.value = true
-  if (chatMessages.value.length === 0) {
-    const d = await jget('/chat/history')
-    chatMessages.value = d.messages || []
-    chatLeft.value = d.left_today ?? 30
-    if (!chatMessages.value.length) {
-      chatMessages.value = [{ role: 'assistant', content: '喵～想和我聊什么呀？' }]
-    }
+  await actor.leaveTree()
+  if (roomLocked() || disposed || actor !== selectedActor.value) return
+  toolsOpen.value = false; hudOpen.value = false; sheet.value = ''; chatOpen.value = true
+  if (!actor.chat.messages.length) {
+    const controller = actor.startChatRequest()
+    try {
+      const response = await fetch(`/api/chat/history${requestedID === 'legacy' ? '' : '?pet_id=' + encodeURIComponent(requestedID)}`, { signal: controller.signal })
+      const d = await response.json()
+      if (disposed || epoch !== identityEpoch || controller.signal.aborted) return
+      actor.chat.messages = d.messages?.length ? d.messages : [{ role: 'assistant', content: '喵～想和我聊什么呀？' }]
+      actor.chat.left = d.left_today ?? 30
+    } catch { if (!controller.signal.aborted && !disposed) showToast('聊天记录没有加载，请稍后再试') }
   }
-  if (adopted.value) say('聊点什么呀～')
+  if (adopted.value && epoch === identityEpoch) actor.say('聊点什么呀～')
 }
 
 async function sendChat() {
   const text = chatInput.value.trim()
   if (roomLocked() || !text || chatStreaming.value) return
   if (chatLeft.value <= 0) return showToast('今天聊得够多啦，猫要睡觉了喵～明天再来')
-  chatInput.value = ''
-  chatMessages.value.push({ role: 'user', content: text })
-  chatLeft.value--
-  chatStreaming.value = true
-  const reply = { role: 'assistant', content: '' }
-  chatMessages.value.push(reply)
+  const actor = selectedActor.value, chat = actor.chat, epoch = identityEpoch
+  const controller = actor.startChatRequest()
+  chat.input = ''
+  chat.messages.push({ role: 'user', content: text })
+  chat.left--; chat.streaming = true
+  const reply = reactive({ role: 'assistant', content: '' })
+  chat.messages.push(reply)
 
   // fetch + ReadableStream 解析 SSE（EventSource 不支持 POST）
   try {
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: text }),
+      body: JSON.stringify({ content: text, ...(actor.id.value !== 'legacy' ? { pet_id: petRequestID(actor.id.value) } : {}) }),
+      signal: controller.signal,
     })
-    if (r.status === 429) {
+    if (disposed || epoch !== identityEpoch || controller.signal.aborted) return
+    if (!r.ok) {
       const e = await r.json()
-      reply.content = e.error || '今天聊够啦～'
-      chatStreaming.value = false
+      reply.content = e.error || '聊天暂时没有完成'
+      chat.streaming = false
       return
     }
     const reader = r.body.getReader()
     const dec = new TextDecoder()
     let buf = ''
-    catAnim.value = 'eat' // 说话时张嘴动画
+    actor.cancel()
+    actor.catAnim.value = 'eat' // 只改变发起聊天的猫
     for (;;) {
       const { done, value } = await reader.read()
+      if (disposed || epoch !== identityEpoch || controller.signal.aborted) { await reader.cancel(); return }
       if (done) break
       buf += dec.decode(value, { stream: true })
       const lines = buf.split('\n')
@@ -1388,17 +1947,17 @@ async function sendChat() {
         if (!line.startsWith('data:')) continue
         try {
           const d = JSON.parse(line.slice(5).trim())
-          if (d.d) { reply.content += d.d; chatMessages.value = [...chatMessages.value] }
+          if (d.d) reply.content += d.d
           if (d.error) { reply.content = d.error }
         } catch (e) { /* 半行 */ }
       }
     }
-    catAnim.value = 'sit'
   } catch (e) {
-    reply.content = reply.content || '喵呜…卡住了，再试一次？'
-    catAnim.value = 'sit'
+    if (!controller.signal.aborted && !disposed && epoch === identityEpoch) reply.content = reply.content || '喵呜…卡住了，再试一次？'
+  } finally {
+    chat.streaming = false
+    if (!controller.signal.aborted && !disposed && epoch === identityEpoch) { actor.catAnim.value = 'sit'; actor.behaviorNext(1500) }
   }
-  chatStreaming.value = false
 }
 
 // 触摸交互：点地面 → 猫快速跑过去；点物品 → 跑过去互动
@@ -1452,114 +2011,218 @@ function onRoomTap(e) {
 }
 
 const TALK = ['喵～陪我玩！', '今天任务做完了吗？', '我在守护这个房间！', '你是最棒的主人！']
-function say(t) {
-  bubble.value = t || TALK[Math.floor(Math.random() * TALK.length)]
-  showBubble.value = true
-  clearTimeout(bubbleTimer)
-  bubbleTimer = setTimeout(() => (showBubble.value = false), 2200)
-}
-function hearts(n) { hopFx() }
+// 气泡与跳跃效果由对应猫实例管理。
 
 // ===== 交互 =====
 const catTouchBusy = ref(false)
 async function petCat() {
   if (!adopted.value || roomLocked() || eating) return
   catTouchBusy.value = true
+  const actor = selectedActor.value, requestedID = actor.id.value, epoch = identityEpoch
   try {
-    await leaveTree()
-    if (!adopted.value || disposed || document.hidden) return
-    const { data } = await jpost('/pet/touch')
+    await actor.leaveTree()
+    if (!adopted.value || disposed || document.hidden || epoch !== identityEpoch) return
+    actor.cancel()
+    const { data } = await jpost('/pet/touch', requestedID === 'legacy' ? {} : { pet_id: petRequestID(requestedID) })
+    if (disposed || epoch !== identityEpoch) return
     if (data.touch_left_today === 0 && data.touch_left_today !== undefined) showToast('今天摸够啦，小猫要被摸秃了～')
-    hearts(3)
-    say(['好舒服呀～', '喵呜！', '最喜欢你啦！'][Math.floor(Math.random() * 3)])
-    await refreshPet()
-  } catch { showToast('摸摸没有保存，请稍后再试') }
-  finally { catTouchBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
+    actor.hearts(3)
+    actor.say(['好舒服呀～', '喵呜！', '最喜欢你啦！'][Math.floor(Math.random() * 3)])
+    await refreshPet(requestedID)
+  } catch { if (!disposed) showToast('摸摸没有保存，请稍后再试') }
+  finally { catTouchBusy.value = false; if (!disposed && epoch === identityEpoch) actor.behaviorNext(4500) }
 }
 
-// 喂食流程：点按钮 → 放置模式（点地面放碗）→ 猫跑过去吃 → 吃完才调后端结算
-const placingFeed = ref(false)
-let eating = false
-let feedTimer = null, feedEpoch = 0, feedInFlight = false
-function feedCurrent(epoch) { return epoch === feedEpoch && adopted.value && !disposed && !document.hidden }
-function cancelFeeding(notify = false) {
-  if (!eating && !placingFeed.value) return
-  feedEpoch++
-  clearTimeout(feedTimer)
-  feedTimer = null
-  if (eating) {
-    syncCatPos()
-    if (catEl.value) catEl.value.style.transition = 'none'
-    interrupt()
-    catAnim.value = 'sit'
-  }
-  placingFeed.value = false
-  showBowl.value = false
-  clearTimeout(bubbleTimer)
-  showBubble.value = false
-  // 已经发出的结算不能伪回滚；请求完成前仍保持互斥，避免重复扣费。
-  eating = feedInFlight
-  if (notify && !disposed) showToast(feedInFlight ? '喂食请求已发送，回来后会同步结果，请勿重复喂食' : '喂食已取消，还没有扣星星，回来可以重新喂')
-}
-async function feed() {
-  if (!adopted.value || eating || roomLocked()) return
-  closeGamePicker(false)
-  await leaveTree()
-  if (!adopted.value || roomLocked() || document.hidden || disposed) return
-  if (placingFeed.value) { placingFeed.value = false; say('不喂了吗？'); return } // 再点一次=取消
-  placingFeed.value = true
-  toolsOpen.value = false
-  say('猫粮放哪儿？点一下地面～')
-}
-function placeBowlAndGo(x, y) {
-  if (!adopted.value || disposed || document.hidden || roomLocked() || treeSession.value || eating || feedInFlight) return
-  clearTimeout(feedTimer)
-  feedTimer = null
-  const epoch = ++feedEpoch
-  placingFeed.value = false
-  eating = true
-  bowlPos.x = x
-  bowlPos.y = y
-  showBowl.value = true
-  say('闻到香味啦！')
-  // 猫小跑到碗边（停左侧，头朝碗）
-  walkTo({ x: x - 58, y: y }, () => {
-    if (!feedCurrent(epoch)) { if (epoch === feedEpoch) cancelFeeding(); return }
-    flipped.value = true // 面向右侧的碗
-    catAnim.value = 'eat'
-    say('开动咯！')
-    feedTimer = setTimeout(async () => {
-      if (epoch !== feedEpoch) return
-      feedTimer = null
-      if (!feedCurrent(epoch)) { cancelFeeding(); return }
-      feedInFlight = true
-      try {
-        // 吃完才请求后端；隐藏或卸载不会重发已经提交的结算。
-        const { ok, data } = await jpost('/pet/feed')
-        if (!feedCurrent(epoch)) return
-        if (!ok) {
-          say(data.error || '星星不够啦…')
-        } else {
-          pet.value = data.pet
-          hearts(6)
-          say('真好吃！谢谢你！')
-        }
-      } catch {
-        if (feedCurrent(epoch)) showToast('喂食结果暂时无法确认，请先查看小猫状态再重试')
-      } finally {
-        feedInFlight = false
-        eating = false
-        if (feedCurrent(epoch)) {
-          showBowl.value = false
-          catAnim.value = 'sit'
-          behaviorNext(1500)
-        }
-      }
-    }, 2300)
-  }, { speed: 170 })
-}
+// 开饭是共享事务：放碗时集中结算，成功后才播放全猫动画；动画永不决定扣费。
+const placingFeed = ref(false), feedPreparing = ref(false), mealPhase = ref('idle')
 const showBowl = ref(false)
 const bowlPos = reactive({ x: 0, y: 0 })
+const mealSpots = ref([]), mealPlate = ref(null), mealBatch = ref(0), mealStage = ref(''), mealAnimation = ref('idle')
+const feedWaiters = new Map()
+let feedRAF = null, feedMoveResolve = null
+function feedWait(ms, epoch) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { feedWaiters.delete(timer); resolve(feedCurrent(epoch)) }, ms)
+    feedWaiters.set(timer, resolve)
+  })
+}
+function stopFeedWaiters() {
+  for (const [timer, resolve] of feedWaiters) { clearTimeout(timer); resolve(false) }
+  feedWaiters.clear()
+  if (feedRAF !== null) cancelAnimationFrame(feedRAF)
+  feedRAF = null; feedMoveResolve?.(false); feedMoveResolve = null
+  mealPlate.value = null; mealStage.value = ''
+}
+function feedWalk(actor, point, epoch) {
+  if (!feedCurrent(epoch)) return Promise.resolve(false)
+  const from = { ...actor.catPos }, duration = Math.max(120, Math.hypot(point.x - from.x, point.y - from.y) / 170 * 1000)
+  actor.interrupt(); actor.catAnim.value = 'walk'; actor.flipped.value = point.x > from.x
+  if (actor.catEl.value) actor.catEl.value.style.transition = 'none'
+  return new Promise(resolve => {
+    feedMoveResolve = resolve
+    const timer = setTimeout(() => {
+      feedWaiters.delete(timer)
+      if (feedRAF !== null) cancelAnimationFrame(feedRAF)
+      feedRAF = null; feedMoveResolve = null; resolve(false)
+    }, 20000)
+    feedWaiters.set(timer, resolve)
+    const started = performance.now()
+    const frame = now => {
+      feedRAF = null
+      if (!feedCurrent(epoch)) { clearTimeout(timer); feedWaiters.delete(timer); feedMoveResolve = null; resolve(false); return }
+      const t = Math.min(1, (now - started) / duration)
+      actor.catPos.x = from.x + (point.x - from.x) * t
+      actor.catPos.y = from.y + (point.y - from.y) * t
+      if (t < 1) feedRAF = requestAnimationFrame(frame)
+      else { clearTimeout(timer); feedWaiters.delete(timer); feedMoveResolve = null; actor.catAnim.value = 'sit'; resolve(true) }
+    }
+    feedRAF = requestAnimationFrame(frame)
+  })
+}
+const actorFloorSnapshot = actor => ({ id: String(actor.id.value), x: actor.catPos.x, y: actor.catPos.y })
+async function runMealMoves(plan, epoch) {
+  if (!plan) return false
+  for (const move of plan.moves) {
+    const actor = actors.get(move.id)
+    if (!actor || !feedCurrent(epoch)) return false
+    for (const point of move.route) if (!await feedWalk(actor, point, epoch)) return false
+  }
+  return feedCurrent(epoch)
+}
+function finishMealAnimation(participants, completed) {
+  clearTimeout(feedTimer); feedTimer = null; stopFeedWaiters()
+  eating = false; showBowl.value = false; mealSpots.value = []; mealPhase.value = 'succeeded'
+  mealAnimation.value = completed ? 'completed' : 'failed'
+  participants.forEach(actor => {
+    actor.cancel()
+    if (completed) actor.say('真好吃！谢谢你！')
+    actor.behaviorNext(1500)
+  })
+  if (!completed) showToast('开饭已结算，但进食动画暂时没能完成；不会退款或重复扣费')
+  camMode.value = 'follow'; centerOn(catPos.x, catPos.y - 48, 0)
+}
+async function animateMeal(participants, geometry, arrival, epoch) {
+  const batches = mealBatches(participants)
+  let completed = false
+  participants.forEach(actor => actor.cancel())
+  try {
+    mealBatch.value = 0; mealStage.value = 'approach'
+    if (!await runMealMoves(arrival, epoch)) return
+    for (const [batchIndex, batch] of batches.entries()) {
+      if (!feedCurrent(epoch)) return
+      mealBatch.value = batchIndex
+      if (batchIndex) {
+        const previous = batches[batchIndex - 1]
+        mealStage.value = 'rotate'; previous.forEach(actor => { actor.mealSeat.value = null; actor.catAnim.value = 'sit' })
+        const stationary = participants.filter(actor => !previous.includes(actor)).map(actorFloorSnapshot)
+        const exits = geometry.seats.slice(0, previous.length).map(seat => ({ x: seat.x, y: geometry.center.y - 110 }))
+        if (!await runMealMoves(planActorSeats(previous.map(actorFloorSnapshot), exits, socialWorldObstacles(), stationary), epoch)) return
+        const waiting = participants.filter(actor => !batch.includes(actor)).map(actorFloorSnapshot)
+        const seated = planActorSeats(batch.map(actorFloorSnapshot), geometry.seats.slice(0, batch.length), socialWorldObstacles(), waiting)
+        if (!await runMealMoves(seated, epoch)) return
+      }
+      // 使用当前实际脚点决定左右口位，不以身份顺序强迫两猫换边。
+      batch.forEach(actor => {
+        const seat = actor.catPos.x < geometry.center.x ? 0 : 1
+        actor.mealSeat.value = seat; actor.flipped.value = geometry.seats[seat].flipped
+        actor.catAnim.value = 'eat'
+      })
+      mealStage.value = 'eat'
+      if (!await feedWait(2000, epoch)) return
+    }
+    completed = true
+  } catch {
+    // 动画故障不改变已成功的结算，更不能创建另一笔请求。
+  } finally {
+    if (feedCurrent(epoch)) finishMealAnimation(participants, completed)
+  }
+}
+let eating = false, feedEpoch = 0, feedInFlight = false, feedTimer = null, mealTransaction = null
+function mealClient() {
+  const storageKey = `meow_meal_${kidID.value || 'legacy'}`
+  if (!mealTransaction) mealTransaction = createMealTransaction({
+    post: body => jpost('/pet/feed', body), storage: localStorage,
+    key: () => storageKey,
+    makeID: () => globalThis.crypto?.randomUUID?.() || `meal-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  })
+  return mealTransaction
+}
+function feedCurrent(epoch) { return epoch === feedEpoch && adopted.value && !disposed && !document.hidden }
+function cancelFeeding(notify = false) {
+  if (!eating && !placingFeed.value && !feedPreparing.value) return
+  const wasMealFraming = mealGroupFraming.value
+  if (mealAnimation.value === 'running') mealAnimation.value = 'cancelled'
+  feedEpoch++
+  clearTimeout(feedTimer); feedTimer = null; stopFeedWaiters()
+  cancelAllCats()
+  placingFeed.value = false; feedPreparing.value = false; showBowl.value = false; mealSpots.value = []
+  eating = feedInFlight
+  if (!feedInFlight && mealPhase.value !== 'unknown') mealPhase.value = mealTransaction?.state.phase === 'succeeded' ? 'succeeded' : 'idle'
+  if (wasMealFraming && adopted.value && !disposed && !document.hidden) { camMode.value = 'follow'; centerOn(catPos.x, catPos.y - 48, 0) }
+  if (notify && !disposed) showToast(feedInFlight ? '开饭请求已发送，回来后同步结果，不会重复扣费' : mealPhase.value === 'succeeded' ? '开饭已结算，只取消动画，不返还费用' : '开饭动画已取消；已成功的结算不会返还，未发送请求不扣星星')
+}
+function resetFeedIdentity() {
+  cancelSocial(false); socialCounts.clear(); lastChaseAt = -60000
+  cancelFeeding()
+  feedEpoch++
+  clearTimeout(feedTimer); feedTimer = null; stopFeedWaiters()
+  placingFeed.value = false; feedPreparing.value = false; showBowl.value = false; mealSpots.value = []
+  eating = false; feedInFlight = false; bowlPos.x = 0; bowlPos.y = 0; mealPhase.value = 'idle'; mealAnimation.value = 'idle'; mealTransaction = null
+}
+async function feed() {
+  if (!adopted.value || eating || feedPreparing.value || placingFeed.value || roomLocked()) return
+  if (pets.value.length && pets.value.every(cat => cat.hunger >= 100) && mealClient().state.phase !== 'unknown') return showToast('小猫们都吃饱啦，不用花星星')
+  const identity = identityEpoch, epoch = ++feedEpoch
+  feedPreparing.value = true; mealAnimation.value = 'idle'
+  cancelSocial(false)
+  try {
+    closeGamePicker(false)
+    await allCats(actor => actor.leaveTree())
+    if (identity !== identityEpoch || epoch !== feedEpoch || !feedPreparing.value || !adopted.value || roomLocked() || document.hidden || disposed) return
+    cancelAllCats()
+    placingFeed.value = true
+    mealPhase.value = mealClient().state.phase === 'unknown' ? 'unknown' : 'placing'
+    toolsOpen.value = false
+    say(mealPhase.value === 'unknown' ? '上次结算待确认，点地面重试同一笔开饭' : '一起开饭！点一下地面放共享餐盘～')
+  } finally { if (identity === identityEpoch && epoch === feedEpoch) feedPreparing.value = false }
+}
+async function placeBowlAndGo(x, y) {
+  if (!placingFeed.value || !adopted.value || disposed || document.hidden || roomLocked() || eating || feedInFlight) return
+  const epoch = ++feedEpoch, identity = identityEpoch, requestedID = selectedPetID.value
+  const participants = [...actors.values()]
+  placingFeed.value = false; eating = true; feedInFlight = true; mealPhase.value = 'sending'
+  bowlPos.x = x; bowlPos.y = y
+  try {
+    const { ok, data } = await mealClient().run(petRequestID(requestedID))
+    if (disposed || identity !== identityEpoch) return
+    mealPhase.value = ok ? 'succeeded' : 'rejected'
+    if (!ok) { showToast(data.error || '开饭没有结算，请稍后再试'); return }
+    // 隐藏只取消动画；迟到的成功仍按身份更新账户与全部猫，不退款、不重发。
+    applyPet(data, requestedID)
+    if (!feedCurrent(epoch)) return
+    if (data.all_full || data.fed === false) { showToast('小猫们都吃饱啦，没有扣星星'); return }
+    const placement = mealPlacement(x, y, participants.map(actorFloorSnapshot), socialWorldObstacles())
+    if (!placement) { finishMealAnimation(participants, false); return }
+    const { geometry, arrival } = placement
+    mealPlate.value = geometry; mealSpots.value = geometry.seats
+    showBowl.value = true; mealAnimation.value = 'running'
+    mealPhase.value = 'animating'; initialGroupFraming.value = false; camMode.value = 'follow'
+    frameGroup(geometry.seats)
+    feedTimer = setTimeout(() => {
+      if (!feedCurrent(epoch)) return
+      cancelFeeding(); resumeAllCats(1500)
+      showToast('小猫休息一下，开饭已结算，不会重复扣星星')
+    }, Math.max(45000, Math.ceil(participants.length / 2) * 15000))
+    void animateMeal(participants, geometry, arrival, epoch)
+  } catch {
+    if (!disposed && identity === identityEpoch) { mealPhase.value = 'unknown'; showToast('开饭结果暂时无法确认，再点一起开饭会重试同一笔，不会重复扣费') }
+  } finally {
+    if (identity === identityEpoch) {
+      feedInFlight = false
+      if (mealPhase.value !== 'animating') { eating = false; if (!disposed && !document.hidden) resumeAllCats(1500) }
+    }
+  }
+}
 
 // ===== 任务 =====
 const submitting = ref(0)
@@ -2068,7 +2731,7 @@ async function retrieveItem(it, { fromShop = false } = {}) {
   if (!fromShop) shopActionBusy.value = true
   try {
     closeGamePicker(false)
-    if (treeSession.value?.itemid === id) await leaveTree()
+    await releaseFurniture(id)
     if (!adopted.value || playOpen.value || disposed || document.hidden) return
     const { ok, data } = await jpost('/scene/remove', { id })
     if (!ok) return showToast(data.error || '收回失败，再试一次')
@@ -2127,7 +2790,7 @@ async function shopAction(it) {
     if (isNarrow.value) { sheet.value = ''; toolsOpen.value = false }
     showToast('从物品栏拖进房间；不想要了可以在商店点「收回」')
   } catch { showToast('商店操作没有保存，请稍后再试') }
-  finally { shopActionBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
+  finally { shopActionBusy.value = false; resumeAllCats(4500) }
 }
 
 // 拖拽：物品栏拖入房间（新摆放）；场景内拖动改位置；拖到边缘收回
@@ -2156,6 +2819,7 @@ function onItemPointerDown(e, it, sceneId) {
   }
   const move = ev => {
     if (ev.pointerId !== drag.pointerId || Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 8) return
+    if (!drag.moved && art.surface === 'floor') cancelSocial()
     drag.moved = true
     if (drag.id) dropActive.value = true
     ghost.style.left = `${ev.clientX - 36}px`
@@ -2193,7 +2857,7 @@ function onItemPointerDown(e, it, sceneId) {
     shopActionBusy.value = true
     try {
       closeGamePicker(false)
-      if (treeSession.value?.itemid === drag.id) await leaveTree()
+      await releaseFurniture(drag.id)
       if (!adopted.value || playOpen.value || document.hidden || disposed) return
       let result
       const inDropZone = dropRect && ev.clientX >= dropRect.left && ev.clientX <= dropRect.right
@@ -2208,7 +2872,7 @@ function onItemPointerDown(e, it, sceneId) {
       await loadAll()
       if (!drag.id) invOpen.value = false // 从物品栏拖入房间：摆好即收起，左下角恢复空白
     } catch { showToast('网络暂时不通，原来的装饰没有丢失') }
-    finally { shopActionBusy.value = false; if (!treeSession.value) behaviorNext(4500) }
+    finally { shopActionBusy.value = false; resumeAllCats(4500) }
   }
   cancelDecorDrag = cleanup
   document.addEventListener('pointermove', move)
@@ -2246,16 +2910,16 @@ function tipUp() { clearTimeout(tipTimer) }
 
 function initCat() {
   if (!roomEl.value || disposed || roomLocked()) return
-  resetTreeToFloor()
-  catPos.x = WORLD_W * 0.55
-  catPos.y = WORLD_H * 0.82
+  cancelAllCats()
   camMode.value = 'follow'
-  centerOn(catPos.x, catPos.y - 48, 0)
+  const visibleCats = [...actors.values()]
+  initialGroupFraming.value = visibleCats.length > 1
+  if (initialGroupFraming.value) frameGroup(visibleCats.map(actor => actor.catPos))
+  else centerOn(catPos.x, catPos.y - 48, 0)
   viewportObserver?.disconnect()
   viewportObserver = new ResizeObserver(onViewportResize)
   viewportObserver.observe(roomEl.value)
-  clearTimeout(stateTimer)
-  stateTimer = setTimeout(behaviorTick, 1200)
+  allCats(actor => actor.behaviorNext(1200))
 }
 onMounted(async () => {
   window.addEventListener('resize', onViewportResize)
@@ -2291,20 +2955,24 @@ watch(adopted, (v) => {
   clearTimeout(initTimer)
   resetTreeToFloor()
   if (v) initTimer = setTimeout(initCat, 100)
-  else { closeGamePicker(false); if (playOpen.value) closePlayground() }
-})
+  else {
+    identityEpoch++
+    resetFeedIdentity(); cancelAllCats(); cancelChat()
+    cancelCameraDrag?.(); cancelDecorDrag?.()
+    closeGamePicker(false); if (playOpen.value) closePlayground()
+  }
+}, { flush: 'sync' })
 watch(() => sceneItems.value.map(it => [it.id, it.item_key, it.x, it.y]), () => {
-  if (treeSession.value && !treeAnchorMatches(treeSession.value.anchor, sceneItems.value)) resetTreeToFloor()
+  for (const actor of actors.values()) actor.syncFurniture()
 }, { flush: 'sync' })
 onBeforeUnmount(() => {
   disposed = true
   cancelNest()
   cancelFeeding()
+  for (const actor of actors.values()) actor.dispose()
+  reservations.clear()
   closeGamePicker(false)
-  resetTreeToFloor()
-  interrupt()
   clearTimeout(initTimer)
-  clearTimeout(bubbleTimer)
   clearTimeout(tipTimer)
   clearTimeout(stateTimer)
   taskRecReleaseStream()
@@ -2370,7 +3038,7 @@ onBeforeUnmount(() => {
   </div>
 
   <!-- 房间 -->
-  <div v-else class="room" ref="rootEl" :inert="playOpen || playOpening" :aria-hidden="playOpen ? 'true' : undefined" :class="{ 'drawer-open': isNarrow && !!sheet }" :data-time-phase="sceneLighting.label">
+  <div v-else class="room" ref="rootEl" :inert="playOpen || playOpening" :aria-hidden="playOpen ? 'true' : undefined" :class="{ 'drawer-open': isNarrow && !!sheet }" :data-time-phase="sceneLighting.label" :data-meal-phase="mealPhase" :data-meal-animation="mealAnimation" :data-social-kind="socialSession?.kind" :data-social-stage="socialSession?.stage" :data-social-round="socialSession?.round" :data-social-actors="socialSession?.roles.join(',')">
     <svg class="ui-icons" aria-hidden="true" width="0" height="0">
       <defs>
         <symbol id="room-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9Z" /></symbol>
@@ -2404,9 +3072,9 @@ onBeforeUnmount(() => {
     <PixelRoom :wallpaper-key="activeWallpaper" />
 
     <!-- 场景道具（可拖动改位置，拖到边缘收回；被猫咬会晃） -->
-    <div v-for="it in placedDecor" :key="it.id" class="scene-item"
-      :class="{ shake: shakeId === it.id }"
-      :style="{ left: it.x + 'px', top: it.y + 'px', zIndex: decorDepth(it), transition: it.item_key === 'yarn' ? 'left .8s ease' : '' }"
+    <div v-for="it in placedDecor" :key="it.id" class="scene-item" :data-scene-id="it.id" :data-item-key="it.item_key" :data-ball-controller="socialSession?.itemID === it.id ? socialSession.owner : undefined"
+      :class="{ shake: roomActors.some(actor => actor.shakeId === it.id) }"
+      :style="{ left: it.x + 'px', top: it.y + 'px', zIndex: decorDepth(it), transition: socialSession?.itemID === it.id ? 'none' : it.item_key === 'yarn' ? 'left .8s ease' : '' }"
       :title="it.item_key === 'cat-tree' ? '点顶部、小窝、柱子有不同反应，按住拖动摆放' : it.item_key === LITTER_KEY ? '猫砂盆 · ' + LITTER_STATE_LABELS[clampLitterState(it.state)] + '（点开铲屎，按住拖动摆放）' : decorArt(it.item_key).name"
       :tabindex="it.item_key === 'cat-tree' || it.item_key === LITTER_KEY ? 0 : undefined" :role="it.item_key === 'cat-tree' || it.item_key === LITTER_KEY ? 'button' : undefined"
       :aria-label="it.item_key === 'cat-tree' ? '猫爬架，点不同位置和小猫互动，按住拖动摆放' : it.item_key === LITTER_KEY ? '猫砂盆，' + LITTER_STATE_LABELS[clampLitterState(it.state)] + '，点开铲屎' : undefined"
@@ -2419,6 +3087,7 @@ onBeforeUnmount(() => {
         :style="{ width: decorArt(it.item_key).size + 'px' }"
         v-html="litterMiniMarkup(it.state || 0)"></div>
       <PixelItem v-else :item-key="it.item_key" :size="decorArt(it.item_key).size" />
+      <span v-if="it.item_key === 'yarn'" data-ball-center aria-hidden="true" :style="{ position: 'absolute', left: decorArt(it.item_key).size / 2 + 'px', top: decorArt(it.item_key).size * 34 / 48 + 'px', width: 0, height: 0, pointerEvents: 'none' }"></span>
     </div>
 
     <!-- 苹果窝窝底椭圆投影（上一代实现，维持原样） -->
@@ -2444,50 +3113,58 @@ onBeforeUnmount(() => {
       <img class="nest-img" :src="nestArt(nestProfile(it.item_key), 'front')" :style="{ width: nestProfile(it.item_key).display[0] + 'px' }" alt="">
     </div>
 
-    <!-- 窝里与出窝期间都用独立最高层气泡，避免猫层级切换时气泡跟着被窝盖住 -->
-    <div v-if="showBubble && (nestActive || nestExiting)" class="bubble nest-bubble"
-      :class="{ 'nest-bubble-follow': nestExiting }" :style="nestBubbleStyle">{{ bubble }}</div>
-
-    <!-- 15 款新窝进窝动画：demo 的 cat-plane(z2) + walker(z4) 双副本补集 clip -->
-    <template v-if="nestEntry">
-      <div class="nest-entry-plane" :data-phase="nestEntry.phase" :data-frame="nestEntry.frame"
-        :style="{ left: nestEntry.route.nestLeft + 'px', top: nestEntry.route.nestTop + 'px',
-          width: nestEntry.route.w + 'px', height: nestEntry.route.h + 'px',
-          clipPath: nestEntry.planeClip, zIndex: 11 + Math.floor(nestEntry.it.y) }">
-        <div v-if="!nestEntry.inner.hidden" class="nest-entry-cat"
-          :style="{ left: nestEntry.inner.left + 'px', top: nestEntry.inner.top + 'px',
-            clipPath: nestEntry.inner.clip, transform: nestEntry.facing }">
-          <CatSprite :species="species" :pose-frame="nestEntry.frame" :size="110" />
+    <!-- 每猫进窝层是 world 的直接子级，不建立额外层叠上下文；共用家具前片只渲染一次。 -->
+    <template v-for="actor in roomActors" :key="'nest-actor-' + actor.id">
+      <div v-if="actor.showBubble && (actor.nestActive || actor.nestExiting)" class="bubble nest-bubble"
+        :data-cat-id="actor.id" :class="{ 'nest-bubble-follow': actor.nestExiting }" :style="actor.nestBubbleStyle">{{ actor.bubble }}</div>
+      <template v-if="actor.nestEntry">
+        <div class="nest-entry-plane" :data-cat-id="actor.id" :data-phase="actor.nestEntry.phase" :data-frame="actor.nestEntry.frame"
+          :style="{ left: actor.nestEntry.route.nestLeft + 'px', top: actor.nestEntry.route.nestTop + 'px',
+            width: actor.nestEntry.route.w + 'px', height: actor.nestEntry.route.h + 'px',
+            clipPath: actor.nestEntry.planeClip, zIndex: 11 + Math.floor(actor.nestEntry.it.y) }">
+          <div v-if="!actor.nestEntry.inner.hidden" class="nest-entry-cat"
+            :style="{ left: actor.nestEntry.inner.left + 'px', top: actor.nestEntry.inner.top + 'px',
+              clipPath: actor.nestEntry.inner.clip, transform: actor.nestEntry.facing }">
+            <CatSprite :species="actor.pet?.species" :pose-frame="actor.nestEntry.frame" :size="110" />
+          </div>
         </div>
-      </div>
-      <div v-if="!nestEntry.outer.hidden" class="nest-entry-cat nest-entry-walker"
-        :style="{ left: nestEntry.outer.left + 'px', top: nestEntry.outer.top + 'px',
-          clipPath: nestEntry.outer.clip, transform: nestEntry.facing,
-          zIndex: 13 + Math.floor(nestEntry.it.y) }">
-        <CatSprite :species="species" :pose-frame="nestEntry.frame" :size="110" />
-      </div>
+        <div v-if="!actor.nestEntry.outer.hidden" class="nest-entry-cat nest-entry-walker"
+          :data-cat-id="actor.id" :style="{ left: actor.nestEntry.outer.left + 'px', top: actor.nestEntry.outer.top + 'px',
+            clipPath: actor.nestEntry.outer.clip, transform: actor.nestEntry.facing,
+            zIndex: 13 + Math.floor(actor.nestEntry.it.y) }">
+          <CatSprite :species="actor.pet?.species" :pose-frame="actor.nestEntry.frame" :size="110" />
+        </div>
+      </template>
     </template>
 
-    <!-- 食物碗（放大，猫低头吃时可见） -->
-    <svg v-if="showBowl" class="bowl" :style="{ left: bowlPos.x + 'px', top: bowlPos.y + 'px', zIndex: 10 + Math.floor(bowlPos.y) }" width="72" height="42" viewBox="0 0 48 28" shape-rendering="crispEdges">
-      <path d="M8 4H40V6H44V10H42V14H40V20H36V24H12V20H8V14H6V10H4V6H8Z" fill="#765449" />
-      <path d="M8 6H40V8H42V12H40V16H37V21H11V16H8V12H6V8H8Z" fill="#C78776" />
-      <path d="M12 7H36V9H40V12H36V14H12V12H8V9H12Z" fill="#744C3E" />
-      <path d="M14 9H18V11H14ZM22 8H27V11H22ZM30 10H34V12H30Z" fill="#D9A571" />
-      <path d="M11 16H37V19H34V21H14V19H11Z" fill="#E7B296" />
+    <!-- 一个浅椭圆共享餐盘；食物与测量点都处于同一个世界坐标模型。 -->
+    <svg v-if="showBowl && mealPlate" class="meal-plate" data-meal-plate :data-batch="mealBatch" :data-stage="mealStage"
+      :style="{ left: mealPlate.center.x - 52 + 'px', top: mealPlate.top + 'px', zIndex: 9 + Math.floor(mealPlate.center.y) }"
+      width="104" height="30" viewBox="0 0 104 30" shape-rendering="crispEdges" aria-label="两餐位共享餐盘">
+      <path d="M24 2H80V4H92V8H100V12H104V20H100V24H88V28H16V24H4V20H0V12H4V8H12V4H24Z" fill="#876557" />
+      <path d="M24 4H80V6H92V10H100V18H92V22H80V24H24V22H12V18H4V10H12V6H24Z" fill="#efe0bf" />
+      <path d="M24 8H80V10H92V18H80V20H24V18H12V10H24Z" fill="#b17a49" />
+      <path d="M18 11H28V15H18ZM34 10H44V14H34ZM50 13H60V17H50ZM66 10H76V14H66ZM80 12H88V16H80Z" fill="#e8b66d" />
+      <path d="M8 20H18V24H86V20H96V24H86V28H18V24H8Z" fill="#cfb692" />
+      <circle v-for="(contact, i) in mealPlate.contacts" :key="i" :data-contact="i" :cx="contact.x - mealPlate.center.x + 52" :cy="contact.y - mealPlate.top" r=".8" fill="transparent" pointer-events="none" />
     </svg>
 
     <!-- 猫 -->
-    <div class="cat-wrap" ref="catEl" :class="{ sad: moodColor === 'sad', 'room-paused': roomHidden, 'tree-cat': treeRendered, 'tree-peek': treeRendered && treeSession?.currentnode === 'nest' && !treeMoving, 'tree-scratch': treeRendered && treeSession?.mode === 'grip' && !treeMoving }"
-      :style="catRoomStyle" :data-tree-node="treeRendered ? treeSession?.currentnode : undefined" @click.stop="petCat">
-      <div class="bubble" v-if="showBubble && !nestActive && !nestExiting">{{ bubble }}</div>
-      <span class="zzz" v-if="catAnim === 'sleep' && zzz">💤</span>
-      <div class="cat-inner" :class="{ flip: flipped }">
-        <CatSprite :species="species" :anim="catAnim" :size="treeCatSize" :paused="playOpen || roomHidden" />
+    <div v-for="actor in roomActors" :key="'cat-' + actor.id" class="cat-wrap" :ref="el => { const instance = actors.get(String(actor.id)); if (instance) instance.catEl.value = el }"
+      :class="{ sad: actor.pet?.hunger < 30 || actor.pet?.mood < 30, selected: String(actor.id) === String(selectedPetID), 'room-paused': roomHidden, 'tree-cat': actor.treeRendered, 'tree-peek': actor.treeRendered && actor.treeSession?.currentnode === 'nest' && !actor.treeMoving, 'tree-scratch': actor.treeRendered && actor.treeSession?.mode === 'grip' && !actor.treeMoving }"
+      :style="actor.catRoomStyle" :data-cat-id="actor.id" :data-selected="String(actor.id) === String(selectedPetID)" :data-anim="actor.catAnim" :data-meal-seat="actor.mealSeat" :data-social-role="actor.socialRole || undefined" :data-social-frame="actor.socialPose || undefined" :data-nest-id="actor.nestActive?.id || actor.nestEntry?.it.id" :data-tree-node="actor.treeRendered ? actor.treeSession?.currentnode : undefined"
+      role="button" tabindex="0" :aria-label="'选择小猫' + (actor.pet?.name || '')" @keydown.enter.prevent.stop="clickCat(actor)" @keydown.space.prevent.stop="clickCat(actor)" @click.stop="clickCat(actor)">
+      <div class="bubble" v-if="actor.showBubble && !actor.nestActive && !actor.nestExiting">{{ actor.bubble }}</div>
+      <div class="cat-inner" :class="{ flip: actor.flipped, 'meal-facing': mealAnimation === 'running' || actor.mealSeat !== null, 'social-facing': !!actor.socialRole }">
+        <CatSprite :species="actor.pet?.species || species" :anim="actor.catAnim" :size="actor.treeCatSize" :pose-frame="actor.socialPose" :meal-pose="actor.mealSeat !== null" :paused="playOpen || playOpening || roomHidden" />
       </div>
     </div>
     </div><!-- /world -->
-    <div v-if="placingFeed" class="place-banner">点一下地面放猫粮，点“陪伴 → 取消喂食”可取消</div>
+    <div class="cat-roster" aria-label="小猫列表" @pointerdown.stop>
+      <button v-for="cat in pets" :key="cat.id" class="cat-select" :data-cat-select="cat.id" :aria-pressed="String(cat.id) === String(selectedPetID)" @click="selectCat(cat.id)">{{ cat.name }}</button>
+      <button v-if="pets.length < petLimit" class="cat-adopt" @click="openAdditionalAdopt">免费领养</button>
+    </div>
+    <div v-if="placingFeed" class="place-banner">点地面一起开饭；<button @click="cancelFeeding()">取消</button></div>
     <div v-show="dropActive" ref="dropEl" class="drop-retrieve">松手拖到这里 → 收回物品栏</div>
     </div><!-- /scene-viewport -->
     <div class="room-tools" v-show="!sheet">
@@ -2513,7 +3190,7 @@ onBeforeUnmount(() => {
       <div class="chip tippable" @mouseenter="showTip('stars')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('stars', e)" @pointerup="tipUp" @pointerleave="tipUp">星星 ⭐{{ pet?.balance }}</div>
       <div class="chip tippable" @mouseenter="showTip('level')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('level', e)" @pointerup="tipUp" @pointerleave="tipUp">等级 Lv{{ pet?.level }}</div>
       <div class="chip tippable" @mouseenter="showTip('streak')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('streak', e)" @pointerup="tipUp" @pointerleave="tipUp">连击 {{ pet?.streak }} 天<span v-if="streakPending"> · 待确定</span></div>
-      <div class="chip mini tippable" @mouseenter="showTip('hunger')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('hunger', e)" @pointerup="tipUp" @pointerleave="tipUp">饱腹<div class="bar"><i :style="{ width: (pet?.hunger || 0) + '%' }" /></div><small>{{ Math.round(pet?.hunger || 0) }}</small></div>
+      <div class="chip mini tippable" @mouseenter="showTip('hunger')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('hunger', e)" @pointerup="tipUp" @pointerleave="tipUp">饱腹<div class="bar"><i :style="{ width: (pet?.hunger || 0) + '%' }" /></div><small>{{ Math.floor(pet?.hunger || 0) }}</small></div>
       <div class="chip mini tippable" @mouseenter="showTip('mood')" @mouseleave="hideTip" @pointerdown="(e) => tipDown('mood', e)" @pointerup="tipUp" @pointerleave="tipUp">心情<div class="bar"><i class="mood" :style="{ width: (pet?.mood || 0) + '%' }" /></div><small>{{ Math.round(pet?.mood || 0) }}</small></div>
       <div class="chip switch" @click="switchKid" title="换一个小朋友登录">👤 换人</div>
       <button class="hud-fold" @click="hudOpen = false">收起状态</button>
@@ -2527,6 +3204,7 @@ onBeforeUnmount(() => {
       <div class="game-picker-heading"><b id="game-picker-title">和猫玩什么？</b><button ref="gamePickerClose" type="button" aria-label="关闭游戏列表" @click="closeGamePicker()">关闭</button></div>
       <button type="button" class="game-card" @click="startGame('feather')"><b>逗猫羽毛</b><small>动动手指，免费玩</small></button>
       <button v-if="hasCatTreeGame" type="button" class="game-card climb" @click="startGame('climb')"><b>无限爬高</b><small>一层一层往上跳</small></button>
+      <button v-if="pets.length >= 2" type="button" class="game-card chase" data-room-action="chase" @click="startGame('chase')"><b>小猫追逐</b><small>两只小猫轮流追一小会儿</small></button>
     </div>
     <div v-if="isNarrow && sheet" class="sheet-scrim" @click="sheet = ''"></div>
     <!-- 侧栏容器：桌面=右侧自适应列；窄屏=底部抽屉 -->
@@ -2604,9 +3282,23 @@ onBeforeUnmount(() => {
 
     <div class="actions" v-show="!isNarrow || toolsOpen">
       <button class="pbtn playground-entry" :aria-expanded="gamePicker" aria-haspopup="dialog" @click="openGamePicker($event.currentTarget)"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>和猫玩</b><small>{{ hasCatTreeGame ? '选个小游戏' : '羽毛逗猫 · 免费' }}</small></span></button>
-      <button class="pbtn feed" @click="feed"><span class="action-icon"><svg class="ui-icon"><use href="#room-food" /></svg></span><span class="action-copy"><b>{{ placingFeed ? '取消喂食' : '喂猫粮' }}</b><small>10 星星 / 次</small></span></button>
+      <button class="pbtn feed" :disabled="feedPreparing || mealPhase === 'sending' || mealPhase === 'animating'" @click="feed"><span class="action-icon"><svg class="ui-icon"><use href="#room-food" /></svg></span><span class="action-copy"><b>{{ mealPhase === 'sending' ? '结算中' : mealPhase === 'unknown' ? '重试一起开饭' : '一起开饭' }}</b><small>全屋 10 星星 / 次</small></span></button>
       <button class="pbtn hint" @click="petCat"><span class="action-icon"><svg class="ui-icon"><use href="#room-paw" /></svg></span><span class="action-copy"><b>摸摸头</b><small>陪它开心一下</small></span></button>
       <button class="pbtn chatbtn" @click="openChat"><span class="action-icon"><svg class="ui-icon"><use href="#room-chat" /></svg></span><span class="action-copy"><b>聊聊天</b><small>今日还可聊 {{ chatLeft }} 句</small></span></button>
+    </div>
+
+    <div v-if="additionalAdoptOpen" class="chat-mask" @click.self="!additionalAdoptBusy && (additionalAdoptOpen = false)">
+      <form class="additional-adopt-box" role="dialog" aria-modal="true" aria-labelledby="additional-adopt-title" @submit.prevent="adoptAdditionalCat">
+        <div class="game-picker-heading"><b id="additional-adopt-title">免费领养第 {{ pets.length + 1 }} 只猫</b><button type="button" :disabled="additionalAdoptBusy" @click="additionalAdoptOpen = false">关闭</button></div>
+        <p>最多 {{ petLimit }} 只；任务、星星和成长共享，不新增礼包。</p>
+        <div class="additional-cats">
+          <button v-for="option in adoptOptions" :key="option.species" type="button" :data-adopt-species="option.species" :aria-pressed="additionalSpecies === option.species" @click="additionalSpecies = option.species">
+            <CatSprite :species="option.species" :size="64" anim="sit" />{{ option.display_name }}
+          </button>
+        </div>
+        <label>小猫名字<input v-model="additionalName" maxlength="8" name="additional-cat-name" placeholder="给新伙伴起名字" /></label>
+        <button class="enter-btn" type="submit" :disabled="additionalAdoptBusy">{{ additionalAdoptBusy ? '领养中' : '免费领养' }}</button>
+      </form>
     </div>
 
     <!-- AI 分析状态层（b 模式提交后 ~20 秒） -->
@@ -2798,6 +3490,20 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .cat-inner { transition: transform .3s; transform-origin: 50% 90%; }
 .cat-inner.flip { transform: scaleX(-1); }
 .cat-wrap.sad { filter: grayscale(.75); }
+.cat-wrap.selected::after { content: ''; position: absolute; left: 38px; bottom: -5px; width: 34px; height: 3px; border-radius: 50%; background: #8370af; opacity: .7; pointer-events: none; }
+.cat-roster { position: absolute; left: 8px; top: 8px; z-index: 14; display: flex; gap: 5px; max-width: calc(100% - 16px); padding: 3px; background: #fff9ebeb; border: 1px solid #b59d76; border-radius: 8px; }
+.cat-roster button { min-height: 32px; min-width: 0; max-width: 112px; padding: 4px 9px; border: 1px solid #d7c7af; border-radius: 5px; background: #f7efdf; color: #70543c; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.cat-roster button[aria-pressed='true'] { background: #e8e0f2; color: #69518f; border-color: #9c8bc5; }
+.scene-viewport .place-banner { top: 54px; }
+.place-banner button { pointer-events: auto; margin-left: 4px; border: 1px solid #d6b58a; border-radius: 4px; background: #fff9eb; color: #805a32; cursor: pointer; }
+.additional-adopt-box { width: min(460px, calc(100vw - 24px)); max-height: calc(100dvh - 40px); overflow-y: auto; touch-action: pan-y; margin: auto; padding: 18px; border: 2px solid #b59d76; border-radius: 12px; background: #fff9eb; }
+.additional-adopt-box p { font-size: 12px; line-height: 1.6; }
+.additional-cats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px; }
+.additional-cats button { display: flex; align-items: center; justify-content: center; flex-direction: column; padding: 8px; border: 1px solid #d7c7af; border-radius: 8px; background: #f7efdf; color: #70543c; }
+.additional-cats button[aria-pressed='true'] { border-color: #8370af; background: #e8e0f2; }
+.additional-adopt-box label { display: grid; gap: 6px; font-size: 13px; margin-bottom: 14px; }
+.additional-adopt-box input { width: 100%; min-width: 0; padding: 10px; border: 1px solid #d7c7af; border-radius: 6px; }
+.pbtn:disabled { opacity: .6; cursor: wait; }
 .bubble { position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); width: max-content; max-width: 300px; background: #FFFCF6; border: 1.5px solid #CBB49A; border-radius: 12px; padding: 8px 12px; font-size: 12px; line-height: 1.5; font-weight: 600; white-space: normal; overflow-wrap: anywhere; box-shadow: 0 4px 12px rgba(103, 75, 47, .12); pointer-events: none; }
 .zzz { position: absolute; top: -20px; right: 0; }
 .scene-item { position: absolute; transform: translate(-50%, -100%); line-height: 0; cursor: grab; user-select: none; touch-action: none; }
@@ -2843,7 +3549,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 }
 .scene-item.shake { animation: shake .5s ease-in-out 3; }
 @keyframes shake { 0%, 100% { transform: translate(-50%, -100%) rotate(0); } 30% { transform: translate(-50%, -100%) rotate(-8deg); } 60% { transform: translate(-50%, -100%) rotate(6deg); } }
-.bowl { position: absolute; transform: translate(-50%, -100%); z-index: 6; }
+.meal-plate { position: absolute; pointer-events: none; }
+.cat-inner.meal-facing, .cat-inner.social-facing { transition: none; }
 .place-banner { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); z-index: 8; width: max-content; max-width: calc(100% - 32px); background: #FFF1D6; color: #805A32; border: 1.5px solid #D6B58A; border-radius: 12px; padding: 8px 14px; font-size: 12px; line-height: 1.5; font-weight: 700; box-shadow: 0 4px 12px rgba(103, 75, 47, .12); pointer-events: none; }
 .room:has(.place-banner) .scene-viewport { cursor: crosshair; }
 

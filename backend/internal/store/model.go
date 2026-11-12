@@ -45,7 +45,7 @@ func (DeviceToken) TableName() string { return "device_token" }
 
 type Pet struct {
 	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	KidID             int64      `gorm:"uniqueIndex" json:"kid_id"`
+	KidID             int64      `gorm:"index:idx_pet_owner" json:"kid_id"`
 	Name              string     `gorm:"size:32" json:"name"`
 	Species           string     `gorm:"size:16" json:"species"`
 	Personality       string     `gorm:"size:64;default:热情开朗" json:"personality"`
@@ -64,6 +64,35 @@ type Pet struct {
 }
 
 func (Pet) TableName() string { return "pet" }
+
+// KidAccount 是成长与钱包唯一真源。Pet 旧成长列仅第一只猫保留同步影子，响应按账户投影。
+type KidAccount struct {
+	KidID             int64  `gorm:"primaryKey;autoIncrement:false" json:"kid_id"`
+	PrimaryPetID      int64  `json:"primary_pet_id"`
+	Balance           int64  `json:"balance"`
+	EarnedTotal       int64  `json:"earned_total"`
+	Level             int64  `gorm:"default:1" json:"level"`
+	Streak            int64  `json:"streak"`
+	StreakBaseDate    string `gorm:"size:10" json:"-"`
+	StreakBaseValue   int64  `json:"-"`
+	StreakEvaluatedNS *int64 `json:"-"`
+	ChatDay           string `gorm:"size:10" json:"-"`
+	ChatUsed          int    `json:"-"`
+}
+
+func (KidAccount) TableName() string { return "kid_account" }
+
+// FeedRequest 与扣款、状态和事件在同一事务提交；孩子锁及唯一键防止跨进程重复扣款。
+type FeedRequest struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement" json:"-"`
+	KidID     int64     `gorm:"uniqueIndex:uk_feed_request" json:"-"`
+	RequestID string    `gorm:"size:128;uniqueIndex:uk_feed_request" json:"-"`
+	Fed       bool      `json:"fed"`
+	AllFull   bool      `json:"all_full"`
+	CreatedAt time.Time `json:"-"`
+}
+
+func (FeedRequest) TableName() string { return "feed_request" }
 
 type SpeciesConfig struct {
 	ID          int64  `gorm:"primaryKey;autoIncrement" json:"id"`
@@ -262,10 +291,11 @@ type OwnedItem struct {
 
 func (OwnedItem) TableName() string { return "owned_item" }
 
-// ChatMessage 猫对话记录（per-kid，取最近 N 轮进上下文）
+// ChatMessage 猫对话记录（per-pet；旧记录迁移到第一只猫）。
 type ChatMessage struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	KidID     int64     `gorm:"index" json:"kid_id"`
+	PetID     int64     `gorm:"index:idx_chat_pet;default:0" json:"pet_id"`
 	Role      string    `gorm:"size:16" json:"role"` // user / assistant
 	Content   string    `json:"content"`
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`

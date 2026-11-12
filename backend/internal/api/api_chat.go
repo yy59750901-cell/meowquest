@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,8 +17,7 @@ import (
 const CHAT_DAILY_LIMIT = 30 // 每孩子每日聊天条数（防刷+防沉迷）
 
 // catSystemPrompt 事实记忆：猫的状态 + 今日任务 + 最近事件流（猫"知道自己的生活"）
-func (s *Server) catSystemPrompt(kidID int64) string {
-	pet, _ := s.DB.GetPet(kidID)
+func (s *Server) catSystemPrompt(kidID int64, pet *store.Pet) string {
 	if pet == nil {
 		return "你是一只像素小猫。"
 	}
@@ -43,13 +43,21 @@ func (s *Server) catSystemPrompt(kidID int64) string {
 	// 最近 3 天事件（猫的生活经历）
 	events, _ := s.DB.EventsSince(kidID, time.Now().AddDate(0, 0, -3).Format("2006-01-02"))
 	evLines := ""
-	for i, e := range events {
-		if i >= 8 {
+	count := 0
+	for _, e := range events {
+		if count >= 8 {
 			break
 		}
 		var payload map[string]any
 		json.Unmarshal([]byte(e.Payload), &payload)
-		evLines += eventCNSafe(e.Type, payload, e.Day) + "；"
+		if target, ok := payload["pet_id"].(float64); ok && int64(target) != pet.ID {
+			continue
+		}
+		line := eventCNSafe(e.Type, payload, e.Day)
+		if line != "" {
+			evLines += line + "；"
+			count++
+		}
 	}
 	if evLines == "" {
 		evLines = "最近比较安静"
@@ -112,6 +120,7 @@ func eventCNSafe(typ string, payload map[string]any, day string) string {
 func (s *Server) chat(c *gin.Context) {
 	var req struct {
 		Content string `json:"content" binding:"required"`
+		PetID   int64  `json:"pet_id" binding:"gte=0"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -122,29 +131,37 @@ func (s *Server) chat(c *gin.Context) {
 	}
 	kidID := kidOf(c)
 
-	// 每日限额
-	if n := s.DB.ChatCountToday(kidID); n >= CHAT_DAILY_LIMIT {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "今天聊得够多啦，猫要睡觉了，明天再来喵～"})
+	pet, err := s.DB.BeginPetChat(kidID, req.PetID, req.Content, CHAT_DAILY_LIMIT, s.now())
+	if err != nil {
+		if errors.Is(err, store.ErrChatLimit) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+		} else {
+			petError(c, err)
+		}
 		return
 	}
 
 	// 无 LLM 配置时的兜底（本地无 key 也能玩）
 	client := s.LLM
-	if !client.Enabled() {
+	if client == nil || !client.Enabled() {
 		reply := "喵呜…（猫打了个哈欠，好像没听清，再跟它说一次？）"
-		s.DB.SaveChat(kidID, "user", req.Content)
-		s.DB.SaveChat(kidID, "assistant", reply)
+		if err := s.DB.SavePetChat(kidID, pet.ID, "assistant", reply); err != nil {
+			petError(c, err)
+			return
+		}
 		c.Header("Content-Type", "text/event-stream")
 		fmt.Fprintf(c.Writer, "data: {\"d\":%q}\n\n", reply)
 		fmt.Fprint(c.Writer, "data: {\"done\":true}\n\n")
 		return
 	}
 
-	s.DB.SaveChat(kidID, "user", req.Content)
-
-	// 上下文：system(事实记忆) + 最近 10 轮 + 本条
-	history, _ := s.DB.ChatHistory(kidID, 20)
-	msgs := []llm.Msg{{Role: "system", Content: s.catSystemPrompt(kidID)}}
+	// 上下文只属于选中猫；BeginPetChat已经持久化本条user消息。
+	history, err := s.DB.PetChatHistory(kidID, pet.ID, 20)
+	if err != nil {
+		petError(c, err)
+		return
+	}
+	msgs := []llm.Msg{{Role: "system", Content: s.catSystemPrompt(kidID, pet)}}
 	for _, m := range history {
 		msgs = append(msgs, llm.Msg{Role: m.Role, Content: m.Content})
 	}
@@ -169,20 +186,32 @@ func (s *Server) chat(c *gin.Context) {
 		writeSSE(map[string]string{"error": "喵呜…猫走神了，再试一次？"})
 		return
 	}
-	s.DB.SaveChat(kidID, "assistant", full)
-	s.DB.AddEvent(kidID, "chat", nil)
+	if err := s.DB.SavePetChat(kidID, pet.ID, "assistant", full); err != nil {
+		writeSSE(map[string]string{"error": "喵呜…聊天保存失败，再试一次？"})
+		return
+	}
+	s.DB.AddEvent(kidID, "chat", map[string]any{"pet_id": pet.ID})
 	writeSSE(map[string]bool{"done": true})
 }
 
 // GET /api/chat/history → 最近 50 条（含限额余量）
 func (s *Server) chatHistory(c *gin.Context) {
 	kidID := kidOf(c)
-	list, err := s.DB.ChatHistory(kidID, 50)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	petID, ok := queryPetID(c)
+	if !ok {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"messages": list, "left_today": CHAT_DAILY_LIMIT - s.DB.ChatCountToday(kidID)})
+	list, err := s.DB.PetChatHistory(kidID, petID, 50)
+	if err != nil {
+		petError(c, err)
+		return
+	}
+	used, err := s.DB.ChatUsedAt(kidID, s.now())
+	if err != nil {
+		petError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"messages": list, "left_today": max(0, CHAT_DAILY_LIMIT-used)})
 }
 
 var _ = io.Discard

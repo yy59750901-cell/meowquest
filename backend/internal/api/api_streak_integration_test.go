@@ -1501,16 +1501,26 @@ func TestShopBuyAndFamilyLeaveReversePetOrderHaveNoDeadlock(t *testing.T) {
 		leaveDone <- taskTestRequest(r, http.MethodPost, "/api/admin/leave", map[string]any{"date": engine.BusinessDate(at)})
 	}()
 	waitTaskSignal(t, firstPetHeld)
-	go func() { buyDone <- taskTestRequest(r, http.MethodPost, "/api/shop/buy", map[string]any{"key": "nest"}) }()
-	var buy *httptest.ResponseRecorder
-	select {
-	case buy = <-buyDone:
-	case <-time.After(5 * time.Second):
-		unblock()
-		t.Fatal("本孩子扣款仍依赖其他孩子的pet锁")
+	// 多猫后钱包与任务统一先锁孩子。整家庭请假已锁住second，购买应等待自身孩子锁，
+	// 不能再要求它越过未提交的请假；释放后两条路径仍必须无反向锁依赖。
+	buyAttempt := make(chan struct{})
+	var attemptOnce sync.Once
+	if err := s.DB.Callback().Query().Before("gorm:query").Register("observe_buy_kid_lock", func(tx *gorm.DB) {
+		if tx.Statement.Table == "kid" {
+			attemptOnce.Do(func() { close(buyAttempt) })
+		}
+	}); err != nil {
+		t.Fatal(err)
 	}
+	go func() { buyDone <- taskTestRequest(r, http.MethodPost, "/api/shop/buy", map[string]any{"key": "nest"}) }()
+	waitTaskSignal(t, buyAttempt)
 	unblock()
-	requireTaskStatus(t, buy, http.StatusOK)
+	select {
+	case buy := <-buyDone:
+		requireTaskStatus(t, buy, http.StatusOK)
+	case <-time.After(5 * time.Second):
+		t.Fatal("释放请假后同孩子购买仍未完成，存在死锁")
+	}
 	select {
 	case w := <-leaveDone:
 		requireTaskStatus(t, w, http.StatusOK)

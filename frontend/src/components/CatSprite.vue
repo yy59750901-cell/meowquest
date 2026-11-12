@@ -2,6 +2,7 @@
 // CatSprite：hyclub 像素猫引擎的 Vue 组件版
 // 原有帧表保持不变；游乐场追加手工像素动作帧。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { MEAL_HEAD_TRANSFORM } from '../multi-cat.js'
 
 const props = defineProps({
   species: { type: String, default: 'orange' },
@@ -11,6 +12,7 @@ const props = defineProps({
   // 进窝跳跃按 demo 逐帧控制（crouchA / pounceA / pounceB / walkA / walkB）；
   // 不传时完全走原有 SEQ 动画，其它玩法不受影响。
   poseFrame: { type: String, default: '' },
+  mealPose: { type: Boolean, default: false },
 })
 
 const PAL = {
@@ -95,7 +97,7 @@ const rects = computed(() => {
       if (!ch || ch === '.' || ch === ' ') continue
       const c = pal[ch]
       if (!c) continue
-      out.push({ x, y, c })
+      out.push({ x, y, c, mouth: ch === 'm', head: x < 7 && y < 7 })
     }
   }
   return out
@@ -105,6 +107,14 @@ const rects = computed(() => {
 <template>
   <svg :width="size" :height="Math.round(size * 0.75)" viewBox="0 0 16 12" shape-rendering="crispEdges"
     style="image-rendering: pixelated; filter: drop-shadow(2px 2px 0 rgba(43,43,43,.25)); display: block">
-    <rect v-for="(r, i) in rects" :key="i" :x="r.x" :y="r.y" width="1.02" height="1.02" :fill="r.c" />
+    <circle v-if="poseFrame === 'catchB'" data-paw cx="2.51" cy="10.51" r=".12" fill="transparent" pointer-events="none" />
+    <template v-if="mealPose && anim === 'eat'">
+      <rect v-for="(r, i) in rects.filter(r => !r.head)" :key="'body-' + i" :x="r.x" :y="r.y" width="1.02" height="1.02" :fill="r.c" />
+      <g :transform="MEAL_HEAD_TRANSFORM" data-meal-head>
+        <rect v-for="(r, i) in rects.filter(r => r.head)" :key="'head-' + i" :x="r.x" :y="r.y" width="1.02" height="1.02" :fill="r.c" :data-mouth-pixel="r.mouth ? r.x + ',' + r.y : undefined" />
+        <circle data-mouth cx="2.01" cy="5.01" r=".12" fill="transparent" pointer-events="none" />
+      </g>
+    </template>
+    <rect v-for="(r, i) in mealPose && anim === 'eat' ? [] : rects" :key="i" :x="r.x" :y="r.y" width="1.02" height="1.02" :fill="r.c" />
   </svg>
 </template>

@@ -88,27 +88,32 @@ func (s *Server) wishList(c *gin.Context) {
 
 // POST /api/wish/:id/redeem 孩子兑换：冻结扣星
 func (s *Server) redeemWish(c *gin.Context) {
-	var w store.Wish
-	if err := s.DB.First(&w, "id=?", c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+	err := s.DB.WithKidLock(kidOf(c), func(tx *store.DB) error {
+		var w store.Wish
+		if err := tx.Where("id=? AND kid_id=?", c.Param("id"), kidOf(c)).First(&w).Error; err != nil {
+			return err
+		}
+		if w.Status != "approved" && w.Status != "saving" {
+			return fmt.Errorf("愿望当前不能兑换")
+		}
+		if err := tx.SpendStarsLocked(kidOf(c), w.Price); err != nil {
+			return err
+		}
+		if err := tx.Model(&w).Updates(map[string]any{"status": "redeem_requested", "redeemed_at": s.now()}).Error; err != nil {
+			return err
+		}
+		return tx.AddEvent(kidOf(c), "wish_redeem", map[string]any{"wish_id": w.ID, "price": w.Price})
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "愿望不能兑换或星星还不够，继续加油喵！"})
 		return
 	}
-	if w.Status != "approved" && w.Status != "saving" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "wish status " + w.Status})
-		return
-	}
-	if err := s.DB.SpendStars(kidOf(c), w.Price); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "星星还不够，继续加油喵！"})
-		return
-	}
-	s.DB.Model(&w).Updates(map[string]any{"status": "redeem_requested", "redeemed_at": now()})
-	s.DB.AddEvent(kidOf(c), "wish_redeem", map[string]any{"wish_id": w.ID, "price": w.Price})
 	c.JSON(http.StatusOK, gin.H{"redeem_requested": true})
 }
 
 // POST /api/wish/:id/cancel 孩子撤回
 func (s *Server) cancelWish(c *gin.Context) {
-	s.DB.Model(&store.Wish{}).Where("id=? AND status IN ('pending','saving')", c.Param("id")).
+	s.DB.Model(&store.Wish{}).Where("id=? AND kid_id=? AND status IN ('pending','saving')", c.Param("id"), kidOf(c)).
 		Updates(map[string]any{"status": "rejected", "reject_reason": "我自己不想许这个愿啦"})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -175,7 +180,7 @@ func (s *Server) adminWishAction(c *gin.Context) {
 		return
 	}
 	var w store.Wish
-	if err := s.DB.First(&w, "id=?", c.Param("id")).Error; err != nil {
+	if err := s.DB.Where("id=? AND kid_id IN (SELECT id FROM kid WHERE family_id=?)", c.Param("id"), famOf(c)).First(&w).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
@@ -284,22 +289,26 @@ func (s *Server) buyItem(c *gin.Context) {
 		return
 	}
 	// 事务：扣星 + 入货原子（失败整体回滚，杜绝扣钱不给货）
-	err := s.DB.Transaction(func(tx *gorm.DB) error {
-		res := tx.Model(&store.Pet{}).Where("kid_id=? AND balance>=?", kidOf(c), price).
-			Update("balance", gorm.Expr("balance-?", price))
-		if res.Error != nil {
-			return res.Error
+	err := s.DB.WithKidLock(kidOf(c), func(tx *store.DB) error {
+		var count int64
+		if err := tx.Model(&store.OwnedItem{}).Where("kid_id=? AND item_key=?", kidOf(c), req.Key).Count(&count).Error; err != nil {
+			return err
 		}
-		if res.RowsAffected == 0 {
-			return fmt.Errorf("insufficient stars")
+		if count > 0 {
+			return fmt.Errorf("already owned")
 		}
-		return tx.Create(&store.OwnedItem{KidID: kidOf(c), ItemKey: req.Key}).Error
+		if err := tx.SpendStarsLocked(kidOf(c), price); err != nil {
+			return err
+		}
+		if err := tx.Create(&store.OwnedItem{KidID: kidOf(c), ItemKey: req.Key}).Error; err != nil {
+			return err
+		}
+		return tx.AddEvent(kidOf(c), "item_bought", map[string]any{"key": req.Key, "price": price})
 	})
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "星星不够，先做任务！"})
 		return
 	}
-	s.DB.AddEvent(kidOf(c), "item_bought", map[string]any{"key": req.Key, "price": price})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

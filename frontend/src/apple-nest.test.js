@@ -114,8 +114,9 @@ test('按 demo 三段进场：地板线、左侧 170px 起走、1.35s 匀速，�
   assert.match(home, /const approachX = Math\.max\(55, pad\.x - 170\)/)
   assert.match(home, /const walkDist = Math\.max\(1, pad\.x - approachX\)/)
   assert.match(home, /\{ speed: walkDist \/ 1\.35, keepCamera: true \}/)
-  // 只有进场三段固定镜头（苹果窝两段 + 新 15 款走到 demo start 一段）；出窝必须跟随相机。
+  // 进场仍三段固定镜头；餐盘由世界脚点RAF驱动，不再调用CSS walkTo，出窝仍跟随相机。
   assert.equal((home.match(/keepCamera: true/g) || []).length, 3)
+  assert.match(home, /function feedWalk[\s\S]*?feedRAF = requestAnimationFrame\(frame\)/)
   assert.match(home, /walkTo\(route\.groundPos,[\s\S]*?keepCamera: true/)
   assert.match(home, /camMode\.value === 'follow' && !opts\.keepCamera/)
   assert.match(home, /nestWalking\.value = it/)
@@ -142,8 +143,8 @@ test('猫精灵自带落地投影，与 demo 的 cat drop-shadow 一致', () => 
 
 test('窝里与出窝说话气泡都在独立最高层，不压窝也不被窝盖住', () => {
   assert.match(home, /const APPLE_NEST_HEIGHT = APPLE_NEST_WIDTH \* 783 \/ 939/)
-  assert.match(home, /class="bubble" v-if="showBubble && !nestActive && !nestExiting"/)
-  assert.match(home, /v-if="showBubble && \(nestActive \|\| nestExiting\)" class="bubble nest-bubble"/)
+  assert.match(home, /class="bubble" v-if="actor\.showBubble && !actor\.nestActive && !actor\.nestExiting"/)
+  assert.match(home, /v-if="actor\.showBubble && \(actor\.nestActive \|\| actor\.nestExiting\)" class="bubble nest-bubble"/)
   // 苹果窝高度仍为 200.13，新窝按各自 display 高度。
   assert.match(home, /if \(it\.item_key === APPLE_NEST_KEY\) return APPLE_NEST_HEIGHT/)
   assert.match(home, /const topBase = it\.y - nestBubbleHeight\(it\) - 10/)
@@ -153,7 +154,7 @@ test('窝里与出窝说话气泡都在独立最高层，不压窝也不被窝�
 })
 
 test('出窝会话：趴睡退出保持最高层、沿地板走出洞口，并串接自主行为', () => {
-  assert.match(home, /const nestExiting = ref\(null\)/)
+  assert.match(home, /function createRoomCat\(initialID, index\)[\s\S]*?nestExiting = ref\(null\)/)
   assert.match(home, /if \(nestExiting\.value\) return 13 \+ Math\.floor\(nestExiting\.value\.y\)/)
   assert.match(home, /function beginNestExit\(it, animate = true, onDone\)/)
   assert.match(home, /const groundY = it\.y \+ 17/)
@@ -164,7 +165,7 @@ test('出窝会话：趴睡退出保持最高层、沿地板走出洞口，并�
   // 两条 dwell 到期都必须把 behaviorNext 串在出窝完成回调里，避免共用 stateTimer 被抢占
   assert.equal((home.match(/cancelNest\(\{ onDone: \(\) => behaviorNext\(\) \}\)/g) || []).length, 2)
   assert.match(home, /cancelNest\(\{ animate: false \}\)/)
-  assert.match(home, /:class="\{ 'nest-bubble-follow': nestExiting \}" :style="nestBubbleStyle"/)
+  assert.match(home, /:class="\{ 'nest-bubble-follow': actor\.nestExiting \}" :style="actor\.nestBubbleStyle"/)
   assert.match(home, /nestExiting\.value = null\s*\n\s*nestActive\.value = it/)
 })
 

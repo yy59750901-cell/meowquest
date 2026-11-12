@@ -57,13 +57,12 @@ func LockedNow(db *store.DB, kidID int64, clock func() time.Time) (time.Time, er
 		return time.Time{}, err
 	}
 	now := clock()
-	var pet store.Pet
-	err := db.Where("kid_id=?", kidID).First(&pet).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return now, nil
-	}
+	pet, err := db.AccountLocked(kidID)
 	if err != nil {
 		return time.Time{}, err
+	}
+	if pet == nil {
+		return now, nil
 	}
 	if pet.StreakEvaluatedNS != nil && now.UnixNano() < *pet.StreakEvaluatedNS {
 		now = time.Unix(0, *pet.StreakEvaluatedNS)
@@ -140,12 +139,8 @@ func EnsureStreakBaseline(db *store.DB, kidID int64, now time.Time) error {
 	if err := db.RequireTaskTransaction(); err != nil {
 		return err
 	}
-	var pet store.Pet
-	err := db.Where("kid_id=?", kidID).First(&pet).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil
-	}
-	if err != nil {
+	pet, err := db.AccountLocked(kidID)
+	if err != nil || pet == nil {
 		return err
 	}
 	if pet.StreakBaseDate != "" {
@@ -158,13 +153,16 @@ func EnsureStreakBaseline(db *store.DB, kidID int64, now time.Time) error {
 // 切换前 approved/ledger 永不补发或重算。默认从切换日开始；仅纳入仍在
 // 审核宽限内的昨日 submitted。更早实例不回放连击，按原任务日超时终结。
 // 从缓存扣除回放范围内已计数日的信用，回放时按所属日正常+1；已有流水不动。
-func initBaseline(db *store.DB, kidID int64, now time.Time) (*store.Pet, error) {
-	var pet store.Pet
-	if err := db.Where("kid_id=?", kidID).First(&pet).Error; err != nil {
+func initBaseline(db *store.DB, kidID int64, now time.Time) (*store.KidAccount, error) {
+	pet, err := db.AccountLocked(kidID)
+	if err != nil {
 		return nil, err
 	}
+	if pet == nil {
+		return nil, store.ErrPetNotFound
+	}
 	if pet.StreakBaseDate != "" {
-		return &pet, nil
+		return pet, nil
 	}
 	start := BusinessDate(now)
 	yesterday := now.In(BusinessLocation).AddDate(0, 0, -1).Format("2006-01-02")
@@ -214,7 +212,7 @@ func initBaseline(db *store.DB, kidID int64, now time.Time) (*store.Pet, error) 
 			return nil, err
 		}
 	}
-	return &pet, nil
+	return pet, nil
 }
 
 func streakSnapshot(dt store.DailyTask) (Snapshot, error) {
@@ -526,9 +524,13 @@ func ReconcileKidLocked(db *store.DB, kidID int64, now time.Time) error {
 			return err
 		}
 		// 任务完成的唯一发奖点：与星星同一事务、由 task 流水保证幂等，每个任务只 +10 心情。
-		if err = db.Model(&store.Pet{}).Where("kid_id=?", kidID).Updates(map[string]any{
+		if err = db.UpdateAccountLocked(kidID, map[string]any{
 			"balance": gorm.Expr("balance+?", final), "earned_total": gorm.Expr("earned_total+?", final),
-			"mood": gorm.Expr("LEAST(100, mood+10)")}).Error; err != nil {
+		}); err != nil {
+			return err
+		}
+		if err = db.Model(&store.Pet{}).Where("kid_id=?", kidID).
+			Update("mood", gorm.Expr("LEAST(100, mood+10)")).Error; err != nil {
 			return err
 		}
 		if err = markSettled(db, dt.ID, int(taskStreak)); err != nil {
@@ -584,12 +586,12 @@ func ReconcileWithClock(db *store.DB, clock func() time.Time) error {
 
 func CloseDay(db *store.DB) error { return ReconcileWithClock(db, time.Now) }
 
-func checkLevelUp(db *store.DB, kidID int64, row *store.Pet) error {
+func checkLevelUp(db *store.DB, kidID int64, row *store.KidAccount) error {
 	if row == nil {
 		return nil
 	}
-	var pet store.Pet
-	if err := db.Where("kid_id=?", kidID).First(&pet).Error; err != nil {
+	pet, err := db.AccountLocked(kidID)
+	if err != nil {
 		return err
 	}
 	level := pet.Level

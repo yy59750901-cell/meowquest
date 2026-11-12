@@ -24,8 +24,8 @@ import (
 	"meowquest/backend/internal/store"
 )
 
-// 仅使用明确提供的测试 DSN；所有表位于新建的隔离 schema，不调用生产迁移。
-func taskIntegrationDB(t *testing.T) *store.DB {
+// 仅使用明确提供的测试DSN，新建空白隔离schema；启动路径测试也只能使用这个连接。
+func taskIntegrationConnection(t *testing.T) (*store.DB, string) {
 	t.Helper()
 	dsn := os.Getenv("MEOWQUEST_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -71,13 +71,21 @@ func taskIntegrationDB(t *testing.T) *store.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { sqlDB.Close() })
-	if err := gdb.AutoMigrate(&store.Family{}, &store.Kid{}, &store.TaskTemplate{}, &store.TaskSchedule{},
+	return &store.DB{DB: gdb}, dsn
+}
+
+// 普通任务测试仍只迁移自己的模型；真实OpenDB启动测试显式调用生产入口。
+func taskIntegrationDB(t *testing.T) *store.DB {
+	t.Helper()
+	db, _ := taskIntegrationConnection(t)
+	if err := db.AutoMigrate(&store.Family{}, &store.Kid{}, &store.TaskTemplate{}, &store.TaskSchedule{},
 		&store.TaskAssign{}, &store.DailyTask{}, &store.TaskCompletion{}, &store.AIReviewJob{}, &store.LeaveRecord{},
 		&store.RewardPolicy{}, &store.Holiday{}, &store.Pet{}, &store.PetEvent{}, &store.SettlementLedger{},
-		&store.KidMessage{}, &store.KidStreakDay{}, &store.OwnedItem{}); err != nil {
+		&store.KidMessage{}, &store.KidStreakDay{}, &store.OwnedItem{}, &store.KidAccount{}, &store.FeedRequest{},
+		&store.SpeciesConfig{}, &store.ChatMessage{}, &store.DeviceToken{}, &store.Wish{}, &store.SceneItem{}); err != nil {
 		t.Fatal(err)
 	}
-	return &store.DB{DB: gdb}
+	return db
 }
 
 func taskFixture(t *testing.T) (*Server, store.TaskTemplate, store.Kid, store.DailyTask) {

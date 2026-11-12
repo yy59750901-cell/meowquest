@@ -64,6 +64,9 @@ func openPG(dsn string) (*DB, error) {
 	if err := autoMigrateAll(gdb); err != nil {
 		return nil, err
 	}
+	if err := MigrateMultiPet(gdb); err != nil {
+		return nil, err
+	}
 	return &DB{gdb}, nil
 }
 
@@ -94,13 +97,20 @@ func openMySQL(dsn string, defaultPIN string) (*DB, error) {
 	if err := migrateLegacy(gdb, defaultPIN); err != nil {
 		return nil, fmt.Errorf("migrate legacy: %w", err)
 	}
+	if err := MigrateMultiPet(gdb); err != nil {
+		return nil, err
+	}
 	return &DB{gdb}, nil
 }
 
 func autoMigrateAll(gdb *gorm.DB) error {
+	// PG/MySQL共用准备顺序：旧归属唯一限制须在GORM查看Pet列元数据前移除。
+	if err := PreparePetOwnership(gdb); err != nil {
+		return err
+	}
 	return gdb.AutoMigrate(
 		&Family{}, &Kid{}, &TaskAssign{}, &DeviceToken{},
-		&Pet{}, &SpeciesConfig{}, &TaskTemplate{}, &TaskSchedule{}, &RewardPolicy{},
+		&Pet{}, &KidAccount{}, &FeedRequest{}, &SpeciesConfig{}, &TaskTemplate{}, &TaskSchedule{}, &RewardPolicy{},
 		&Holiday{}, &LeaveRecord{}, &DailyTask{}, &KidStreakDay{}, &TaskCompletion{}, &AIReviewJob{},
 		&SettlementLedger{}, &Wish{}, &SceneItem{}, &OwnedItem{}, &PetEvent{}, &ChatMessage{}, &KidMessage{},
 	)
@@ -241,29 +251,26 @@ func (d *DB) Tick(kidID int64) (*Pet, error) {
 }
 
 // TickAt 用调用方时钟结算，供事务内与结算判定时间保持一致。
-func (d *DB) TickAt(kidID int64, now time.Time) (*Pet, error) {
-	var pet Pet
-	if err := d.Where("kid_id=?", kidID).First(&pet).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return nil, nil
+func (d *DB) TickAt(kidID int64, now time.Time) (pet *Pet, err error) {
+	apply := func(tx *DB) error {
+		pets, tickErr := tx.tickPetsLocked(kidID, now)
+		if tickErr != nil || len(pets) == 0 {
+			return tickErr
 		}
-		return nil, err
-	}
-	last := pet.LastTick
-	if last == nil {
-		last = &pet.HatchedAt
-	}
-	hours := now.Sub(*last).Hours()
-	if hours > 0 {
-		pet.Hunger = clampMin(pet.Hunger-pet.HungerDecay*hours, 0)
-		pet.Mood = clampMin(pet.Mood-0.5*hours, 0)
-		pet.LastTick = &now
-		if err := d.Model(&Pet{}).Where("kid_id=?", kidID).
-			Updates(map[string]any{"hunger": pet.Hunger, "mood": pet.Mood, "last_tick": now}).Error; err != nil {
-			return nil, err
+		account, accountErr := tx.AccountLocked(kidID)
+		if accountErr != nil {
+			return accountErr
 		}
+		projectGrowth(&pets[0], account)
+		pet = &pets[0]
+		return nil
 	}
-	return &pet, nil
+	if _, inTx := d.Statement.ConnPool.(gorm.TxCommitter); inTx {
+		err = apply(d)
+	} else {
+		err = d.WithKidLock(kidID, apply)
+	}
+	return
 }
 
 func clampMin(v, min float64) float64 {
@@ -279,26 +286,28 @@ func (d *DB) GetPet(kidID int64) (*Pet, error) {
 
 func (d *DB) HasPet(kidID int64) (bool, error) {
 	var n int64
-	d.Model(&Pet{}).Where("kid_id=?", kidID).Count(&n)
-	return n > 0, nil
+	err := d.Model(&Pet{}).Where("kid_id=?", kidID).Count(&n).Error
+	return n > 0, err
 }
 
 // AdoptPet 领养（kid 维度；礼包 30 星）
 func (d *DB) AdoptPet(kidID int64, name, species, personality string) (int64, error) {
-	if ok, _ := d.HasPet(kidID); ok {
-		return 0, errors.New("already adopted")
-	}
-	pet := &Pet{KidID: kidID, Name: name, Species: species, Personality: personality,
-		Hunger: 100, Mood: 100, Balance: 30, EarnedTotal: 30}
-	if err := d.Create(pet).Error; err != nil {
-		return 0, err
-	}
-	d.AddEvent(kidID, "adopt", map[string]any{"name": name, "species": species})
-	return pet.ID, nil
+	return d.adoptPet(kidID, name, species, personality, true)
 }
 
+// UpdatePet 保留旧成长写入口；只接受账户字段，猫状态必须显式按猫ID写入。
 func (d *DB) UpdatePet(kidID int64, cols map[string]any) error {
-	return d.Model(&Pet{}).Where("kid_id=?", kidID).Updates(cols).Error
+	for key := range cols {
+		switch key {
+		case "balance", "earned_total", "level", "streak", "streak_base_date", "streak_base_value", "streak_evaluated_ns":
+		default:
+			return fmt.Errorf("猫独立字段不能按孩子更新: %s", key)
+		}
+	}
+	if _, inTx := d.Statement.ConnPool.(gorm.TxCommitter); inTx {
+		return d.UpdateAccountLocked(kidID, cols)
+	}
+	return d.WithKidLock(kidID, func(tx *DB) error { return tx.UpdateAccountLocked(kidID, cols) })
 }
 
 // ===== 品种 =====
@@ -326,64 +335,28 @@ func (d *DB) AddStars(kidID int64, source string, base int, dateMul, streakMul f
 	if dailyTaskID > 0 {
 		dtid = &dailyTaskID
 	}
-	return d.Transaction(func(tx *gorm.DB) error {
+	return d.WithKidLock(kidID, func(tx *DB) error {
 		led := SettlementLedger{KidID: kidID, Date: today(), DailyTaskID: dtid, Source: source,
 			Base: base, DateMultiplier: dateMul, StreakMultiplier: streakMul,
 			Final: final, DeltaBalance: final, DeltaEarned: final}
 		if err := tx.Create(&led).Error; err != nil {
 			return err
 		}
-		return tx.Model(&Pet{}).Where("kid_id=?", kidID).
-			Updates(map[string]any{"balance": gorm.Expr("balance+?", final), "earned_total": gorm.Expr("earned_total+?", final)}).Error
+		return tx.UpdateAccountLocked(kidID, map[string]any{"balance": gorm.Expr("balance+?", final), "earned_total": gorm.Expr("earned_total+?", final)})
 	})
 }
 
 func (d *DB) SpendStars(kidID int64, amount int) error {
-	res := d.Model(&Pet{}).Where("kid_id=? AND balance>=?", kidID, amount).
-		Update("balance", gorm.Expr("balance-?", amount))
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return errors.New("insufficient balance")
-	}
-	return nil
+	return d.WithKidLock(kidID, func(tx *DB) error { return tx.SpendStarsLocked(kidID, amount) })
 }
 
 func (d *DB) FeedPet(kidID int64) error {
-	if _, err := d.Tick(kidID); err != nil {
-		return err
-	}
-	res := d.Model(&Pet{}).Where("kid_id=? AND balance>=10", kidID).Updates(map[string]any{
-		"balance": gorm.Expr("balance-10"),
-		"hunger":  gorm.Expr("LEAST(100, hunger+30)"),
-		"mood":    gorm.Expr("LEAST(100, mood+5)"),
-	})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return errors.New("insufficient stars")
-	}
-	d.AddEvent(kidID, "feed", map[string]any{"stars": 10})
-	return nil
+	_, err := d.FeedGroupAt(kidID, 0, "legacy-"+NewToken(), time.Now())
+	return err
 }
 
 func (d *DB) TouchPet(kidID int64) (left int, err error) {
-	if _, err = d.Tick(kidID); err != nil {
-		return 0, err
-	}
-	var n int64
-	d.Model(&PetEvent{}).Where("type='touch' AND day=? AND kid_id=?", today(), kidID).Count(&n)
-	if n >= 3 {
-		return 0, nil
-	}
-	if err = d.Model(&Pet{}).Where("kid_id=?", kidID).
-		Update("mood", gorm.Expr("LEAST(100, mood+5)")).Error; err != nil {
-		return 0, err
-	}
-	d.AddEvent(kidID, "touch", nil)
-	return int(3 - n - 1), nil
+	return d.TouchPetAt(kidID, 0, time.Now())
 }
 
 func (d *DB) EventCount(kidID int64, day, typ string) int64 {
@@ -473,27 +446,9 @@ func FamilyOfAdminToken(token string) int64 {
 
 // ===== 猫聊天 =====
 
-// ChatHistory 最近 limit 条对话（按时间正序）
+// ChatHistory 兼容无猫ID的旧调用，只返回第一只猫的对话。
 func (d *DB) ChatHistory(kidID int64, limit int) ([]ChatMessage, error) {
-	var list []ChatMessage
-	if err := d.Where("kid_id=?", kidID).Order("id DESC").Limit(limit).Find(&list).Error; err != nil {
-		return nil, err
-	}
-	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
-		list[i], list[j] = list[j], list[i]
-	}
-	return list, nil
-}
-
-func (d *DB) SaveChat(kidID int64, role, content string) {
-	d.Create(&ChatMessage{KidID: kidID, Role: role, Content: content})
-}
-
-// ChatCountToday 今日聊天条数（限额用）
-func (d *DB) ChatCountToday(kidID int64) int64 {
-	var n int64
-	d.Model(&ChatMessage{}).Where("kid_id=? AND date(created_at)=CURRENT_DATE", kidID).Count(&n)
-	return n
+	return d.PetChatHistory(kidID, 0, limit)
 }
 
 func today() string { return time.Now().Format("2006-01-02") }

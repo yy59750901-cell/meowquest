@@ -86,7 +86,7 @@ test('demo 七阶段时序与动作帧常量完全对齐', () => {
   }
   assert.match(sprite, /poseFrame: \{ type: String, default: '' \}/)
   assert.match(sprite, /if \(props\.poseFrame && POSE_FRAMES\[props\.poseFrame\]\)/)
-  assert.match(home, /:pose-frame="nestEntry\.frame" :size="110"/)
+  assert.match(home, /:pose-frame="actor\.nestEntry\.frame" :size="110"/)
 })
 
 test('route：两类方向、门槛/前沿、起跳边界保护；抛物线真实先升后降', () => {
@@ -162,8 +162,8 @@ test('房间模板：每款专属 PNG 阴影、前片、双副本动画层与三
   assert.match(home, /nestArt\(nestProfile\(it\.item_key\), 'back'\)/)
   assert.match(home, /nestArt\(nestProfile\(it\.item_key\), 'front'\)/)
   assert.match(home, /zIndex: 12 \+ Math\.floor\(it\.y\)/)
-  assert.match(home, /clipPath: nestEntry\.planeClip, zIndex: 11 \+ Math\.floor\(nestEntry\.it\.y\)/)
-  assert.match(home, /zIndex: 13 \+ Math\.floor\(nestEntry\.it\.y\)/)
+  assert.match(home, /clipPath: actor\.nestEntry\.planeClip, zIndex: 11 \+ Math\.floor\(actor\.nestEntry\.it\.y\)/)
+  assert.match(home, /zIndex: 13 \+ Math\.floor\(actor\.nestEntry\.it\.y\)/)
   assert.match(home, /visibility: nestEntry\.value \? 'hidden' : 'visible'/)
   // 阴影 9+y < back 10+y < 窝内猫 11+y < front 12+y < walker 13+y
   assert.match(home, /: 10 \+ Math\.floor\(it\.y\)/)
