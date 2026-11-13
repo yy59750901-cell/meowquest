@@ -993,4 +993,13 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - `nest-catalog.test.js` 加确认稿SHA、精确索引色和小图体积回归；前端419/419通过。`nest-catalog.js`、`scene-art.js`、`shop-display.js`、`CatSprite.vue`和其它12款48素材均与HEAD逐字节一致，不改价格、猫尺寸、脚点或七阶段动作。
 - 新目录 `nest-pilot-game-check/production-dist` 无删除构建成功、增量同步embed；入口仍为 `index-HPYrO7ui.js` / `index-CW3l4-uj.css`（此轮只替图，JS/CSS hash不变）。本机Go二进制编译成功但未运行业务后端，旧hash文件保留，chunk>500kB警告仍在。
 - 真实当前KidHome全API mock：1440×1000 / 390×844 / 320×740三款共24组（桌面四配色、手机橘黑）七阶段/落点/88px窝内猫/110px另一猫/前后图对齐/取消/同窝拒绝与不同窝并存310检查0失败，62截图。已查看三款大小屏橘黑睡姿、进入/走近、商店/库存关键图与三窝分别和苹果并存图，无新增阻断遮挡或布局问题。缩略图64×64、库存40×40复用新素材。静态最终图完成原CSS过渡，不改原业务动画。
-- 实际生产embed页面三视口另核对十二资源SHA/几何、无pageerror与横溢出，源码/build/embed每张图逐字节一致。证据、脚本、原图备份在工作区 `nest-pilot-game-check/`，不入业务仓库；未启动业务DB或发送真实写接口。线上仍未发布，未提交、推送或部署，验收devserver结束后停止。
+- 实际生产embed页面三视口另核对十二资源SHA/几何、无pageerror与横溢出，源码/build/embed每张图逐字节一致。证据、脚本、原图备份在工作区 `nest-pilot-game-check/`，不入业务仓库；未启动业务DB或发送真实写接口。线上仍未发布，未提交、推送或部署，验收devserver结束后停止。（第五十三、五十四节均为当时本地接入状态，后续正式发布见第五十五节。）
+
+## 五十五、四款猫窝画风提交与正式发布（11月13日 18:5x）
+
+- 用户明确「提交push，然后发布正式环境，不需要备份老的服务和数据库」。范围为切面苹果v3与灰蓝围合窝、绿色小怪兽窝、蓝壳黄内衬半开放窝，以及商店/物品栏新缩略图；猫帧、尺寸、互动规则与剩余12款保持不变。
+- 提交前 fetch 后HEAD/origin main为0/0；前端419/419、后端 `go test ./... -count=1` 全过，diff/cached检查通过；已完成大小屏真实房间验收，15张素材source/embed逐字节一致。37项暂存无.env/.deploy.local/私钥，87行新增自写文本URL/IPv4/凭据扫描0命中，真实部署URL不含于入库文件；服务器信息只在被ignore配置中。
+- 功能提交 `aa37b14` `feat: 统一四款猫窝像素画风并压缩运行素材`（37文件 +121/−17），push `ebbd891..aa37b14` 成功。保留旧embed hash文件，未绕开删除保护或清理旧产物；新入口引用 `index-HPYrO7ui.js` / `index-CW3l4-uj.css`。
+- `deploy.sh` 交叉编译linux/amd64 → 上传 → systemctl替换重启 → 健康检查全部成功，service active、首页200。按明确指令未备份旧二进制与数据库；脚本无数据库修改操作，本轮无后端业务/schema变化，不把正常服务启动当作手工数据库迁移。
+- 发布后只读验证：默认URL的15张新PNG与JS/CSS均成功读取且SHA与本地embed完全一致；线上运行二进制与本次发布产物SHA相同（`e796ad88…`），匿名species接口成功，最近80行日志error/warn/panic/fatal为0。核验时间18:54:39；具体证据与可复跑脚本在工作区 `nest-pilot-game-check/release-proof.json` / `verify-release.py`，不含真实域名、不入仓库。
+- 此节补记发布结果另作docs提交推送，不修改已部署运行产物。剩余12款未改；原chunk>500kB警告和320工具条边缘紧凑等现有取舍仍保留。
