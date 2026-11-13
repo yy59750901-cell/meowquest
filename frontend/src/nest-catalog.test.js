@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import {
   NEST_CATALOG, NEST_KEYS, NEST_ENTRY_TIME, NEST_WALK_FRAME_MS, NEST_MOTION, NEST_PAD,
   CAT_W, CAT_H, WORLD_W, isJumpNest, nestProfile, nestArt, nestRoute, nestFlightPoint,
@@ -67,6 +68,33 @@ test('每款 4 张压缩素材存在：back/front 保持原分辨率，阴影与
   }
   assert.ok(total < 3 * 1024 * 1024, `15 款双片合计 ${total}B 仍过大`)
   assert.ok(statSync(artPath('tent-back.png')).size > 0)
+})
+
+test('三款像素画风确认稿原样接入，索引色与共享缩略图保持轻量', () => {
+  // 只锁已确认的三款美术，不改变其它款或七阶段几何与动作。
+  const approved = {
+    'greyblue-round-back.png': 'fbded2ebb140ec1b4642903aba824b73dd2cfd6f2f1727fe8c667cdf9087b8dc',
+    'greyblue-round-front.png': 'a9073ef58d64b93ab9c118990facabf5a2c4bcd3196f45135e1d8541d393534a',
+    'greyblue-round-shadow.png': 'cdf7eca8ca1d3bba33af1b5e3b6f4f404288b047b714eb676219d86ddbb18387',
+    'greyblue-round-thumb.png': '19fda107e50eb251019ba0cf103da11e4837cad7e5649f70e0069aa041e17ee6',
+    'green-monster-back.png': '8232e4f39b9f969609e804ac4f2c81965c2dbd6e7c51f070aeedf1c59477e865',
+    'green-monster-front.png': '2fbe12a6d9d039c95250eaf0213c128e5ee2a476cb743b6941572f618a997e68',
+    'green-monster-shadow.png': 'd9f130740c10daf72c5166011e7a6624292f24b88561c1ddeaebd91d3151a763',
+    'green-monster-thumb.png': '6098826627000c90d80c4a1e6fd3f592d9b411ecb80010abdac17279bc08b7d6',
+    'blue-yellow-back.png': 'f2351df2f9919e0a7f2b17cd62136cecbb61271222469e996dd4b1b073791fcb',
+    'blue-yellow-front.png': '37a2427f48481df044f793a734f11bebedce6aecd66f0e3464b19a079f1d5027',
+    'blue-yellow-shadow.png': 'b420d7d115c50c92b4d9f85d4472e1ccfa5e0b4353618b93dc8416f5da4b856e',
+    'blue-yellow-thumb.png': '414b77f201225e3ab6e829074492c88af936e2bcb315c6e8031252f50440fb88',
+  }
+  let total = 0
+  for (const [name, hash] of Object.entries(approved)) {
+    const buf = readFileSync(artPath(name))
+    assert.equal(createHash('sha256').update(buf).digest('hex'), hash, `${name} 不匹配确认稿`)
+    assert.equal(buf[25], 3, `${name} 应使用精确索引色 PNG`)
+    total += buf.length
+    if (name.endsWith('-thumb.png')) assert.ok(buf.length < 2 * 1024, `${name} 不应退回大图`)
+  }
+  assert.ok(total < 110 * 1024, '三款四片合计应保持约103KiB')
 })
 
 test('demo 七阶段时序与动作帧常量完全对齐', () => {

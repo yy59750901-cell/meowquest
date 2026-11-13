@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { DECOR_ART, decorArt } from './scene-art.js'
 import { getShopDisplay } from './shop-display.js'
 import { NEST_KEYS, NEST_CATALOG } from './nest-catalog.js'
@@ -71,8 +72,31 @@ test('确认稿双片素材存在，尺寸一致且不是同一张图', () => {
   assert.notDeepEqual(back.buf, front.buf)
 })
 
-// 运行时只用压缩图：苹果窝双片 256 色量化、商店走 64px 缩略图、15 款保持压缩版，
-// 美术原稿仍留在 meowquest-cat-nest-design/assets/ 与 gallery assets，不参与运行时。
+// 切面苹果 v3 使用精确索引色 PNG，商店和物品栏复用同一张 64px 缩略图；
+// 其余 15 款保持原压缩素材，不因单款美术替换改变绘制或交互。
+test('苹果 v3 确认稿原样接入，双片索引色与鲜亮红不回退，缩略图同步', () => {
+  const approved = {
+    'nest-apple.png': 'fb8f47f25587ac1c5bd78874813996c1c4746ce3a0be7b7ff01ac62efb91f231',
+    'nest-apple-front.png': 'cd5550c9ea6e9252cac3f96c278fea781c4cda26f9fb0a198b89071a4df3d796',
+    'nest-apple-thumb.png': 'ad65f04740cf3e15b796cb727a33b7c6f1e72a4efe24c9d1d6a4f2010db76726',
+  }
+  const paletteChunks = []
+  for (const [name, sha] of Object.entries(approved)) {
+    const { buf } = readPng(name)
+    assert.equal(createHash('sha256').update(buf).digest('hex'), sha, `${name} 必须匹配确认稿`)
+    assert.equal(buf[24], 4, `${name} 使用 4 位调色板索引`)
+    assert.equal(buf[25], 3, `${name} 必须是索引色 PNG`)
+    for (let pos = 8; pos < buf.length;) {
+      const len = buf.readUInt32BE(pos)
+      const type = buf.subarray(pos + 4, pos + 8).toString()
+      if (type === 'PLTE') paletteChunks.push(buf.subarray(pos + 8, pos + 8 + len))
+      pos += len + 12
+    }
+  }
+  assert.ok(paletteChunks.every(p => p.includes(Buffer.from([0xE3, 0x54, 0x4D]))), '苹果暖红主色不能回退成砖棕')
+  assert.ok(readPng('nest-apple.png').buf.length + readPng('nest-apple-front.png').buf.length <= 12 * 1024,
+    '苹果 v3 双片应保持约 10KB，不得回到高精度大图')
+})
 test('所有猫窝运行时素材都是压缩图，商店卡片不拉全尺寸大图', () => {
   const bytes = name => statSync(new URL(`../public/art/${name}`, import.meta.url)).size
   assert.ok(bytes('nest-apple.png') < 80 * 1024, '苹果窝 back 不应回到 600KB 原图')
@@ -125,13 +149,13 @@ test('按 demo 三段进场：地板线、左侧 170px 起走、1.35s 匀速，�
   assert.match(home, /nestWalking\.value = null[\s\S]*?nestExiting\.value = null[\s\S]*?nestActive\.value = it/)
 })
 
-test('按 demo 补上窝底椭圆投影，且压在窝体下层不遮窝', () => {
-  assert.match(home, /class="nest-shade"/)
-  assert.match(home, /v-for="it in appleNests" :key="'nest-shade-' \+ it.id"/)
+test('苹果 v3 使用确认稿阶梯投影，尺寸锚点不变且压在窝体下层', () => {
+  assert.match(home, /<svg v-for="it in appleNests" :key="'nest-shade-' \+ it.id" class="nest-shade"/)
   assert.match(home, /top: it\.y \+ 5 \+ 'px', zIndex: 9 \+ Math\.floor\(it\.y\)/)
-  assert.match(home, /\.nest-shade \{[^}]*width: 176px; height: 10\.4px;/)
-  // demo 纯色地板用 #886747/.28；游戏木纹地板需加深柔化才等效贴地，几何与层级不变
-  assert.match(home, /\.nest-shade \{[^}]*background: #5b3d22; opacity: \.45; filter: blur\(2px\);/)
+  assert.match(home, /viewBox="0 0 176 10\.4" preserveAspectRatio="none" shape-rendering="crispEdges"/)
+  assert.match(home, /d="M32 0H144V2\.6H164V5\.2H176V7\.8H160V10\.4H16V7\.8H0V5\.2H12V2\.6H32Z" fill="#735348"/)
+  assert.match(home, /\.nest-shade \{[^}]*width: 176px; height: 10\.4px;[^}]*opacity: \.4;[^}]*image-rendering: pixelated;/)
+  assert.doesNotMatch(home, /\.nest-shade \{[^}]*(?:blur\(|border-radius|background:)/)
   // 投影层 9+y < 窝 back 10+y < 窝内猫 11+y < 前片 12+y < 走路猫 13+y
   assert.match(home, /: 10 \+ Math\.floor\(it\.y\)/)
   assert.match(home, /zIndex: 12 \+ Math\.floor\(it\.y\)/)

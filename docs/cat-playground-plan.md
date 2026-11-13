@@ -976,3 +976,21 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - **部署前置**：线上为 PG（复用服务器 PG 容器），`PreparePetOwnership` + `AutoMigrate` + `MigrateMultiPet` 的 PG 路径已在真实隔离 PG 集成验证；只读预检确认 systemd 只有单个 `meowquest.service`、无新旧二进制混跑、日志无异常。按历史「不用备份」口径未备份旧二进制与数据库；MySQL 真实隔离实例仍未验证，线上不用。真实服务器/域名仍只在 gitignore 的 `backend/.deploy.local`。
 - **部署与核验**：`backend/deploy.sh` 四步全过；`systemd active`、首页 200。线上 `index.html` 引用与本地 embed 一致，JS 200（606441B）/ CSS 200（290676B）；线上 JS 含「开饭已结算」「小猫追逐」「yarn-wait」「data-mouth-pixel」「一起开饭」且命中数与本地产物一致，CSS 含 `meal-facing` / `social-facing`；匿名 `/api/species` 200；线上二进制 SHA256 与本地 release 一致（`daa6ff23…`）；最近 80 行日志无 error / panic / fatal / migration / warn。**只读查询线上 PG 确认迁移完成**：`feed_request` / `kid_account` / `pet` 三表齐备，`pet_rows=4` 数据未丢，`kid_id` 单列 UNIQUE 约束残留 `0`。
 - **边界**：实际领养上限仍 2；四猫为假数据扩展验收，未开放。孩子真机手感与低头姿态/合玩审美反馈待确认；一起睡与更复杂社交未做。
+
+## 五十三、切面苹果猫窝 v3 画风替换（11月13日，本地接入）
+
+- **授权与范围**：用户确认鲜亮苹果红 v3，并要求替换正式游戏。只换 `nest-apple`，不是全16款，也不含提交、推送或线上部署。独立试稿采用旧家具的48列整数色块设计，红壳五档色阶最终确认；现有双片939×783画布、透明遮挡逐像素保留，显示192px、原猫帧/配色、进窝0.8渲染、落点与进出窝链路不变。其余15款60张素材及 `CatSprite.vue`、catalog、scene-art、shop-display 均与HEAD逐字节一致。
+- **接入文件**：替换 `frontend/public/art/nest-apple.png` / `nest-apple-front.png`；以同一新版完整图生成64×64索引色 `nest-apple-thumb.png`，商店与物品栏沿原路径共享。`KidHome.vue` 只把苹果柔椭圆投影改成确认稿阶梯SVG（176×10.4、窝底下5px、opacity .4、z=9+y），不改动作。`apple-nest.test.js` 增加确认稿SHA/4位索引色/暖红色/体积防回归，并更新投影断言。
+- **体积与遮挡**：前后片68983+63839B → 5078+5034B（合计10112B，降低92.39%）；thumb8072→845B。双片alpha与旧游戏逐像素相同，缩略图仅重生展示图、不参与遮挡。未把体积下降比例当作整页加载提速实测。
+- **测试与构建**：前端418/418通过。原 `build.sh` 的清空旧dist被批量删除保护阻止，未重复尝试删除；改在验收目录新建 `production-dist`、`--emptyOutDir=false` 构建成功，再增量复制到Go embed，保留旧hash文件而不清理。新入口引用 `index-HPYrO7ui.js` / `index-CW3l4-uj.css`，源码新图与embed逐字节一致；本地二进制编译成功，但未启动业务后端或触碰数据库。旧>500kB chunk警告仍在，未扩范围拆包。
+- **真实页面证据**：真实当前KidHome SFC，所有API假数据拦截，1440×1000 / 390×844 / 320×740的橘、黑猫跨三屏加桌面奶牛/白猫共8组点击进窝 → 行走 → 趴睡通过；窝192px、窝内猫88px、其他地面猫110px，z=609/610/611/612、落点与旧公式一致。最终静态截图完成既有CSS翻转过渡后采集，未改业务动画；已逐张查看趴睡截图，无猫盖空、穿壳、气泡压窝。生产embed页面三视口另验资源SHA、阴影、尺寸、无pageerror/横溢出，mock页面不等于线上已发布。证据与备份在工作区 `apple-v3-game-check/`，不入库。
+- **商店与多猫回归**：三屏商店新图自然尺寸64×64、物品栏40×40且使用同一thumb；390/320陪伴四操作展开与库存展开截图已查看，无新增布局问题。桌面真实同窝抢占被拒、两苹果实例可分别住两猫，四猫配色趴睡截图均可辨；取消不改既有共享占用规则。以上只用mock数据；早期补充独立脚本因时钟等待未完成，未采用其部分报告作为通过证据，最终以主代理可复跑的 `room-basic.cjs` / `room-basic.json` 与 `production-smoke.cjs` / JSON为准。
+- **边界**：本地源码和已入库embed已更新；线上服务未替换、未commit/push，既有320工具条边缘紧凑与世界裁切不属本轮。运行中的业务后端未重启；既有CSS翻转过渡可短暂把猫压窄，静态趴睡验收取过渡结束后的图，本轮未改动画。
+
+## 五十四、三款代表猫窝画风接入（11月13日，本地正式游戏）
+
+- 用户确认三款试稿并要求做正式游戏：灰蓝椭圆围合窝、绿色小怪兽窝、蓝壳黄内衬半开放窝各4张back/front/shadow/thumb原样替换 `frontend/public/art/nests/` 与Go embed对应路径，保留此前苹果v3改动。三款合计531371→105279B（约519→103KiB，减80.2%）；逐款前后片及阴影canvas/alpha不变，影子仍为原柔alpha单色重绘，不新增苹果式阶梯影。
+- `nest-catalog.test.js` 加确认稿SHA、精确索引色和小图体积回归；前端419/419通过。`nest-catalog.js`、`scene-art.js`、`shop-display.js`、`CatSprite.vue`和其它12款48素材均与HEAD逐字节一致，不改价格、猫尺寸、脚点或七阶段动作。
+- 新目录 `nest-pilot-game-check/production-dist` 无删除构建成功、增量同步embed；入口仍为 `index-HPYrO7ui.js` / `index-CW3l4-uj.css`（此轮只替图，JS/CSS hash不变）。本机Go二进制编译成功但未运行业务后端，旧hash文件保留，chunk>500kB警告仍在。
+- 真实当前KidHome全API mock：1440×1000 / 390×844 / 320×740三款共24组（桌面四配色、手机橘黑）七阶段/落点/88px窝内猫/110px另一猫/前后图对齐/取消/同窝拒绝与不同窝并存310检查0失败，62截图。已查看三款大小屏橘黑睡姿、进入/走近、商店/库存关键图与三窝分别和苹果并存图，无新增阻断遮挡或布局问题。缩略图64×64、库存40×40复用新素材。静态最终图完成原CSS过渡，不改原业务动画。
+- 实际生产embed页面三视口另核对十二资源SHA/几何、无pageerror与横溢出，源码/build/embed每张图逐字节一致。证据、脚本、原图备份在工作区 `nest-pilot-game-check/`，不入业务仓库；未启动业务DB或发送真实写接口。线上仍未发布，未提交、推送或部署，验收devserver结束后停止。

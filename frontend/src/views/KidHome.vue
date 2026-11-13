@@ -3090,9 +3090,12 @@ onBeforeUnmount(() => {
       <span v-if="it.item_key === 'yarn'" data-ball-center aria-hidden="true" :style="{ position: 'absolute', left: decorArt(it.item_key).size / 2 + 'px', top: decorArt(it.item_key).size * 34 / 48 + 'px', width: 0, height: 0, pointerEvents: 'none' }"></span>
     </div>
 
-    <!-- 苹果窝窝底椭圆投影（上一代实现，维持原样） -->
-    <div v-for="it in appleNests" :key="'nest-shade-' + it.id" class="nest-shade"
-      :style="{ left: it.x + 'px', top: it.y + 5 + 'px', zIndex: 9 + Math.floor(it.y) }"></div>
+    <!-- 切面苹果 v3：与确认稿一致的阶梯接触影，原几何和层级不变。 -->
+    <svg v-for="it in appleNests" :key="'nest-shade-' + it.id" class="nest-shade"
+      :style="{ left: it.x + 'px', top: it.y + 5 + 'px', zIndex: 9 + Math.floor(it.y) }"
+      viewBox="0 0 176 10.4" preserveAspectRatio="none" shape-rendering="crispEdges" aria-hidden="true">
+      <path d="M32 0H144V2.6H164V5.2H176V7.8H160V10.4H16V7.8H0V5.2H12V2.6H32Z" fill="#735348" />
+    </svg>
 
     <!-- 15 款新窝：每款专属 PNG 接触投影，按 demo .shade 的 inset:-8px 铺满窝 bbox 外扩 8px -->
     <div v-for="it in jumpNests" :key="'nest-shadow-' + it.id" class="nest-shadow-img"
@@ -3512,10 +3515,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .litter-mini :deep(svg) { display: block; width: 100%; height: auto; image-rendering: pixelated; }
 .nest-front { position: absolute; transform: translate(-50%, -100%); line-height: 0; pointer-events: none; }
 .nest-img { display: block; height: auto; image-rendering: pixelated; }
-/* 确认稿 demo 的 .shade：窝宽 240 配 220x13 椭圆投影，底边比窝底低 5px，压在窝体下层。
-   demo 是纯色地板用 #886747/.28；游戏是木纹地板（纹理明暗 ±20 会吃掉浅影），
-   按等效贴地观感加深到 #5b3d22/.45 并柔化边缘，几何与层级仍与 demo 一致。 */
-.nest-shade { position: absolute; width: 176px; height: 10.4px; transform: translate(-50%, -100%); border-radius: 50%; background: #5b3d22; opacity: .45; filter: blur(2px); pointer-events: none; }
+/* 苹果 v3 确认稿的硬阶梯投影；仍为 176x10.4、窝底下 5px、z=9+y。
+   仅统一绘画语言，不改猫窝尺寸、脚点或进出窝链路。 */
+.nest-shade { position: absolute; width: 176px; height: 10.4px; transform: translate(-50%, -100%); display: block; opacity: .4; image-rendering: pixelated; pointer-events: none; }
 /* 15 款新窝：每款下轮廓接触阴影 PNG，几何=demo 的 inset:-8px，拉伸铺满 */
 .nest-shadow-img { position: absolute; transform: translate(-50%, -100%); background-size: 100% 100%; background-repeat: no-repeat; pointer-events: none; }
 /* demo 的 cat-plane / walker 双副本：同世界坐标、补集 clip；坐标按 110 口径，渲染层 scale(.8) 等比缩小 */
