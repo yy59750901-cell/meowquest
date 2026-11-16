@@ -1003,3 +1003,14 @@ MDA诊断：现有机制以点击触发与资源交换为主，动态主要是�
 - `deploy.sh` 交叉编译linux/amd64 → 上传 → systemctl替换重启 → 健康检查全部成功，service active、首页200。按明确指令未备份旧二进制与数据库；脚本无数据库修改操作，本轮无后端业务/schema变化，不把正常服务启动当作手工数据库迁移。
 - 发布后只读验证：默认URL的15张新PNG与JS/CSS均成功读取且SHA与本地embed完全一致；线上运行二进制与本次发布产物SHA相同（`e796ad88…`），匿名species接口成功，最近80行日志error/warn/panic/fatal为0。核验时间18:54:39；具体证据与可复跑脚本在工作区 `nest-pilot-game-check/release-proof.json` / `verify-release.py`，不含真实域名、不入仓库。
 - 此节补记发布结果另作docs提交推送，不修改已部署运行产物。剩余12款未改；原chunk>500kB警告和320工具条边缘紧凑等现有取舍仍保留。
+
+## 五十六、剩余十二款像素确认稿接入（11月16日，本地正式游戏）
+
+- 用户确认整套并要求接入正式游戏。12款各4张back/front/shadow/thumb原样替换 `frontend/public/art/nests/` 和Go embed对应路径；其中 `dot-U` 使用用户截图确认的柔粉前围v2，不再按实物照片恢复奶白左臂。此前已上线切面苹果v3/灰蓝/小怪兽/蓝黄15张素材与HEAD逐字节一致。
+- 十二款合计1980490→421578B（约1.89MiB→411.7KiB，减78.7%）。保前后片及shadow原canvas/alpha；针织原front大面积比back alpha低1仍保留，故该片44930B，不强压损失透明细节。影子仍原柔alpha单色，不新增阶梯影；原猫/四配色/SVG110×83、窝内0.8尺度、脚点和七阶段时序不变。
+- `nest-catalog.test.js` 加十二款按back/front/shadow/thumb顺序联合SHA、精确索引色、64×64轻量thumb与总量回归；全量420/420通过。`KidHome.vue`、`CatSprite.vue`、catalog、scene-art、shop-display与HEAD逐字节一致，名字/价格/业务互动未改。
+- 安全新目录 `nest-remaining-game-check/production-dist` 构建成功后增量同步embed；只改美术，入口JS/CSS仍 `index-HPYrO7ui.js` / `index-CW3l4-uj.css`，旧hash保留。Go本机二进制编译成功，未启动业务后端或数据库；旧chunk>500kB警告未扩范围处理。
+- 真实当前KidHome、所有API mock：1440×1000 / 390×844 / 320×740十二款96组（桌面四配色、手机橘黑）七阶段/落点/88px窝内猫/另一猫110/前后片对齐/取消/同窝拒绝与和苹果不同窝并存1219检查0失败，224截图。已查看每款18态裁图总览、三屏商店/库存及波点U关键单图，无新增盖空/穿壳/重影/气泡压窝或UI溢出。静态截图完成既有CSS翻转过渡；业务动画未改。
+- 生产embed三视口另验12款24前后片几何、48素材×3屏共144资源SHA、无pageerror/横溢出；48图source/build/embed逐字节与确认稿一致。商店thumb64×64、库存40×40复用新图，12库存只内部横滚；原小屏工具条紧凑和非当前猫远处取景未修改。
+- 购买/拖放补测仅mock：桌面12款分别购买→库存拖入→猫进窝，390/320波点U购拖取消再摆，共14次买入与放置、另1次已有实例拖动保存、2次取消，311断言0失败/20截图，真实业务写入0。首轮窄屏进窝点击被冻结时钟下购买Toast拦截，改为推进测试时钟让Toast自然结束后重跑通过；未移除DOM或修改业务代码。移动屏为鼠标窄视口，不声称真机触摸已验。证据 `purchase-drag-report.json`。
+- 接入证据/脚本与旧48图备份在工作区 `nest-remaining-game-check/`，不入业务仓库。此轮尚未提交、推送或线上部署；本地构建产物不代表线上已更新。验收Vite结束后停止，后端go test全包通过。

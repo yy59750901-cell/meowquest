@@ -97,6 +97,40 @@ test('三款像素画风确认稿原样接入，索引色与共享缩略图保�
   assert.ok(total < 110 * 1024, '三款四片合计应保持约103KiB')
 })
 
+test('剩余十二款确认稿原样接入，波点U为用户截图粉色版', () => {
+  // 每款按 back/front/shadow/thumb 顺序合并校验，锁定实际确认素材。
+  const approved = {
+    'lace-square': '71785046afce0ec3c5690f5fe62910825222932ee7fe9b8d731432642f6ee061',
+    tent: '6fab419a8ad1640839a07ea30661ecfffa0a7e581ef4e4d05ce29a13c6d99ed9',
+    'petal-cylinder': '2f35e712544fba38320966b69065de9fb270a00b9aaddec76610568fd6b24219',
+    'stripe-handle': '7a9b61eed33e670efb64043d500236456fb5f956385821cc946bf8f97b1478e6',
+    'knit-drop': 'c8366fa13109936d8a1e60f7ad19600084a8fefc4f41b7719d3c3801987336d8',
+    'dot-U': 'c90ba6bad0ab7778bc248ab6bbdb2ed6e67cb1fcce624f9bf84dba447ee7c51e',
+    'quilt-U': 'b274fcf648396f8c1cff89ccc619945fd43cd2e5f9a189546197572a575ade2a',
+    'leaf-apple': '1248875404dcb846588b2eeaa79a0142693be02c68c13253156012c159930973',
+    banana: 'e8dbaab966f57394c941dbd9ccb3cc10b50a895f1c934f717bf36a81a744bf60',
+    catear: '3461e3c4d5952ac1705ad1f2a91c086a6acc24922f6a027b4371505d623939ed',
+    house: 'cb5e652bd2d307db475ddac878770f12453c362c6b3fd5c139e8d14b70c6f8b5',
+    'red-dots': 'd5d34bcbdd451e438324bde27886f91e10385c67996544ba73521e4192f5f176',
+  }
+  let total = 0
+  for (const [key, hash] of Object.entries(approved)) {
+    const digest = createHash('sha256')
+    for (const part of ['back', 'front', 'shadow', 'thumb']) {
+      const buf = readFileSync(artPath(`${key}-${part}.png`))
+      assert.equal(buf[25], 3, `${key}-${part} 应保持精确索引色 PNG`)
+      digest.update(buf)
+      total += buf.length
+      if (part === 'thumb') {
+        assert.deepEqual([buf.readUInt32BE(16), buf.readUInt32BE(20)], [64, 64])
+        assert.ok(buf.length < 2 * 1024, `${key} 缩略图不应退回大图`)
+      }
+    }
+    assert.equal(digest.digest('hex'), hash, `${key} 与确认的四张素材不一致`)
+  }
+  assert.ok(total < 420 * 1024, '十二款四片合计应保持约412KiB')
+})
+
 test('demo 七阶段时序与动作帧常量完全对齐', () => {
   assert.deepEqual(NEST_ENTRY_TIME, { walk: 900, prepare: 150, openJump: 650, doorJump: 480, land: 220 })
   assert.equal(NEST_WALK_FRAME_MS, 180)
