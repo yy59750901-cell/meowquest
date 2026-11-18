@@ -437,8 +437,8 @@ const petRequestID = id => pets.value.find(cat => String(cat.id) === String(id))
 const petQuery = id => id && id !== 'legacy' ? `/pet?pet_id=${encodeURIComponent(id)}` : '/pet'
 async function loadAll() {
   const epoch = identityEpoch, requestedID = selectedPetID.value
-  const [sp, p, t, w, s, sc] = await Promise.all([
-    jget('/species'), jget(petQuery(requestedID)), jget('/tasks/today'), jget('/wish/list'), jget('/shop'), jget('/scene'),
+  const [sp, p, t, w, stars, s, sc] = await Promise.all([
+    jget('/species'), jget(petQuery(requestedID)), jget('/tasks/today'), jget('/wish/list'), jget('/wish/stars'), jget('/shop'), jget('/scene'),
   ])
   if (disposed || epoch !== identityEpoch) return
   if (sp) speciesList.value = sp.species || []
@@ -446,6 +446,7 @@ async function loadAll() {
   if (disposed || epoch !== identityEpoch) return
   applyToday(t)
   if (w) wishes.value = w.wishes || []
+  if (stars) wishStars.value = stars.stars || []
   if (s) shopItems.value = s.items || []
   if (sc) sceneItems.value = sc.items || []
   restoreTimer()
@@ -2648,6 +2649,9 @@ function taskBtnLabel(t) {
 // ===== 愿望 =====
 const wishModal = ref(false)
 const wishForm = reactive({ title: '', hoped: '' })
+const wishStars = ref([]) // 愿望星图：家长兑现后的愿望
+const redeemBusy = ref(0) // 正在兑换的愿望 id，防连点重复扣星
+const fmtStarDate = t => t ? String(t).slice(0, 10).replace(/-/g, '.') : ''
 function newWish() {
   if (roomLocked()) return
   wishForm.title = ''
@@ -2669,6 +2673,22 @@ async function cancelWish(w) {
   await jpost(`/wish/${w.id}/cancel`)
   showToast('撤回了这个愿望')
   await loadAll()
+}
+// 攒够后由孩子主动兑换：服务端在孩子锁事务内一次完成扣星和状态变更。
+async function redeemWish(w) {
+  if (redeemBusy.value || wishModal.value) return
+  if (!w.can_redeem) return showToast('星星还不够，继续加油～')
+  redeemBusy.value = w.id
+  try {
+    const { ok, data } = await jpost(`/wish/${w.id}/redeem`, {})
+    if (!ok) return showToast(data.error || '兑换失败，稍后再试哦')
+    showToast(`兑换成功！${w.price}⭐ 交给妈妈啦，等着愿望实现～`)
+    await loadAll()
+  } catch {
+    showToast('网络不太好，稍后再试哦')
+  } finally {
+    redeemBusy.value = 0
+  }
 }
 
 // ===== 商店/场景 =====
@@ -3246,12 +3266,28 @@ onBeforeUnmount(() => {
       <div class="panel-body">
         <div v-for="w in wishes.filter(x => x.status !== 'rejected')" :key="w.id" class="wish-row">
           <div class="wt">✨ {{ w.title }} <a v-if="['pending', 'saving'].includes(w.status)" class="cancel" @click="cancelWish(w)">✕</a></div>
-          <div v-if="w.status === 'saving'" class="track"><i :style="{ width: (w.progress || 0) + '%' }" /><span>{{ w.progress }}%</span></div>
+          <template v-if="w.status === 'saving'">
+            <div class="track"><i :style="{ width: (w.progress || 0) + '%' }" /><span>{{ w.progress }}%</span></div>
+            <div v-if="w.price > 0" class="wish-saving">
+              <span class="wsub">{{ w.can_redeem ? '攒够啦，可以兑换咯！' : '还差 ' + Math.max(0, (w.price || 0) - (w.balance || 0)) + ' 颗星' }}</span>
+              <button v-if="w.can_redeem" class="wish-redeem" :disabled="!!redeemBusy" @click="redeemWish(w)">{{ redeemBusy === w.id ? '兑换中…' : '✨ 兑换 ' + w.price + '⭐' }}</button>
+            </div>
+          </template>
           <div v-else-if="w.status === 'pending'" class="wsub">等妈妈定价…</div>
           <div v-else-if="w.status === 'redeem_requested'" class="wsub">等妈妈兑现～</div>
           <div v-else-if="w.status === 'fulfilled'" class="wsub done">🌟 已实现！</div>
         </div>
         <div v-if="!wishes.length" class="empty">还没有愿望，点上面许一个～</div>
+        <div class="wish-wall">
+          <div class="wish-wall-head">🌟 愿望星图 <small>{{ wishStars.length }} 颗</small></div>
+          <div v-if="!wishStars.length" class="wish-wall-empty">实现的愿望会变成星星挂在这里～</div>
+          <div v-else class="wish-wall-list">
+            <div v-for="s in wishStars" :key="s.id" class="wish-wall-star">
+              <span class="wish-wall-icon">⭐</span>
+              <span class="wish-wall-copy"><b>{{ s.title }}</b><small>{{ fmtStarDate(s.fulfilled_at) }} · {{ s.price }}⭐</small></span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -3637,6 +3673,21 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .wsub { font-size: 11px; color: #88786A; }
 .wsub.done { color: #A67B3F; font-weight: 700; }
 .wish-row .cancel { float: right; color: #A56860; font-weight: 700; cursor: pointer; margin-left: 8px; font-size: 12px; padding: 2px 6px; }
+.wish-saving { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.wish-saving .wsub { min-width: 0; }
+.wish-redeem { flex: 0 0 auto; padding: 6px 9px; border: 1px solid #C9B8E4; border-radius: 9px; background: #E9E1F8; color: #69518F; font-size: 11.5px; font-weight: 700; line-height: 1.2; white-space: nowrap; cursor: pointer; box-shadow: 0 2px 0 #DACDEE; }
+.wish-redeem:active { transform: translateY(1px); box-shadow: none; }
+.wish-redeem:disabled { opacity: .6; cursor: default; }
+.wish-wall { margin-top: 12px; padding-top: 9px; border-top: 1px dashed #DDD1EE; }
+.wish-wall-head { margin-bottom: 6px; color: #69518F; font-size: 12px; font-weight: 700; }
+.wish-wall-head small { margin-left: 4px; color: #9C8AAE; font-weight: 600; }
+.wish-wall-empty { color: #A09386; font-size: 11px; line-height: 1.5; }
+.wish-wall-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; }
+.wish-wall-star { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 7px; border: 1px solid #E5D9C5; border-radius: 9px; background: #FFF6E4; }
+.wish-wall-icon { flex: 0 0 auto; font-size: 16px; }
+.wish-wall-copy { display: flex; flex-direction: column; min-width: 0; }
+.wish-wall-copy b { overflow: hidden; color: #70543C; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.wish-wall-copy small { color: #9B8A76; font-size: 10px; white-space: nowrap; }
 /* 固定四列（图标/名称/价格/按钮），保证各行左右边缘与列宽一致 */
 .shop-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) 52px 62px; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 8px; }
 /* 图标统一坐在同一种 32px 格子里：道具是小图居中，壁纸是图案铺满 */

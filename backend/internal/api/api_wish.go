@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -10,8 +11,6 @@ import (
 
 	"meowquest/backend/internal/store"
 )
-
-func now() time.Time { return time.Now() }
 
 type wishAdminItem struct {
 	ID           int64     `json:"id"`
@@ -88,6 +87,7 @@ func (s *Server) wishList(c *gin.Context) {
 
 // POST /api/wish/:id/redeem 孩子兑换：冻结扣星
 func (s *Server) redeemWish(c *gin.Context) {
+	msg := "愿望当前不能兑换"
 	err := s.DB.WithKidLock(kidOf(c), func(tx *store.DB) error {
 		var w store.Wish
 		if err := tx.Where("id=? AND kid_id=?", c.Param("id"), kidOf(c)).First(&w).Error; err != nil {
@@ -96,7 +96,14 @@ func (s *Server) redeemWish(c *gin.Context) {
 		if w.Status != "approved" && w.Status != "saving" {
 			return fmt.Errorf("愿望当前不能兑换")
 		}
+		if w.Price <= 0 {
+			msg = "这个愿望还没定价，等妈妈定好再来～"
+			return errors.New("wish price not set")
+		}
 		if err := tx.SpendStarsLocked(kidOf(c), w.Price); err != nil {
+			if errors.Is(err, store.ErrInsufficientStars) {
+				msg = "星星还不够，继续加油喵！"
+			}
 			return err
 		}
 		if err := tx.Model(&w).Updates(map[string]any{"status": "redeem_requested", "redeemed_at": s.now()}).Error; err != nil {
@@ -105,7 +112,7 @@ func (s *Server) redeemWish(c *gin.Context) {
 		return tx.AddEvent(kidOf(c), "wish_redeem", map[string]any{"wish_id": w.ID, "price": w.Price})
 	})
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "愿望不能兑换或星星还不够，继续加油喵！"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"redeem_requested": true})
@@ -168,7 +175,7 @@ func (s *Server) adminWishList(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"wishes": out, "daily_stars_avg": healthBase})
 }
 
-// POST /api/admin/wish/:id { action: approve/reject/fulfill, price, reason }
+// POST /api/admin/wish/:id { action: approve/reject/refund/fulfill, price, reason }
 func (s *Server) adminWishAction(c *gin.Context) {
 	var req struct {
 		Action string `json:"action" binding:"required"`
@@ -200,10 +207,52 @@ func (s *Server) adminWishAction(c *gin.Context) {
 		s.DB.Model(&w).Where("status IN ('pending','saving')").
 			Updates(map[string]any{"status": "rejected", "reject_reason": req.Reason})
 		c.JSON(http.StatusOK, gin.H{"ok": true})
+	case "refund":
+		// 家长不兑现：把冻结时扣掉的星星原额退回，愿望回到攒星中（愿望永不过期）。
+		err := s.DB.WithKidLock(w.KidID, func(tx *store.DB) error {
+			var pending store.Wish
+			if err := tx.Where("id=? AND kid_id=? AND status='redeem_requested'", w.ID, w.KidID).First(&pending).Error; err != nil {
+				return err
+			}
+			if pending.Price <= 0 {
+				return errors.New("wish price invalid")
+			}
+			// 只加回可消费余额：累计获得(等级)与收入账本都不变，也不写 settlement_ledger，避免污染定价健康度口径。
+			if err := tx.UpdateAccountLocked(w.KidID, map[string]any{"balance": gorm.Expr("balance+?", pending.Price)}); err != nil {
+				return err
+			}
+			res := tx.Model(&store.Wish{}).Where("id=? AND status='redeem_requested'", w.ID).
+				Updates(map[string]any{"status": "saving", "redeemed_at": nil})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				return errors.New("wish status changed")
+			}
+			return tx.AddEvent(w.KidID, "wish_refund", map[string]any{"wish_id": w.ID, "price": pending.Price})
+		})
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "这个愿望现在不能退回星星"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
 	case "fulfill":
-		s.DB.Model(&w).Where("status='redeem_requested'").
-			Updates(map[string]any{"status": "fulfilled", "fulfilled_at": now()})
-		s.DB.AddEvent(w.KidID, "wish_fulfilled", map[string]any{"wish_id": w.ID})
+		// 状态变更与事件同事务：重复点击只兑现一次，不会重复写进猫的记忆。
+		err := s.DB.WithKidLock(w.KidID, func(tx *store.DB) error {
+			res := tx.Model(&store.Wish{}).Where("id=? AND kid_id=? AND status='redeem_requested'", w.ID, w.KidID).
+				Updates(map[string]any{"status": "fulfilled", "fulfilled_at": s.now()})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				return errors.New("wish not pending fulfillment")
+			}
+			return tx.AddEvent(w.KidID, "wish_fulfilled", map[string]any{"wish_id": w.ID})
+		})
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "愿望不在待兑现状态"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown action"})

@@ -204,12 +204,13 @@ async function wishAction(w, action) {
   if (action === 'approve') {
     priceModal.value = { wish: w, price: w.hoped_price || 200 }
     return
-  } else if (action === 'reject') {
-    await jpost(`/api/admin/wish/${w.id}`, { action, reason: '这个我们换个更值得的目标好吗？' })
-  } else if (action === 'fulfill') {
-    await jpost(`/api/admin/wish/${w.id}`, { action })
   }
-  showToast('操作成功')
+  if (action === 'refund' && !window.confirm(`确定不兑现「${w.title}」吗？${w.price}⭐ 会原额退回给孩子。`)) return
+  const body = { action }
+  if (action === 'reject') body.reason = '这个我们换个更值得的目标好吗？'
+  const { ok, data } = await jpost(`/api/admin/wish/${w.id}`, body)
+  if (!ok) return showToast(data?.error || '操作失败，稍后再试')
+  showToast(action === 'refund' ? '星星已退回，愿望回到攒星中' : action === 'fulfill' ? '愿望已兑现，星图亮起一颗星' : '操作成功')
   await load()
 }
 
@@ -376,10 +377,12 @@ onBeforeUnmount(() => clearInterval(statusTicker))
           <div class="row1"><b>✨ {{ w.kid_name ? w.kid_name + ' · ' : '' }}{{ w.title }}</b><em>{{ statusText[w.status] }}</em></div>
           <div class="row2" v-if="w.status === 'pending'">孩子期望：{{ w.hoped_price }}⭐ · 预计 {{ w.suggest_days || '?' }} 天</div>
           <div class="row2" v-else-if="w.status === 'saving'">定价 {{ w.price }}⭐</div>
+          <div class="row2" v-else-if="w.status === 'redeem_requested'">已扣 {{ w.price }}⭐ · 等现实兑现</div>
           <div class="btns" v-if="['pending', 'saving', 'redeem_requested'].includes(w.status)">
             <button v-if="w.status === 'pending'" class="ok" @click="wishAction(w, 'approve')">定价通过</button>
             <button v-if="w.status === 'saving'" class="no" @click="wishAction(w, 'reject')">取消</button>
             <button v-if="w.status === 'redeem_requested'" class="ok" @click="wishAction(w, 'fulfill')">✓ 已兑现</button>
+            <button v-if="w.status === 'redeem_requested'" class="no" @click="wishAction(w, 'refund')">↩ 退回星星</button>
           </div>
         </div>
       </van-tab>

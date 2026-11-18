@@ -2,9 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -268,5 +270,215 @@ func TestSceneItemInvalidRequests(t *testing.T) {
 			r.ServeHTTP(w, req)
 			requireTaskStatus(t, w, http.StatusBadRequest)
 		})
+	}
+}
+
+// ===== 愿望兑换闭环：扣星 / 退星 / 兑现幂等 / 星图 =====
+
+func wishFlowRouter(s *Server, familyID, kidID int64) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("familyID", familyID)
+		c.Set("kidID", kidID)
+	})
+	r.POST("/api/wish", s.createWish)
+	r.GET("/api/wish/list", s.wishList)
+	r.GET("/api/wish/stars", s.wishStars)
+	r.POST("/api/wish/:id/redeem", s.redeemWish)
+	r.POST("/api/admin/wish/:id", s.adminWishAction)
+	return r
+}
+
+func wishFlowFixture(t *testing.T) (*Server, *gin.Engine, store.Kid, store.Pet) {
+	t.Helper()
+	db := taskIntegrationDB(t)
+	fam := store.Family{Code: "778899", Name: "愿望闭环测试"}
+	mustTaskCreate(t, db, &fam)
+	kid := store.Kid{FamilyID: fam.ID, Name: "攒星孩子"}
+	mustTaskCreate(t, db, &kid)
+	pet := store.Pet{KidID: kid.ID, Name: "小橘", Species: "orange", Balance: 100, EarnedTotal: 100}
+	mustTaskCreate(t, db, &pet)
+	s := &Server{DB: db}
+	return s, wishFlowRouter(s, fam.ID, kid.ID), kid, pet
+}
+
+func wishBalances(t *testing.T, s *Server, petID int64) (int64, int64) {
+	t.Helper()
+	var p store.Pet
+	if err := s.DB.First(&p, petID).Error; err != nil {
+		t.Fatal(err)
+	}
+	return p.Balance, p.EarnedTotal
+}
+
+func wishOf(t *testing.T, s *Server, id int64) store.Wish {
+	t.Helper()
+	var w store.Wish
+	if err := s.DB.First(&w, id).Error; err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+func wishEventCount(t *testing.T, s *Server, kidID int64, typ string) int64 {
+	t.Helper()
+	var n int64
+	if err := s.DB.Model(&store.PetEvent{}).Where("kid_id=? AND type=?", kidID, typ).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// 完整链路：pending → saving → redeem_requested →(refund) saving → redeem_requested → fulfilled。
+func TestWishRedeemRefundFulfillIntegration(t *testing.T) {
+	s, r, kid, pet := wishFlowFixture(t)
+	created := taskTestRequest(r, http.MethodPost, "/api/wish",
+		map[string]any{"title": "乐高梦幻花园", "hoped_price": 50})
+	requireTaskStatus(t, created, http.StatusOK)
+	var c struct {
+		ID     int64  `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Status != "pending" {
+		t.Fatalf("新愿望状态应为 pending，实际 %s", c.Status)
+	}
+	adminPath := fmt.Sprintf("/api/admin/wish/%d", c.ID)
+	redeemPath := fmt.Sprintf("/api/wish/%d/redeem", c.ID)
+
+	// 未定价不能兑换，也不能误扣星。
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, redeemPath, map[string]any{}), http.StatusBadRequest)
+	if b, e := wishBalances(t, s, pet.ID); b != 100 || e != 100 {
+		t.Fatalf("未定价兑换不应改变余额：balance=%d earned=%d", b, e)
+	}
+
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, adminPath,
+		map[string]any{"action": "approve", "price": 50}), http.StatusOK)
+	list := taskTestRequest(r, http.MethodGet, "/api/wish/list", nil)
+	requireTaskStatus(t, list, http.StatusOK)
+	var lr struct {
+		Wishes []struct {
+			CanRedeem bool  `json:"can_redeem"`
+			Progress  int   `json:"progress"`
+			Balance   int64 `json:"balance"`
+			Price     int   `json:"price"`
+		} `json:"wishes"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &lr); err != nil {
+		t.Fatal(err)
+	}
+	if len(lr.Wishes) != 1 || !lr.Wishes[0].CanRedeem || lr.Wishes[0].Progress != 100 || lr.Wishes[0].Price != 50 {
+		t.Fatalf("攒够后列表应给出可兑换与满进度：%s", list.Body)
+	}
+
+	// 兑换：扣星 + 状态 + 事件一次事务完成，等级累计不变。
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, redeemPath, map[string]any{}), http.StatusOK)
+	if b, e := wishBalances(t, s, pet.ID); b != 50 || e != 100 {
+		t.Fatalf("兑换应只扣可消费余额：balance=%d earned=%d", b, e)
+	}
+	if w := wishOf(t, s, c.ID); w.Status != "redeem_requested" || w.RedeemedAt == nil {
+		t.Fatalf("兑换后状态/时间不对：%+v", w)
+	}
+	// 重复兑换不能二次扣星。
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, redeemPath, map[string]any{}), http.StatusBadRequest)
+	if b, _ := wishBalances(t, s, pet.ID); b != 50 {
+		t.Fatalf("重复兑换二次扣星：balance=%d", b)
+	}
+
+	// 家长不兑现：原额退星、回攒星中、等级与收入账本不变。
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, adminPath,
+		map[string]any{"action": "refund"}), http.StatusOK)
+	if b, e := wishBalances(t, s, pet.ID); b != 100 || e != 100 {
+		t.Fatalf("退回应原额返还且不动累计：balance=%d earned=%d", b, e)
+	}
+	if w := wishOf(t, s, c.ID); w.Status != "saving" || w.RedeemedAt != nil {
+		t.Fatalf("退回后应回到攒星中并清空兑换时间：%+v", w)
+	}
+	if n := wishEventCount(t, s, kid.ID, "wish_refund"); n != 1 {
+		t.Fatalf("退回事件应恰好一条，实际 %d", n)
+	}
+	var refundLedger int64
+	if err := s.DB.Model(&store.SettlementLedger{}).Where("source=?", "wish_refund").Count(&refundLedger).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refundLedger != 0 {
+		t.Fatalf("退回不能写收入账本，否则污染定价健康度：%d 条", refundLedger)
+	}
+
+	// 退回后愿望仍可再次兑换，然后兑现。
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, redeemPath, map[string]any{}), http.StatusOK)
+	if b, _ := wishBalances(t, s, pet.ID); b != 50 {
+		t.Fatalf("再次兑换应扣一次：balance=%d", b)
+	}
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, adminPath,
+		map[string]any{"action": "fulfill"}), http.StatusOK)
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, adminPath,
+		map[string]any{"action": "fulfill"}), http.StatusBadRequest)
+	if n := wishEventCount(t, s, kid.ID, "wish_fulfilled"); n != 1 {
+		t.Fatalf("重复兑现不应重复写猫记忆事件，实际 %d 条", n)
+	}
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, adminPath,
+		map[string]any{"action": "refund"}), http.StatusBadRequest)
+	if b, _ := wishBalances(t, s, pet.ID); b != 50 {
+		t.Fatalf("已兑现愿望不能退星：balance=%d", b)
+	}
+
+	stars := taskTestRequest(r, http.MethodGet, "/api/wish/stars", nil)
+	requireTaskStatus(t, stars, http.StatusOK)
+	var sr struct {
+		Stars []struct {
+			ID    int64  `json:"id"`
+			Title string `json:"title"`
+			Price int    `json:"price"`
+		} `json:"stars"`
+	}
+	if err := json.Unmarshal(stars.Body.Bytes(), &sr); err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Stars) != 1 || sr.Stars[0].ID != c.ID || sr.Stars[0].Price != 50 {
+		t.Fatalf("星图应归档本次兑现的愿望：%s", stars.Body)
+	}
+}
+
+// 两个并发兑换请求只能成功一个，余额只扣一次（孩子行锁 + 状态机）。
+func TestWishConcurrentRedeemChargesOnceIntegration(t *testing.T) {
+	s, r, _, pet := wishFlowFixture(t)
+	created := taskTestRequest(r, http.MethodPost, "/api/wish", map[string]any{"title": "并发愿望"})
+	requireTaskStatus(t, created, http.StatusOK)
+	var c struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	adminPath := fmt.Sprintf("/api/admin/wish/%d", c.ID)
+	redeemPath := fmt.Sprintf("/api/wish/%d/redeem", c.ID)
+	requireTaskStatus(t, taskTestRequest(r, http.MethodPost, adminPath,
+		map[string]any{"action": "approve", "price": 60}), http.StatusOK)
+
+	var codes [2]int
+	var wg sync.WaitGroup
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i] = taskTestRequest(r, http.MethodPost, redeemPath, map[string]any{}).Code
+		}(i)
+	}
+	wg.Wait()
+	success := 0
+	for _, code := range codes {
+		if code == http.StatusOK {
+			success++
+		}
+	}
+	if success != 1 {
+		t.Fatalf("并发兑换应恰好一次成功，实际状态码 %v", codes)
+	}
+	if b, e := wishBalances(t, s, pet.ID); b != 40 || e != 100 {
+		t.Fatalf("并发兑换只能扣一次：balance=%d earned=%d", b, e)
 	}
 }
