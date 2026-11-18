@@ -10,6 +10,7 @@ import { getShopDisplay } from '../shop-display.js'
 import TimerOverlay from '../components/TimerOverlay.vue'
 import CatPlayground from '../components/CatPlayground.vue'
 import CatClimb from '../components/CatClimb.vue'
+import CatYarn from '../components/CatYarn.vue'
 import PixelShop from '../components/PixelShop.vue'
 import LitterScoop from '../components/LitterScoop.vue'
 import { LITTER_KEY, LITTER_STATE_LABELS, clampLitterState, litterMiniMarkup } from '../litter-box.js'
@@ -165,11 +166,12 @@ function startGame(kind) {
   if (kind === 'chase') return startChase(true)
   closeGamePicker(false)
   if (kind === 'climb') return openTreeGame()
+  if (kind === 'yarn') return openPlayground('yarn')
   return openPlayground('feather')
 }
 async function openPlayground(kind = 'feather') {
   // Vue 事件不能作为游戏类型；原来的无参入口仍然是羽毛。
-  kind = kind === 'climb' ? 'climb' : 'feather'
+  kind = kind === 'climb' || kind === 'yarn' ? kind : 'feather'
   if (!adopted.value || playOpen.value || playOpening.value) return
   if (gameBusy()) { showToast('先完成正在进行的操作，再和猫玩吧'); return }
   if (kind === 'climb' && !hasCatTreeGame.value) return
@@ -3227,6 +3229,7 @@ onBeforeUnmount(() => {
       <div class="game-picker-heading"><b id="game-picker-title">和猫玩什么？</b><button ref="gamePickerClose" type="button" aria-label="关闭游戏列表" @click="closeGamePicker()">关闭</button></div>
       <button type="button" class="game-card" @click="startGame('feather')"><b>逗猫羽毛</b><small>动动手指，免费玩</small></button>
       <button v-if="hasCatTreeGame" type="button" class="game-card climb" @click="startGame('climb')"><b>无限爬高</b><small>一层一层往上跳</small></button>
+      <button type="button" class="game-card yarn" @click="startGame('yarn')"><b>毛球合成</b><small>两个一样的碰一起，合出大花猫</small></button>
       <button v-if="pets.length >= 2" type="button" class="game-card chase" data-room-action="chase" @click="startGame('chase')"><b>小猫追逐</b><small>两只小猫轮流追一小会儿</small></button>
     </div>
     <div v-if="isNarrow && sheet" class="sheet-scrim" @click="sheet = ''"></div>
@@ -3482,6 +3485,7 @@ onBeforeUnmount(() => {
   <Teleport to="body">
     <CatPlayground v-if="playOpen && adopted && gameKind === 'feather'" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
     <CatClimb v-if="playOpen && adopted && gameKind === 'climb'" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
+    <CatYarn v-if="playOpen && adopted && gameKind === 'yarn'" :species="species" :cat-name="pet?.name || '小猫'" @close="closePlayground" />
     <LitterScoop v-if="litterItem && adopted" :state="clampLitterState(litterItem.state)"
       :species="species" :mood="pet?.mood ?? 100"
       @scooped="onLitterScooped" @close="onLitterClose" />
@@ -3574,6 +3578,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .game-picker-heading button { min-height: 30px; padding: 3px 10px; border: 1px solid #cfbea1; border-radius: 4px; color: #654738; background: #f1e7d5; font-size: 11px; cursor: pointer; }
 .game-card { min-height: 58px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 3px; padding: 8px 14px; border: 2px solid #cfbea1; border-radius: 8px; color: #654738; background: #f1e7d5; text-align: left; cursor: pointer; }
 .game-card.climb { background: #e9f1dd; border-color: #b9caa7; }
+.game-card.yarn { background: #fbe7e2; border-color: #e3b7ad; }
 .game-card b { font-size: 14px; }
 .game-card small { font-size: 11px; opacity: .78; }
 .game-card:hover, .game-card:focus-visible { background: #ffe9bd; outline: 2px solid #9C8BC5; outline-offset: 2px; }

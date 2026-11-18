@@ -244,7 +244,7 @@ test('游戏入口只认购买、不要求摆放；无参/MouseEvent 入口仍�
   ui.cleanup()
 })
 
-test('和猫玩列表：未购买只有羽毛，购买后出现无限爬高；打开列表不冻结房间', async () => {
+test('和猫玩列表：未购买有羽毛和毛球合成，购买后多出无限爬高；打开列表不冻结房间', async () => {
   const ui = harness()
   ui.shopItems.value[0].owned = false
   ui.openGamePicker(ui.trigger)
@@ -253,16 +253,26 @@ test('和猫玩列表：未购买只有羽毛，购买后出现无限爬高；�
   assert.equal(ui.playOpening.value, false)
   assert.equal(ui.playOpen.value, false)
   const cards = nodes(ui.render()).filter(node => node.props?.class?.includes?.('game-card'))
-  assert.equal(cards.length, 1)
+  assert.equal(cards.length, 2)
   assert.equal(nodes(ui.render()).find(node => node.props?.class?.includes?.('playground-entry'))?.props['aria-expanded'], true)
   ui.closeGamePicker()
   ui.shopItems.value[0].owned = true
   ui.openGamePicker(ui.trigger)
   await ui.flush()
-  assert.equal(nodes(ui.render()).filter(node => node.props?.class?.includes?.('game-card')).length, 2)
+  assert.equal(nodes(ui.render()).filter(node => node.props?.class?.includes?.('game-card')).length, 3)
   await ui.startGame('climb')
   assert.equal(ui.gamePicker.value, false)
   assert.equal(ui.gameKind.value, 'climb')
+  assert.equal(ui.playOpen.value, true)
+  ui.cleanup()
+})
+
+test('选择毛球合成：进入合成游戏，不误进其他游戏', async () => {
+  const ui = harness()
+  ui.openGamePicker(ui.trigger)
+  await ui.flush()
+  await ui.startGame('yarn')
+  assert.equal(ui.gameKind.value, 'yarn')
   assert.equal(ui.playOpen.value, true)
   ui.cleanup()
 })
